@@ -1104,49 +1104,68 @@ struct PostRideSheet: View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("e.g. Nashua, NH", text: $goingTo)
-                        .font(.body)
-                        .onChange(of: goingTo) { oldValue, newValue in
-                            distanceError = nil
-                        }
-                    
-                    TextField("e.g. Boston, MA", text: $pickupFrom)
-                        .font(.body)
-                        .onChange(of: pickupFrom) { oldValue, newValue in
-                            distanceError = nil
-                        }
-                    
-                    HStack {
-                        TextField("0.0", text: $milesText)
-                            .keyboardType(.decimalPad)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Pickup Location")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextField("e.g. Boston, MA", text: $pickupFrom)
                             .font(.body)
-                            .disabled(isCalculatingDistance)
-                            .onChange(of: milesText) { oldValue, newValue in
-                                if priceText.isEmpty || Double(priceText) == (Double(oldValue) ?? 0) * 1.0 {
-                                    if let milesValue = Double(newValue) {
-                                        priceText = String(format: "%.0f", milesValue * 1.0)
+                            .onChange(of: pickupFrom) { oldValue, newValue in
+                                distanceError = nil
+                            }
+                    }
+                    
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Drop-off Location")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextField("e.g. Nashua, NH", text: $goingTo)
+                            .font(.body)
+                            .onChange(of: goingTo) { oldValue, newValue in
+                                distanceError = nil
+                            }
+                    }
+                    
+                    VStack(spacing: 8) {
+                        HStack {
+                            TextField("0.0", text: $milesText)
+                                .keyboardType(.decimalPad)
+                                .font(.body)
+                                .disabled(isCalculatingDistance)
+                                .onChange(of: milesText) { oldValue, newValue in
+                                    if priceText.isEmpty || Double(priceText) == (Double(oldValue) ?? 0) * 1.0 {
+                                        if let milesValue = Double(newValue) {
+                                            priceText = String(format: "%.0f", milesValue * 1.0)
+                                        }
                                     }
                                 }
+                            
+                            if isCalculatingDistance {
+                                ProgressView()
+                                    .scaleEffect(0.8)
                             }
-                        
-                        if isCalculatingDistance {
-                            ProgressView()
-                                .scaleEffect(0.8)
+                            
+                            Text("miles")
+                                .foregroundStyle(.secondary)
                         }
-                        
-                        Text("miles")
-                            .foregroundStyle(.secondary)
-                        
-                        Spacer()
                         
                         if canCalculateDistance {
                             Button {
                                 calculateDistance()
                             } label: {
-                                Image(systemName: "arrow.triangle.2.circlepath")
-                                    .font(.caption)
+                                HStack {
+                                    Image(systemName: "arrow.triangle.2.circlepath")
+                                    Text("Calculate Distance")
+                                }
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                                .foregroundStyle(.blue)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
+                                .background(Color.blue.opacity(0.1))
+                                .cornerRadius(8)
                             }
-                            .buttonStyle(.borderless)
+                            .buttonStyle(.plain)
                         }
                     }
                     
@@ -1156,7 +1175,7 @@ struct PostRideSheet: View {
                             .foregroundStyle(.red)
                     }
                 } header: {
-                    Text("Where")
+                    Text("Route")
                 }
                 
                 // Date & Time Section
@@ -1367,6 +1386,22 @@ struct RideCard: View {
     
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            // Pickup Time at top
+            HStack(spacing: 8) {
+                Image(systemName: "calendar")
+                    .font(.caption)
+                    .foregroundStyle(.blue)
+                Text(ride.pickupDateShort)
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.blue)
+                Spacer()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(Color.blue.opacity(0.1))
+            .cornerRadius(8)
+            
             // Route
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 2) {
@@ -1375,6 +1410,7 @@ struct RideCard: View {
                         .foregroundStyle(.secondary)
                     Text(ride.from)
                         .font(.headline)
+                        .lineLimit(1)
                 }
                 
                 Image(systemName: "arrow.right")
@@ -1387,6 +1423,7 @@ struct RideCard: View {
                         .foregroundStyle(.secondary)
                     Text(ride.to)
                         .font(.headline)
+                        .lineLimit(1)
                 }
             }
             
