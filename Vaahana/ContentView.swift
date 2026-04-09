@@ -15,17 +15,21 @@ import FirebaseFirestore
 struct Ride: Identifiable, Codable, Equatable {
     var id: UUID
     var name: String
-    var phone: String              // US phone - digits only, no country code
-    var phoneCountryCode: String   // US phone country code
-    var whatsappPhone: String      // WhatsApp - digits only, no country code
-    var whatsappCountryCode: String // WhatsApp country code
-    var from: String               // pickup city/area
-    var to: String                 // destination city/area
+    var phone: String
+    var phoneCountryCode: String
+    var whatsappPhone: String
+    var whatsappCountryCode: String
+    var from: String
+    var to: String
     var miles: Double
-    var price: Double              // rider's willing to pay amount
-    var pickupDate: Date           // Date and time of pickup
+    var coins: Int                 // community coins offered for this ride
+    var hotDuration: Int           // minutes the request stays visible (default 5)
+    var pickupDate: Date
     var status: RideStatus
     var createdAt: Date
+
+    var hotUntil: Date { createdAt.addingTimeInterval(TimeInterval(hotDuration * 60)) }
+    var isHot: Bool { hotUntil > Date() }
     
     var initials: String {
         let components = name.split(separator: " ")
@@ -60,9 +64,9 @@ enum RideStatus: String, Codable {
     case pending, accepted
 }
 
-enum AppMode: String, CaseIterable {
-    case rider = "Rider"
-    case driver = "Driver"
+enum UserRole: String, Codable {
+    case rider
+    case driver
 }
 
 // MARK: - Storage Manager
@@ -132,56 +136,45 @@ class RideStorage: ObservableObject {
     var acceptedRides: [Ride] {
         rides.filter { $0.status == .accepted }
     }
+
+    var hotPendingRides: [Ride] {
+        rides.filter { $0.status == .pending && $0.isHot }
+    }
 }
 
 // MARK: - Main Content View
 
 struct ContentView: View {
+    let role: UserRole
     @StateObject private var storage = RideStorage()
-    @State private var selectedMode: AppMode = .rider
     @State private var showingProfile = false
 
     var body: some View {
         VStack(spacing: 0) {
             // Header
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text("Vaahana")
-                        .font(.system(size: 48, weight: .black, design: .rounded))
-                    Spacer()
-                    Button {
-                        showingProfile = true
-                    } label: {
-                        Image(systemName: "person.circle.fill")
-                            .font(.title)
-                            .foregroundStyle(.primary)
-                    }
-                    .padding(.trailing)
+            HStack(alignment: .firstTextBaseline) {
+                Text("Vaahana")
+                    .font(.system(size: 48, weight: .black, design: .rounded))
+                Spacer()
+                Button {
+                    showingProfile = true
+                } label: {
+                    Image(systemName: "person.circle.fill")
+                        .font(.title)
+                        .foregroundStyle(.primary)
                 }
-                .padding(.horizontal)
-                .padding(.top, 16)
-
-                // Mode Picker
-                Picker("Mode", selection: $selectedMode) {
-                    ForEach(AppMode.allCases, id: \.self) { mode in
-                        Text(mode.rawValue).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .padding(.horizontal)
-                .padding(.top, 12)
-                .padding(.bottom, 8)
+                .padding(.trailing)
             }
+            .padding(.horizontal)
+            .padding(.top, 16)
+            .padding(.bottom, 8)
             .background(Color(UIColor.systemBackground))
-            
-            // Content
-            Group {
-                switch selectedMode {
-                case .rider:
-                    RiderView()
-                case .driver:
-                    DriverView()
-                }
+
+            // Role-locked content
+            if role == .rider {
+                RiderView()
+            } else {
+                DriverView()
             }
         }
         .background(Color(UIColor.systemGroupedBackground))
@@ -275,21 +268,16 @@ struct DriverView: View {
     @StateObject private var locationManager = LocationManager()
     
     // Filter settings
-    @AppStorage("filterCity") private var filterCity = ""
-    @AppStorage("filterRadius") private var filterRadius = 50.0
-    @State private var tempFilterCity = ""
-    @State private var tempFilterRadius = 50.0
-    
+    @AppStorage("filterRadius") private var filterRadius = 5.0
+    @State private var tempFilterRadius = 5.0
+
     var filteredRides: [Ride] {
-        guard !filterCity.isEmpty, let userLocation = locationManager.location else {
-            return storage.rides
-        }
-        
-        return storage.rides.filter { ride in
-            guard let rideLocation = rideLocations[ride.id] else { return false }
+        let hot = storage.hotPendingRides
+        guard let userLocation = locationManager.location else { return hot }
+        return hot.filter { ride in
+            guard let rideLocation = rideLocations[ride.id] else { return true }
             let distance = userLocation.distance(from: CLLocation(latitude: rideLocation.latitude, longitude: rideLocation.longitude))
-            let miles = distance / 1609.34
-            return miles <= filterRadius
+            return (distance / 1609.34) <= filterRadius
         }
     }
     
@@ -298,7 +286,7 @@ struct DriverView: View {
             if storage.isLoading {
                 ProgressView("Loading rides...")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if storage.rides.isEmpty {
+            } else if storage.hotPendingRides.isEmpty {
                 emptyStateView
             } else {
                 mapViewWithList
@@ -314,7 +302,6 @@ struct DriverView: View {
         }
         .onAppear {
             locationManager.requestLocation()
-            tempFilterCity = filterCity
             tempFilterRadius = filterRadius
         }
         .toolbar {
@@ -324,10 +311,8 @@ struct DriverView: View {
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "slider.horizontal.3")
-                        if !filterCity.isEmpty {
-                            Text("\(Int(filterRadius))mi")
-                                .font(.caption2)
-                        }
+                        Text("\(Int(filterRadius))mi")
+                            .font(.caption2)
                     }
                 }
             }
@@ -344,27 +329,24 @@ struct DriverView: View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("e.g. Boston, MA", text: $tempFilterCity)
-                    
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
-                            Text("Radius")
+                            Text("Pickup radius")
                             Spacer()
                             Text("\(Int(tempFilterRadius)) miles")
                                 .foregroundStyle(.secondary)
                         }
-                        Slider(value: $tempFilterRadius, in: 5...200, step: 5)
+                        Slider(value: $tempFilterRadius, in: 1...50, step: 1)
                     }
                 } header: {
                     Text("Filter Settings")
                 } footer: {
-                    Text("Show only ride requests within this radius from your location")
+                    Text("Show only hot ride requests within this distance of your live location.")
                 }
-                
+
                 Section {
-                    Button("Clear Filters") {
-                        tempFilterCity = ""
-                        tempFilterRadius = 50
+                    Button("Reset to Default (5 mi)") {
+                        tempFilterRadius = 5
                     }
                     .foregroundStyle(.red)
                 }
@@ -375,13 +357,11 @@ struct DriverView: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
                         showingFilters = false
-                        tempFilterCity = filterCity
                         tempFilterRadius = filterRadius
                     }
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Apply") {
-                        filterCity = tempFilterCity
                         filterRadius = tempFilterRadius
                         showingFilters = false
                     }
@@ -470,7 +450,7 @@ struct DriverView: View {
                     Image(systemName: "figure.wave")
                         .font(.system(size: 14))
                         .foregroundStyle(.white)
-                    Text("$\(String(format: "%.0f", ride.price))")
+                    Text("🪙\(ride.coins)")
                         .font(.caption2)
                         .fontWeight(.bold)
                         .foregroundStyle(.white)
@@ -495,13 +475,11 @@ struct DriverView: View {
                         .padding(.top, 8)
                     
                     HStack {
-                        Text("Ride Requests")
+                        Text("Hot Requests")
                             .font(.headline)
-                        if !filterCity.isEmpty {
-                            Text("(\(filteredRides.count))")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
+                        Text("(\(filteredRides.count))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         Spacer()
                         Image(systemName: showingList ? "chevron.down" : "chevron.up")
                             .font(.caption)
@@ -518,44 +496,13 @@ struct DriverView: View {
             // Ride list - compact view
             ScrollView {
                 LazyVStack(spacing: 8) {
-                    let pendingFiltered = filteredRides.filter { $0.status == .pending }
-                    let acceptedFiltered = filteredRides.filter { $0.status == .accepted }
-                    
-                    if !pendingFiltered.isEmpty {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Waiting for driver")
-                                .font(.subheadline)
-                                .fontWeight(.semibold)
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal)
-                                .padding(.top, 8)
-                            
-                            ForEach(pendingFiltered.sorted(by: { $0.createdAt > $1.createdAt })) { ride in
-                                CompactRideRow(ride: ride) {
-                                    selectedRide = ride
-                                }
-                            }
-                        }
-                    }
-                    
-                    if !acceptedFiltered.isEmpty {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Confirmed")
-                                .font(.subheadline)
-                                .fontWeight(.semibold)
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal)
-                                .padding(.top, 8)
-                            
-                            ForEach(acceptedFiltered.sorted(by: { $0.createdAt > $1.createdAt })) { ride in
-                                CompactRideRow(ride: ride) {
-                                    selectedRide = ride
-                                }
-                            }
+                    ForEach(filteredRides.sorted(by: { $0.hotUntil < $1.hotUntil })) { ride in
+                        CompactRideRow(ride: ride) {
+                            selectedRide = ride
                         }
                     }
                 }
-                .padding(.bottom, 16)
+                .padding(.vertical, 8)
             }
             .background(Color(UIColor.systemBackground))
             .gesture(
@@ -685,14 +632,20 @@ struct CompactRideRow: View {
                     
                     HStack(spacing: 8) {
                         Text("\(String(format: "%.1f", ride.miles)) mi")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Text("•")
-                            .foregroundStyle(.secondary)
-                        Text("$\(String(format: "%.0f", ride.price))")
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                            .foregroundStyle(.blue)
+                            .font(.caption).foregroundStyle(.secondary)
+                        Text("•").foregroundStyle(.secondary)
+                        Text("🪙 \(ride.coins)")
+                            .font(.caption).fontWeight(.semibold).foregroundStyle(.orange)
+                        Spacer()
+                        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                            let rem = ride.hotUntil.timeIntervalSince(ctx.date)
+                            if rem > 0 {
+                                Text("🔥 \(Int(rem/60)):\(String(format:"%02d", Int(rem)%60))")
+                                    .font(.caption2).foregroundStyle(.orange)
+                            } else {
+                                Text("Expired").font(.caption2).foregroundStyle(.secondary)
+                            }
+                        }
                     }
                 }
                 
@@ -779,12 +732,12 @@ struct RideDetailSheet: View {
                             }
                             
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("Offer")
+                                Text("Coins")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
-                                Text("$\(String(format: "%.2f", ride.price))")
+                                Text("🪙 \(ride.coins)")
                                     .font(.headline)
-                                    .foregroundStyle(.blue)
+                                    .foregroundStyle(.orange)
                             }
                             
                             Spacer()
@@ -895,17 +848,16 @@ struct RideDetailSheet: View {
         updatedRide.status = .accepted
         storage.updateRide(updatedRide)
     }
-    
+
     func openWhatsApp() {
         let cleanedCountryCode = ride.whatsappCountryCode.replacingOccurrences(of: "+", with: "")
-        let message = "Hi \(ride.name)! I saw your Vaahana request (\(ride.from) → \(ride.to), $\(String(format: "%.2f", ride.price))). I can give you a ride — interested?"
+        let message = "Hi \(ride.name)! I saw your ride request on Vaahana (\(ride.from) → \(ride.to), \(ride.coins) coins). I'd love to help — interested?"
         let encodedMessage = message.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        let urlString = "https://wa.me/\(cleanedCountryCode)\(ride.whatsappPhone)?text=\(encodedMessage)"
-        
-        if let url = URL(string: urlString) {
+        if let url = URL(string: "https://wa.me/\(cleanedCountryCode)\(ride.whatsappPhone)?text=\(encodedMessage)") {
             UIApplication.shared.open(url)
         }
     }
+
 }
 
 // Helper for corner radius on specific corners
@@ -1072,7 +1024,8 @@ struct PostRideSheet: View {
     @State private var goingTo = ""
     @State private var pickupFrom = ""
     @State private var milesText = ""
-    @State private var priceText = ""
+    @State private var coinsText = ""
+    @State private var hotDuration = 5
     @State private var pickupDate = Date()
     @State private var name = ""
     @State private var phoneCountryCode = "+1"
@@ -1101,19 +1054,19 @@ struct PostRideSheet: View {
         Double(milesText) ?? 0
     }
     
-    var price: Double {
-        Double(priceText) ?? 0
+    var coins: Int {
+        Int(coinsText) ?? 0
     }
-    
-    var suggestedPrice: Double {
-        miles * 1.0
+
+    var suggestedCoins: Int {
+        max(1, Int(miles))
     }
-    
+
     var isValid: Bool {
         !goingTo.isEmpty &&
         !pickupFrom.isEmpty &&
         miles > 0 &&
-        price > 0 &&
+        coins > 0 &&
         !name.isEmpty &&
         phone.count >= 6 &&
         (sameNumberForBoth || whatsappPhone.count >= 6)
@@ -1156,9 +1109,9 @@ struct PostRideSheet: View {
                                 .font(.body)
                                 .disabled(isCalculatingDistance)
                                 .onChange(of: milesText) { oldValue, newValue in
-                                    if priceText.isEmpty || Double(priceText) == (Double(oldValue) ?? 0) * 1.0 {
+                                    if coinsText.isEmpty || Int(coinsText) == max(1, Int(Double(oldValue) ?? 0)) {
                                         if let milesValue = Double(newValue) {
-                                            priceText = String(format: "%.0f", milesValue * 1.0)
+                                            coinsText = "\(max(1, Int(milesValue)))"
                                         }
                                     }
                                 }
@@ -1211,32 +1164,41 @@ struct PostRideSheet: View {
                     Text("Select when you need to be picked up")
                 }
                 
-                // Price Section
+                // Coins Section
                 Section {
                     HStack {
-                        Text("$")
-                            .foregroundStyle(.secondary)
-                        TextField("0", text: $priceText)
-                            .keyboardType(.decimalPad)
+                        Text("🪙")
+                            .font(.title3)
+                        TextField("0", text: $coinsText)
+                            .keyboardType(.numberPad)
                             .font(.title3)
                             .fontWeight(.semibold)
-                        
-                        if miles > 0 && suggestedPrice != price {
+
+                        if miles > 0 && suggestedCoins != coins {
                             Button {
-                                priceText = String(format: "%.0f", suggestedPrice)
+                                coinsText = "\(suggestedCoins)"
                             } label: {
-                                Text("Use $\(String(format: "%.0f", suggestedPrice))")
+                                Text("Use \(suggestedCoins)")
                                     .font(.caption)
                             }
                             .buttonStyle(.borderless)
                         }
                     }
                 } header: {
-                    Text("Your Offer")
+                    Text("Coins Offered")
                 } footer: {
-                    if miles > 0 {
-                        Text("Suggested: $\(String(format: "%.2f", suggestedPrice)) ($1 per mile)")
-                    }
+                    miles > 0
+                        ? Text("Suggested: \(suggestedCoins) coins (1 per mile). No real money — community currency only.")
+                        : Text("Coins are community currency. No real money involved.")
+                }
+
+                // Hot Duration Section
+                Section {
+                    Stepper("\(hotDuration) minutes", value: $hotDuration, in: 5...60, step: 5)
+                } header: {
+                    Text("Keep Request Active For")
+                } footer: {
+                    Text("Your request disappears from drivers after this time. Default is 5 minutes.")
                 }
                 
                 Section {
@@ -1319,7 +1281,8 @@ struct PostRideSheet: View {
         goingTo = ride.to
         pickupFrom = ride.from
         milesText = String(format: "%.1f", ride.miles)
-        priceText = String(format: "%.0f", ride.price)
+        coinsText = "\(ride.coins)"
+        hotDuration = ride.hotDuration
         pickupDate = ride.pickupDate
         name = ride.name
         phoneCountryCode = ride.phoneCountryCode
@@ -1334,7 +1297,6 @@ struct PostRideSheet: View {
         let finalWhatsappCountryCode = sameNumberForBoth ? phoneCountryCode : whatsappCountryCode
         
         if let editingRide = editingRide {
-            // Update existing ride
             var updatedRide = editingRide
             updatedRide.name = name
             updatedRide.phone = phone
@@ -1344,12 +1306,11 @@ struct PostRideSheet: View {
             updatedRide.from = pickupFrom
             updatedRide.to = goingTo
             updatedRide.miles = miles
-            updatedRide.price = price
+            updatedRide.coins = coins
+            updatedRide.hotDuration = hotDuration
             updatedRide.pickupDate = pickupDate
-            
             storage.updateRide(updatedRide)
         } else {
-            // Create new ride
             let ride = Ride(
                 id: UUID(),
                 name: name,
@@ -1360,12 +1321,12 @@ struct PostRideSheet: View {
                 from: pickupFrom,
                 to: goingTo,
                 miles: miles,
-                price: price,
+                coins: coins,
+                hotDuration: hotDuration,
                 pickupDate: pickupDate,
                 status: .pending,
                 createdAt: Date()
             )
-            
             storage.addRide(ride)
         }
         
@@ -1385,7 +1346,7 @@ struct PostRideSheet: View {
                 
                 await MainActor.run {
                     milesText = String(format: "%.1f", calculatedMiles)
-                    priceText = String(format: "%.0f", calculatedMiles * 1.0)
+                    coinsText = "\(max(1, Int(calculatedMiles)))"
                     isCalculatingDistance = false
                 }
             } catch {
@@ -1454,7 +1415,26 @@ struct RideCard: View {
             HStack(spacing: 8) {
                 StatusChip(status: ride.status)
                 InfoChip(text: String(format: "%.1f mi", ride.miles), color: .gray)
-                InfoChip(text: String(format: "$%.2f", ride.price), color: .blue)
+                InfoChip(text: "🪙 \(ride.coins)", color: .orange)
+            }
+
+            // Hot timer
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                let remaining = ride.hotUntil.timeIntervalSince(context.date)
+                if remaining > 0 {
+                    HStack(spacing: 4) {
+                        Text("🔥")
+                        Text(formatCountdown(remaining))
+                            .font(.caption).fontWeight(.semibold).foregroundStyle(.orange)
+                        Text("left")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(Color.orange.opacity(0.1)).cornerRadius(6)
+                } else {
+                    Label("Request expired", systemImage: "clock.badge.xmark")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
             
             Divider()
@@ -1575,14 +1555,19 @@ struct RideCard: View {
     
     func openWhatsApp() {
         let cleanedCountryCode = ride.whatsappCountryCode.replacingOccurrences(of: "+", with: "")
-        let message = "Hi \(ride.name)! I saw your Vaahana request (\(ride.from) → \(ride.to), $\(String(format: "%.2f", ride.price))). I can give you a ride — interested?"
+        let message = "Hi \(ride.name)! I saw your ride request on Vaahana (\(ride.from) → \(ride.to), \(ride.coins) coins). I'd love to help — interested?"
         let encodedMessage = message.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        let urlString = "https://wa.me/\(cleanedCountryCode)\(ride.whatsappPhone)?text=\(encodedMessage)"
-        
-        if let url = URL(string: urlString) {
+        if let url = URL(string: "https://wa.me/\(cleanedCountryCode)\(ride.whatsappPhone)?text=\(encodedMessage)") {
             UIApplication.shared.open(url)
         }
     }
+}
+
+// MARK: - Helpers
+
+func formatCountdown(_ seconds: TimeInterval) -> String {
+    let s = max(0, Int(seconds))
+    return String(format: "%d:%02d", s / 60, s % 60)
 }
 
 // MARK: - Helper Views
@@ -1631,5 +1616,5 @@ struct InfoChip: View {
 // MARK: - Preview
 
 #Preview {
-    ContentView()
+    ContentView(role: .rider)
 }

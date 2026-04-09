@@ -11,6 +11,8 @@ struct ProfileView: View {
     @State private var displayName = ""
     @State private var phone = ""
     @State private var whatsapp = ""
+    @State private var role: UserRole? = nil
+    @State private var coins: Int = 0
     @State private var isSaving = false
     @State private var errorMessage: String?
 
@@ -41,6 +43,23 @@ struct ProfileView: View {
                     }
                     .padding(.vertical, 8)
                     .listRowBackground(Color.clear)
+                }
+
+                // Role + Coins
+                Section {
+                    HStack {
+                        Label(role == .driver ? "Driver" : "Rider",
+                              systemImage: role == .driver ? "car.fill" : "figure.wave")
+                        Spacer()
+                        Text("Role").font(.caption).foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Text("🪙 \(coins) coins")
+                        Spacer()
+                        Text("Balance").font(.caption).foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Account")
                 }
 
                 Section("Profile") {
@@ -116,6 +135,10 @@ struct ProfileView: View {
         if let data = try? await db.collection("users").document(uid).getDocument().data() {
             phone = data["phone"] as? String ?? ""
             whatsapp = data["whatsapp"] as? String ?? ""
+            coins = data["coins"] as? Int ?? 0
+            if let rawRole = data["role"] as? String {
+                role = UserRole(rawValue: rawRole)
+            }
         }
     }
 
