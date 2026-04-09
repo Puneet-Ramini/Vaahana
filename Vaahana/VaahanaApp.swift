@@ -6,22 +6,45 @@
 //
 
 import SwiftUI
+import Combine
 import FirebaseCore
 import FirebaseAuth
 
+// Listens to Firebase auth state and exposes whether a verified phone user is signed in
+class AuthState: ObservableObject {
+    @Published var isSignedIn = false
+
+    private var handle: AuthStateDidChangeListenerHandle?
+
+    init() {
+        handle = Auth.auth().addStateDidChangeListener { [weak self] _, user in
+            // Only consider the user signed in if they have a verified phone number
+            self?.isSignedIn = user?.phoneNumber != nil
+        }
+    }
+
+    deinit {
+        if let handle {
+            Auth.auth().removeStateDidChangeListener(handle)
+        }
+    }
+}
+
 @main
 struct VaahanaApp: App {
+    @StateObject private var authState = AuthState()
+
     init() {
         FirebaseApp.configure()
-        // Silently sign in anonymously — no UI, no personal data collected
-        if Auth.auth().currentUser == nil {
-            Auth.auth().signInAnonymously { _, _ in }
-        }
     }
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            if authState.isSignedIn {
+                ContentView()
+            } else {
+                PhoneAuthView()
+            }
         }
     }
 }
