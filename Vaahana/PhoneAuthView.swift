@@ -9,16 +9,21 @@ import FirebaseAuth
 // MARK: - Auth UI Delegate (needed for reCAPTCHA fallback on simulator)
 
 private class PhoneVerificationUIDelegate: NSObject, AuthUIDelegate {
+    private var rootVC: UIViewController? {
+        (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.keyWindow?.rootViewController
+    }
+
     func present(_ viewControllerToPresent: UIViewController, animated: Bool, completion: (() -> Void)?) {
-        let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene
-        scene?.windows.first?.rootViewController?.present(viewControllerToPresent, animated: animated, completion: completion)
+        rootVC?.present(viewControllerToPresent, animated: animated, completion: completion)
     }
 
     func dismiss(animated: Bool, completion: (() -> Void)?) {
-        let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene
-        scene?.windows.first?.rootViewController?.dismiss(animated: animated, completion: completion)
+        rootVC?.dismiss(animated: animated, completion: completion)
     }
 }
+
+// Kept alive for the app's lifetime — avoids deallocation during async phone verification
+private let sharedPhoneAuthUIDelegate = PhoneVerificationUIDelegate()
 
 // MARK: - Phone Auth View
 
@@ -29,8 +34,6 @@ struct PhoneAuthView: View {
     @State private var otpCode = ""
     @State private var isLoading = false
     @State private var errorMessage: String?
-
-    private let uiDelegate = PhoneVerificationUIDelegate()
 
     let countryCodes = [
         ("🇺🇸", "+1"),
@@ -219,7 +222,7 @@ struct PhoneAuthView: View {
         errorMessage = nil
         let fullNumber = "\(countryCode)\(phoneNumber)"
 
-        PhoneAuthProvider.provider().verifyPhoneNumber(fullNumber, uiDelegate: uiDelegate) { id, error in
+        PhoneAuthProvider.provider().verifyPhoneNumber(fullNumber, uiDelegate: sharedPhoneAuthUIDelegate) { id, error in
             isLoading = false
             if let error {
                 errorMessage = error.localizedDescription
