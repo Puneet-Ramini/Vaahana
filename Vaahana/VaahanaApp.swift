@@ -38,9 +38,15 @@ class UserState: ObservableObject {
     func fetchRole(uid: String) {
         db.collection("users").document(uid).getDocument { [weak self] doc, _ in
             DispatchQueue.main.async {
-                if let rawRole = doc?.data()?["role"] as? String,
+                let data = doc?.data()
+                if let rawRole = data?["role"] as? String,
                    let role = UserRole(rawValue: rawRole) {
                     self?.role = role
+                    // One-time migration: give any rider with no coins field 100 coins
+                    if role == .rider && data?["coins"] == nil {
+                        Firestore.firestore().collection("users").document(uid)
+                            .setData(["coins": 100, "coinsLocked": 0], merge: true)
+                    }
                 } else {
                     self?.role = nil
                 }
