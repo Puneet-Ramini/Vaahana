@@ -8,6 +8,7 @@
 import SwiftUI
 import Combine
 import MapKit
+import FirebaseFirestore
 
 // MARK: - Data Models
 
@@ -67,63 +68,65 @@ enum AppMode: String, CaseIterable {
 // MARK: - Storage Manager
 
 class RideStorage: ObservableObject {
-    @AppStorage("rides") private var ridesData: Data = Data()
-    @AppStorage("myRideIDs") private var myRideIDsData: Data = Data()
-    
     @Published var rides: [Ride] = []
     @Published var myRideIDs: [UUID] = []
-    
+
+    private let db = Firestore.firestore()
+    private var listener: ListenerRegistration?
+
     init() {
-        loadRides()
         loadMyRideIDs()
+        startListening()
     }
-    
-    private func loadRides() {
-        if let decoded = try? JSONDecoder().decode([Ride].self, from: ridesData) {
-            rides = decoded
-        }
+
+    deinit {
+        listener?.remove()
     }
-    
+
     private func loadMyRideIDs() {
-        if let decoded = try? JSONDecoder().decode([UUID].self, from: myRideIDsData) {
-            myRideIDs = decoded
-        }
+        guard let data = UserDefaults.standard.data(forKey: "myRideIDs"),
+              let ids = try? JSONDecoder().decode([UUID].self, from: data) else { return }
+        myRideIDs = ids
     }
-    
-    func saveRides() {
-        if let encoded = try? JSONEncoder().encode(rides) {
-            ridesData = encoded
-        }
-    }
-    
-    func saveMyRideIDs() {
+
+    private func persistMyRideIDs() {
         if let encoded = try? JSONEncoder().encode(myRideIDs) {
-            myRideIDsData = encoded
+            UserDefaults.standard.set(encoded, forKey: "myRideIDs")
         }
     }
-    
+
+    private func startListening() {
+        listener = db.collection("rides")
+            .addSnapshotListener { [weak self] snapshot, _ in
+                guard let self, let snapshot else { return }
+                self.rides = snapshot.documents.compactMap { try? $0.data(as: Ride.self) }
+            }
+    }
+
     func addRide(_ ride: Ride) {
-        rides.append(ride)
+        try? db.collection("rides").document(ride.id.uuidString).setData(from: ride)
         myRideIDs.append(ride.id)
-        saveRides()
-        saveMyRideIDs()
+        persistMyRideIDs()
     }
-    
+
     func updateRide(_ ride: Ride) {
-        if let index = rides.firstIndex(where: { $0.id == ride.id }) {
-            rides[index] = ride
-            saveRides()
-        }
+        try? db.collection("rides").document(ride.id.uuidString).setData(from: ride)
     }
-    
+
+    func deleteRide(_ ride: Ride) {
+        db.collection("rides").document(ride.id.uuidString).delete()
+        myRideIDs.removeAll { $0 == ride.id }
+        persistMyRideIDs()
+    }
+
     var myRides: [Ride] {
         rides.filter { myRideIDs.contains($0.id) }
     }
-    
+
     var pendingRides: [Ride] {
         rides.filter { $0.status == .pending }
     }
-    
+
     var acceptedRides: [Ride] {
         rides.filter { $0.status == .accepted }
     }
@@ -235,10 +238,7 @@ struct RiderView: View {
     }
     
     func deleteRide(_ ride: Ride) {
-        storage.rides.removeAll { $0.id == ride.id }
-        storage.myRideIDs.removeAll { $0 == ride.id }
-        storage.saveRides()
-        storage.saveMyRideIDs()
+        storage.deleteRide(ride)
     }
 }
 
