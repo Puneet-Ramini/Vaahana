@@ -70,6 +70,7 @@ enum AppMode: String, CaseIterable {
 class RideStorage: ObservableObject {
     @Published var rides: [Ride] = []
     @Published var myRideIDs: [UUID] = []
+    @Published var isLoading = true
 
     private let db = Firestore.firestore()
     private var listener: ListenerRegistration?
@@ -100,6 +101,7 @@ class RideStorage: ObservableObject {
             .addSnapshotListener { [weak self] snapshot, _ in
                 guard let self, let snapshot else { return }
                 self.rides = snapshot.documents.compactMap { try? $0.data(as: Ride.self) }
+                self.isLoading = false
             }
     }
 
@@ -184,7 +186,10 @@ struct RiderView: View {
     
     var body: some View {
         ZStack {
-            if storage.myRides.isEmpty {
+            if storage.isLoading {
+                ProgressView("Loading...")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if storage.myRides.isEmpty {
                 // Empty State
                 VStack(spacing: 16) {
                     Text("🚗")
@@ -275,7 +280,10 @@ struct DriverView: View {
     
     var body: some View {
         ZStack {
-            if storage.rides.isEmpty {
+            if storage.isLoading {
+                ProgressView("Loading rides...")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if storage.rides.isEmpty {
                 emptyStateView
             } else {
                 mapViewWithList
