@@ -18,7 +18,12 @@ private class PhoneVerificationUIDelegate: NSObject, AuthUIDelegate {
     }
 
     func dismiss(animated: Bool, completion: (() -> Void)?) {
-        rootVC?.dismiss(animated: animated, completion: completion)
+        // Only dismiss what we presented — never dismiss the root hosting controller
+        guard let presented = rootVC?.presentedViewController else {
+            completion?()
+            return
+        }
+        presented.dismiss(animated: animated, completion: completion)
     }
 }
 
@@ -223,12 +228,14 @@ struct PhoneAuthView: View {
         let fullNumber = "\(countryCode)\(phoneNumber)"
 
         PhoneAuthProvider.provider().verifyPhoneNumber(fullNumber, uiDelegate: sharedPhoneAuthUIDelegate) { id, error in
-            isLoading = false
-            if let error {
-                errorMessage = error.localizedDescription
-                return
+            DispatchQueue.main.async {
+                isLoading = false
+                if let error {
+                    errorMessage = error.localizedDescription
+                    return
+                }
+                verificationID = id
             }
-            verificationID = id
         }
     }
 
@@ -243,13 +250,15 @@ struct PhoneAuthView: View {
         )
 
         Auth.auth().signIn(with: credential) { _, error in
-            isLoading = false
-            if let error {
-                errorMessage = "Invalid code. Please try again."
-                otpCode = ""
-                return
+            DispatchQueue.main.async {
+                isLoading = false
+                if error != nil {
+                    errorMessage = "Invalid code. Please try again."
+                    otpCode = ""
+                    return
+                }
+                // AuthState listener in VaahanaApp automatically navigates to ContentView
             }
-            // AuthState listener in VaahanaApp automatically navigates to ContentView
         }
     }
 }
