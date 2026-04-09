@@ -139,16 +139,28 @@ class RideStorage: ObservableObject {
 struct ContentView: View {
     @StateObject private var storage = RideStorage()
     @State private var selectedMode: AppMode = .rider
-    
+    @State private var showingProfile = false
+
     var body: some View {
         VStack(spacing: 0) {
             // Header
             VStack(alignment: .leading, spacing: 4) {
-                Text("Vaahana")
-                    .font(.system(size: 48, weight: .black, design: .rounded))
-                    .padding(.horizontal)
-                    .padding(.top, 16)
-                
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Vaahana")
+                        .font(.system(size: 48, weight: .black, design: .rounded))
+                    Spacer()
+                    Button {
+                        showingProfile = true
+                    } label: {
+                        Image(systemName: "person.circle.fill")
+                            .font(.title)
+                            .foregroundStyle(.primary)
+                    }
+                    .padding(.trailing)
+                }
+                .padding(.horizontal)
+                .padding(.top, 16)
+
                 // Mode Picker
                 Picker("Mode", selection: $selectedMode) {
                     ForEach(AppMode.allCases, id: \.self) { mode in
@@ -174,6 +186,9 @@ struct ContentView: View {
         }
         .background(Color(UIColor.systemGroupedBackground))
         .environmentObject(storage)
+        .sheet(isPresented: $showingProfile) {
+            ProfileView()
+        }
     }
 }
 
