@@ -15,6 +15,7 @@ struct ProfileView: View {
     @State private var coins: Int = 0
     @State private var isSaving = false
     @State private var errorMessage: String?
+    @State private var showingHistory = false
 
     private var currentUser: FirebaseAuth.User? { Auth.auth().currentUser }
     private let db = Firestore.firestore()
@@ -83,6 +84,14 @@ struct ProfileView: View {
                         Text(error)
                             .font(.caption)
                             .foregroundStyle(.red)
+                    }
+                }
+
+                Section {
+                    NavigationLink {
+                        RideHistoryView(role: role ?? .rider)
+                    } label: {
+                        Label("Ride History", systemImage: "clock.arrow.circlepath")
                     }
                 }
 

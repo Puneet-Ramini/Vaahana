@@ -9,110 +9,328 @@ import SwiftUI
 import Combine
 import MapKit
 import FirebaseFirestore
+import FirebaseAuth
 
 // MARK: - Data Models
 
-struct Ride: Identifiable, Codable, Equatable {
-    var id: UUID
-    var name: String
-    var phone: String
-    var phoneCountryCode: String
-    var whatsappPhone: String
-    var whatsappCountryCode: String
-    var from: String
-    var to: String
-    var miles: Double
-    var coins: Int                 // community coins offered for this ride
-    var hotDuration: Int           // minutes the request stays visible (default 5)
-    var pickupDate: Date
-    var status: RideStatus
-    var createdAt: Date
+// MARK: RideStatus — full state machine
+enum RideStatus: String, Codable {
+    case posted
+    case accepted
+    case driverEnroute  = "driver_enroute"
+    case driverArrived  = "driver_arrived"
+    case rideStarted    = "ride_started"
+    case completed
+    case cancelled
+    case expired
 
-    var hotUntil: Date { createdAt.addingTimeInterval(TimeInterval(hotDuration * 60)) }
-    var isHot: Bool { hotUntil > Date() }
-    
-    var initials: String {
-        let components = name.split(separator: " ")
-        if components.count >= 2 {
-            return String(components[0].prefix(1) + components[1].prefix(1)).uppercased()
-        } else {
-            return String(name.prefix(2)).uppercased()
+    // Backward compat: old Firestore docs stored "pending" — map to .posted
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = try container.decode(String.self)
+        if raw == "pending" { self = .posted; return }
+        self = RideStatus(rawValue: raw) ?? .posted
+    }
+
+    var isActive: Bool {
+        switch self {
+        case .accepted, .driverEnroute, .driverArrived, .rideStarted: return true
+        default: return false
         }
     }
-    
-    var timeAgo: String {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .short
-        return formatter.localizedString(for: createdAt, relativeTo: Date())
+
+    var isFinal: Bool {
+        switch self {
+        case .completed, .cancelled, .expired: return true
+        default: return false
+        }
     }
-    
-    var pickupDateFormatted: String {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .short
-        formatter.timeStyle = .short
-        return formatter.string(from: pickupDate)
+
+    var riderDisplayText: String {
+        switch self {
+        case .posted:        return "Waiting for driver"
+        case .accepted:      return "Driver accepted"
+        case .driverEnroute: return "Driver on the way"
+        case .driverArrived: return "Driver arrived"
+        case .rideStarted:   return "Ride in progress"
+        case .completed:     return "Completed"
+        case .cancelled:     return "Cancelled"
+        case .expired:       return "Expired"
+        }
     }
-    
-    var pickupDateShort: String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMM d, h:mm a"
-        return formatter.string(from: pickupDate)
+
+    var driverDisplayText: String {
+        switch self {
+        case .posted:        return "Open request"
+        case .accepted:      return "Accepted"
+        case .driverEnroute: return "En route"
+        case .driverArrived: return "Arrived"
+        case .rideStarted:   return "In progress"
+        case .completed:     return "Completed"
+        case .cancelled:     return "Cancelled"
+        case .expired:       return "Expired"
+        }
     }
 }
 
-enum RideStatus: String, Codable {
-    case pending, accepted
+// MARK: CoinStatus — lifecycle of coins for a ride
+enum CoinStatus: String, Codable {
+    case none
+    case locked       // locked from rider at acceptance
+    case transferred  // transferred to driver at completion
+    case refunded     // unlocked back to rider on cancellation
 }
 
+// MARK: UserRole
 enum UserRole: String, Codable {
     case rider
     case driver
 }
 
+// MARK: Ride
+struct Ride: Identifiable, Codable, Equatable {
+    // Core identity
+    var id: UUID
+    var riderId: String
+    var status: RideStatus
+    var createdAt: Date
+    var updatedAt: Date?
+
+    // Rider contact
+    var name: String
+    var phone: String
+    var phoneCountryCode: String
+    var whatsappPhone: String
+    var whatsappCountryCode: String
+
+    // Route
+    var from: String
+    var to: String
+    var miles: Double
+    var pickupLat: Double?     // geocoded at post time
+    var pickupLng: Double?
+
+    // Details
+    var coins: Int
+    var hotDuration: Int       // minutes the request stays visible
+    var pickupDate: Date
+
+    // Driver assignment (populated on acceptance)
+    var driverId: String?
+    var driverName: String?
+    var driverPhone: String?
+    var driverWhatsapp: String?
+
+    // Coin lifecycle
+    var coinStatus: CoinStatus
+    var coinsLocked: Int
+    var coinsTransferred: Int
+
+    // State timestamps
+    var acceptedAt: Date?
+    var driverEnrouteAt: Date?
+    var arrivedAt: Date?
+    var startedAt: Date?
+    var completedAt: Date?
+    var cancelledAt: Date?
+
+    // Cancellation
+    var cancelledBy: String?
+    var cancellationReasonCode: String?
+
+    // MARK: Computed
+
+    var hotUntil: Date { createdAt.addingTimeInterval(TimeInterval(hotDuration * 60)) }
+    var isHot: Bool { hotUntil > Date() }
+
+    var initials: String {
+        let parts = name.split(separator: " ")
+        if parts.count >= 2 {
+            return String(parts[0].prefix(1) + parts[1].prefix(1)).uppercased()
+        }
+        return String(name.prefix(2)).uppercased()
+    }
+
+    var timeAgo: String {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .short
+        return f.localizedString(for: createdAt, relativeTo: Date())
+    }
+
+    var pickupDateFormatted: String {
+        let f = DateFormatter()
+        f.dateStyle = .short
+        f.timeStyle = .short
+        return f.string(from: pickupDate)
+    }
+
+    var pickupDateShort: String {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d, h:mm a"
+        return f.string(from: pickupDate)
+    }
+
+    // MARK: Convenience init (for creating new rides)
+
+    init(
+        id: UUID = UUID(),
+        riderId: String,
+        name: String,
+        phone: String,
+        phoneCountryCode: String,
+        whatsappPhone: String,
+        whatsappCountryCode: String,
+        from: String,
+        to: String,
+        miles: Double,
+        pickupLat: Double? = nil,
+        pickupLng: Double? = nil,
+        coins: Int,
+        hotDuration: Int = 5,
+        pickupDate: Date,
+        status: RideStatus = .posted,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.riderId = riderId
+        self.status = status
+        self.createdAt = createdAt
+        self.updatedAt = nil
+        self.name = name
+        self.phone = phone
+        self.phoneCountryCode = phoneCountryCode
+        self.whatsappPhone = whatsappPhone
+        self.whatsappCountryCode = whatsappCountryCode
+        self.from = from
+        self.to = to
+        self.miles = miles
+        self.pickupLat = pickupLat
+        self.pickupLng = pickupLng
+        self.coins = coins
+        self.hotDuration = hotDuration
+        self.pickupDate = pickupDate
+        self.driverId = nil
+        self.driverName = nil
+        self.driverPhone = nil
+        self.driverWhatsapp = nil
+        self.coinStatus = .none
+        self.coinsLocked = 0
+        self.coinsTransferred = 0
+        self.acceptedAt = nil
+        self.driverEnrouteAt = nil
+        self.arrivedAt = nil
+        self.startedAt = nil
+        self.completedAt = nil
+        self.cancelledAt = nil
+        self.cancelledBy = nil
+        self.cancellationReasonCode = nil
+    }
+
+    // MARK: Custom Decoder — backward compat with old Firestore docs
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id                     = try c.decode(UUID.self, forKey: .id)
+        riderId                = (try? c.decodeIfPresent(String.self, forKey: .riderId))              ?? ""
+        status                 = (try? c.decodeIfPresent(RideStatus.self, forKey: .status))            ?? .posted
+        createdAt              = (try? c.decodeIfPresent(Date.self, forKey: .createdAt))               ?? Date()
+        updatedAt              = try? c.decodeIfPresent(Date.self, forKey: .updatedAt)
+        name                   = (try? c.decodeIfPresent(String.self, forKey: .name))                  ?? ""
+        phone                  = (try? c.decodeIfPresent(String.self, forKey: .phone))                 ?? ""
+        phoneCountryCode       = (try? c.decodeIfPresent(String.self, forKey: .phoneCountryCode))      ?? "+1"
+        whatsappPhone          = (try? c.decodeIfPresent(String.self, forKey: .whatsappPhone))         ?? ""
+        whatsappCountryCode    = (try? c.decodeIfPresent(String.self, forKey: .whatsappCountryCode))   ?? "+1"
+        from                   = (try? c.decodeIfPresent(String.self, forKey: .from))                  ?? ""
+        to                     = (try? c.decodeIfPresent(String.self, forKey: .to))                    ?? ""
+        miles                  = (try? c.decodeIfPresent(Double.self, forKey: .miles))                 ?? 0
+        pickupLat              = try? c.decodeIfPresent(Double.self, forKey: .pickupLat)
+        pickupLng              = try? c.decodeIfPresent(Double.self, forKey: .pickupLng)
+        coins                  = (try? c.decodeIfPresent(Int.self, forKey: .coins))                    ?? 0
+        hotDuration            = (try? c.decodeIfPresent(Int.self, forKey: .hotDuration))              ?? 5
+        pickupDate             = (try? c.decodeIfPresent(Date.self, forKey: .pickupDate))              ?? Date()
+        driverId               = try? c.decodeIfPresent(String.self, forKey: .driverId)
+        driverName             = try? c.decodeIfPresent(String.self, forKey: .driverName)
+        driverPhone            = try? c.decodeIfPresent(String.self, forKey: .driverPhone)
+        driverWhatsapp         = try? c.decodeIfPresent(String.self, forKey: .driverWhatsapp)
+        coinStatus             = (try? c.decodeIfPresent(CoinStatus.self, forKey: .coinStatus))        ?? .none
+        coinsLocked            = (try? c.decodeIfPresent(Int.self, forKey: .coinsLocked))              ?? 0
+        coinsTransferred       = (try? c.decodeIfPresent(Int.self, forKey: .coinsTransferred))         ?? 0
+        acceptedAt             = try? c.decodeIfPresent(Date.self, forKey: .acceptedAt)
+        driverEnrouteAt        = try? c.decodeIfPresent(Date.self, forKey: .driverEnrouteAt)
+        arrivedAt              = try? c.decodeIfPresent(Date.self, forKey: .arrivedAt)
+        startedAt              = try? c.decodeIfPresent(Date.self, forKey: .startedAt)
+        completedAt            = try? c.decodeIfPresent(Date.self, forKey: .completedAt)
+        cancelledAt            = try? c.decodeIfPresent(Date.self, forKey: .cancelledAt)
+        cancelledBy            = try? c.decodeIfPresent(String.self, forKey: .cancelledBy)
+        cancellationReasonCode = try? c.decodeIfPresent(String.self, forKey: .cancellationReasonCode)
+    }
+}
+
 // MARK: - Storage Manager
 
 class RideStorage: ObservableObject {
-    @Published var rides: [Ride] = []
-    @Published var myRideIDs: [UUID] = []
+    /// Rider's own rides (all statuses), sorted newest first
+    @Published var myRides: [Ride] = []
+    /// Posted rides visible to drivers (status == .posted)
+    @Published var postedRides: [Ride] = []
+    /// Current active ride for either role (non-final, non-posted status)
+    @Published var activeRide: Ride? = nil
     @Published var isLoading = true
 
     private let db = Firestore.firestore()
-    private var listener: ListenerRegistration?
+    private var listeners: [ListenerRegistration] = []
 
-    init() {
-        loadMyRideIDs()
+    let uid: String
+    let role: UserRole
+
+    init(role: UserRole) {
+        self.role = role
+        self.uid = Auth.auth().currentUser?.uid ?? ""
         startListening()
     }
 
     deinit {
-        listener?.remove()
-    }
-
-    private func loadMyRideIDs() {
-        guard let data = UserDefaults.standard.data(forKey: "myRideIDs"),
-              let ids = try? JSONDecoder().decode([UUID].self, from: data) else { return }
-        myRideIDs = ids
-    }
-
-    private func persistMyRideIDs() {
-        if let encoded = try? JSONEncoder().encode(myRideIDs) {
-            UserDefaults.standard.set(encoded, forKey: "myRideIDs")
-        }
+        listeners.forEach { $0.remove() }
     }
 
     private func startListening() {
-        listener = db.collection("rides")
-            .addSnapshotListener { [weak self] snapshot, _ in
-                guard let self, let snapshot else { return }
-                self.rides = snapshot.documents.compactMap { try? $0.data(as: Ride.self) }
-                self.isLoading = false
-            }
+        if role == .rider {
+            // Rider sees their own rides, keyed by riderId
+            let l = db.collection("rides")
+                .whereField("riderId", isEqualTo: uid)
+                .addSnapshotListener { [weak self] snapshot, _ in
+                    guard let self, let snapshot else { return }
+                    let rides = snapshot.documents.compactMap { try? $0.data(as: Ride.self) }
+                    self.myRides = rides.sorted { $0.createdAt > $1.createdAt }
+                    self.activeRide = rides.first { $0.status.isActive }
+                    self.isLoading = false
+                }
+            listeners.append(l)
+        } else {
+            // Driver sees all posted (hot) rides
+            let l = db.collection("rides")
+                .whereField("status", isEqualTo: "posted")
+                .addSnapshotListener { [weak self] snapshot, _ in
+                    guard let self, let snapshot else { return }
+                    self.postedRides = snapshot.documents.compactMap { try? $0.data(as: Ride.self) }
+                    self.isLoading = false
+                }
+            listeners.append(l)
+
+            // Driver also listens for any ride they've accepted
+            let l2 = db.collection("rides")
+                .whereField("driverId", isEqualTo: uid)
+                .addSnapshotListener { [weak self] snapshot, _ in
+                    guard let self, let snapshot else { return }
+                    let driverRides = snapshot.documents.compactMap { try? $0.data(as: Ride.self) }
+                    self.activeRide = driverRides.first { $0.status.isActive }
+                }
+            listeners.append(l2)
+        }
     }
 
     func addRide(_ ride: Ride) {
         try? db.collection("rides").document(ride.id.uuidString).setData(from: ride)
-        myRideIDs.append(ride.id)
-        persistMyRideIDs()
     }
 
     func updateRide(_ ride: Ride) {
@@ -121,24 +339,11 @@ class RideStorage: ObservableObject {
 
     func deleteRide(_ ride: Ride) {
         db.collection("rides").document(ride.id.uuidString).delete()
-        myRideIDs.removeAll { $0 == ride.id }
-        persistMyRideIDs()
     }
 
-    var myRides: [Ride] {
-        rides.filter { myRideIDs.contains($0.id) }
-    }
-
-    var pendingRides: [Ride] {
-        rides.filter { $0.status == .pending }
-    }
-
-    var acceptedRides: [Ride] {
-        rides.filter { $0.status == .accepted }
-    }
-
-    var hotPendingRides: [Ride] {
-        rides.filter { $0.status == .pending && $0.isHot }
+    /// Hot posted rides — used by driver discovery
+    var hotPostedRides: [Ride] {
+        postedRides.filter { $0.isHot }
     }
 }
 
@@ -146,8 +351,13 @@ class RideStorage: ObservableObject {
 
 struct ContentView: View {
     let role: UserRole
-    @StateObject private var storage = RideStorage()
+    @StateObject private var storage: RideStorage
     @State private var showingProfile = false
+
+    init(role: UserRole) {
+        self.role = role
+        _storage = StateObject(wrappedValue: RideStorage(role: role))
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -191,67 +401,122 @@ struct RiderView: View {
     @EnvironmentObject var storage: RideStorage
     @State private var showingPostSheet = false
     @State private var editingRide: Ride?
-    
+    @State private var showingActiveRide = false
+    @State private var showingHistory = false
+
+    var pastRides: [Ride] {
+        storage.myRides.filter { $0.status.isFinal }
+    }
+
+    var postedRides: [Ride] {
+        storage.myRides.filter { $0.status == .posted }
+    }
+
     var body: some View {
         ZStack {
             if storage.isLoading {
                 ProgressView("Loading...")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if storage.myRides.isEmpty {
-                // Empty State
-                VStack(spacing: 16) {
-                    Text("🚗")
-                        .font(.system(size: 72))
-                    Text("No requests yet")
-                        .font(.headline)
-                    Text("Post your first ride request.\nDrivers nearby will reach out on WhatsApp.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 32)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 12) {
-                        ForEach(storage.myRides.sorted(by: { $0.createdAt > $1.createdAt })) { ride in
-                            RideCard(ride: ride, isDriverMode: false, onEdit: {
-                                editingRide = ride
-                            }, onDelete: {
-                                deleteRide(ride)
-                            })
+                        // Active ride banner (if any)
+                        if let active = storage.activeRide {
+                            activeRideBanner(active)
+                        }
+
+                        // Posted (hot) requests
+                        if postedRides.isEmpty && storage.activeRide == nil {
+                            emptyState
+                        } else {
+                            ForEach(postedRides) { ride in
+                                RideCard(ride: ride, isDriverMode: false, onEdit: {
+                                    editingRide = ride
+                                }, onDelete: {
+                                    storage.deleteRide(ride)
+                                })
+                            }
+                        }
+
+                        // Past rides section
+                        if !pastRides.isEmpty {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Past Rides")
+                                    .font(.subheadline).fontWeight(.semibold)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 4)
+                                ForEach(pastRides) { ride in
+                                    RideCard(ride: ride, isDriverMode: false, onEdit: nil, onDelete: nil)
+                                }
+                            }
                         }
                     }
                     .padding()
-                    .padding(.bottom, 80) // Space for button
+                    .padding(.bottom, 80)
                 }
             }
         }
         .safeAreaInset(edge: .bottom) {
-            Button {
-                showingPostSheet = true
-            } label: {
-                Text("+ Request a Ride")
-                    .font(.headline)
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding()
-                    .background(Color.black)
-                    .cornerRadius(12)
+            if storage.activeRide == nil {
+                Button {
+                    showingPostSheet = true
+                } label: {
+                    Text("+ Request a Ride")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(Color.black)
+                        .cornerRadius(12)
+                }
+                .padding()
+                .background(Color(UIColor.systemGroupedBackground))
             }
-            .padding()
-            .background(Color(UIColor.systemGroupedBackground))
         }
-        .sheet(isPresented: $showingPostSheet) {
-            PostRideSheet()
-        }
-        .sheet(item: $editingRide) { ride in
-            PostRideSheet(editingRide: ride)
+        .sheet(isPresented: $showingPostSheet) { PostRideSheet() }
+        .sheet(item: $editingRide) { ride in PostRideSheet(editingRide: ride) }
+        .sheet(isPresented: $showingActiveRide) {
+            if let active = storage.activeRide {
+                ActiveRideView(ride: active, role: .rider)
+            }
         }
     }
-    
-    func deleteRide(_ ride: Ride) {
-        storage.deleteRide(ride)
+
+    private func activeRideBanner(_ ride: Ride) -> some View {
+        Button { showingActiveRide = true } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "car.circle.fill")
+                    .font(.largeTitle)
+                    .foregroundStyle(.blue)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Ride in Progress").font(.caption).foregroundStyle(.secondary)
+                    Text(ride.status.riderDisplayText)
+                        .font(.headline).foregroundStyle(.blue)
+                    Text("\(ride.from) → \(ride.to)")
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .padding()
+            .background(Color.blue.opacity(0.08))
+            .cornerRadius(14)
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.blue.opacity(0.3), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 16) {
+            Text("🚗").font(.system(size: 72))
+            Text("No requests yet").font(.headline)
+            Text("Post your first ride request.\nDrivers nearby will reach out.")
+                .font(.subheadline).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center).padding(.horizontal, 32)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 60)
     }
 }
 
@@ -260,9 +525,9 @@ struct RiderView: View {
 struct DriverView: View {
     @EnvironmentObject var storage: RideStorage
     @State private var selectedRide: Ride?
-    @State private var rideLocations: [UUID: CLLocationCoordinate2D] = [:]
+    @State private var isOnline = true
+    @State private var showingActiveRide = false
     @State private var cameraPosition: MapCameraPosition = .automatic
-    @State private var hasSetInitialCamera = false
     @StateObject private var locationManager = LocationManager()
 
     // Persisted filter settings
@@ -281,12 +546,14 @@ struct DriverView: View {
     var radiusMeters: CLLocationDistance { filterRadius * 1609.34 }
 
     var filteredRides: [Ride] {
-        let hot = storage.hotPendingRides
+        guard isOnline else { return [] }
+        let hot = storage.hotPostedRides
         guard let center = effectiveCenter else { return hot }
         let centerLoc = CLLocation(latitude: center.latitude, longitude: center.longitude)
         return hot.filter { ride in
-            guard let coord = rideLocations[ride.id] else { return true }
-            return (centerLoc.distance(from: CLLocation(latitude: coord.latitude, longitude: coord.longitude)) / 1609.34) <= filterRadius
+            guard let lat = ride.pickupLat, let lng = ride.pickupLng else { return true }
+            let dist = centerLoc.distance(from: CLLocation(latitude: lat, longitude: lng)) / 1609.34
+            return dist <= filterRadius
         }
     }
 
@@ -328,10 +595,10 @@ struct DriverView: View {
                             }
                         }
 
-                        // Ride pins
+                        // Ride pins (using stored geocoded coords)
                         ForEach(filteredRides) { ride in
-                            if let loc = rideLocations[ride.id] {
-                                Annotation(ride.from, coordinate: loc) {
+                            if let lat = ride.pickupLat, let lng = ride.pickupLng {
+                                Annotation(ride.from, coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lng)) {
                                     rideAnnotationView(for: ride)
                                 }
                             }
@@ -363,10 +630,21 @@ struct DriverView: View {
                 controlPanel
             }
         }
-        .task { await loadRideLocations() }
-        .onChange(of: storage.rides) { _, _ in Task { await loadRideLocations() } }
         .onAppear { locationManager.requestLocation() }
+        .onChange(of: locationManager.location) { _, loc in
+            guard !driverCenterCustom, let loc else { return }
+            cameraPosition = .region(MKCoordinateRegion(
+                center: loc.coordinate,
+                latitudinalMeters: radiusMeters * 3,
+                longitudinalMeters: radiusMeters * 3
+            ))
+        }
         .sheet(item: $selectedRide) { ride in RideDetailSheet(ride: ride) }
+        .sheet(isPresented: $showingActiveRide) {
+            if let active = storage.activeRide {
+                ActiveRideView(ride: active, role: .driver)
+            }
+        }
     }
 
     // MARK: - Control Panel
@@ -379,6 +657,46 @@ struct DriverView: View {
                 .frame(width: 36, height: 4)
                 .padding(.top, 10)
                 .padding(.bottom, 12)
+
+            // Active ride banner
+            if let active = storage.activeRide {
+                Button { showingActiveRide = true } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "car.circle.fill")
+                            .font(.title2).foregroundStyle(.blue)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Active Ride").font(.caption).foregroundStyle(.secondary)
+                            Text(active.status.driverDisplayText).font(.subheadline).fontWeight(.semibold).foregroundStyle(.blue)
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal).padding(.vertical, 10)
+                    .background(Color.blue.opacity(0.08))
+                }
+                .buttonStyle(.plain)
+                Divider()
+            }
+
+            // Online / Offline toggle
+            HStack {
+                Label(isOnline ? "Online" : "Offline", systemImage: isOnline ? "antenna.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash")
+                    .font(.subheadline).fontWeight(.semibold)
+                    .foregroundStyle(isOnline ? .green : .secondary)
+                Spacer()
+                Toggle("", isOn: $isOnline)
+                    .labelsHidden()
+                    .tint(.green)
+                    .onChange(of: isOnline) { _, online in
+                        guard let uid = Auth.auth().currentUser?.uid else { return }
+                        Firestore.firestore().collection("users").document(uid)
+                            .setData(["isAvailable": online], merge: true)
+                    }
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+
+            Divider()
 
             // Location + radius
             VStack(spacing: 10) {
@@ -448,9 +766,9 @@ struct DriverView: View {
                 ProgressView().frame(maxWidth: .infinity).padding()
             } else if filteredRides.isEmpty {
                 VStack(spacing: 6) {
-                    Image(systemName: storage.hotPendingRides.isEmpty ? "flame.slash" : "map.circle")
+                    Image(systemName: storage.hotPostedRides.isEmpty ? "flame.slash" : "map.circle")
                         .font(.title2).foregroundStyle(.secondary)
-                    Text(storage.hotPendingRides.isEmpty
+                    Text(storage.hotPostedRides.isEmpty
                          ? "No hot requests right now"
                          : "No hot requests within \(Int(filterRadius)) mi")
                         .font(.subheadline).foregroundStyle(.secondary)
@@ -488,34 +806,6 @@ struct DriverView: View {
         }
     }
 
-    // MARK: - Data
-
-    func loadRideLocations() async {
-        let calculator = DistanceCalculator()
-        var locations = rideLocations
-        for ride in storage.rides where locations[ride.id] == nil {
-            if let coord = try? await calculator.geocode(address: ride.from) {
-                locations[ride.id] = CLLocationCoordinate2D(latitude: coord.lat, longitude: coord.lon)
-            }
-        }
-        await MainActor.run {
-            rideLocations = locations
-            guard !hasSetInitialCamera else { return }
-            hasSetInitialCamera = true
-            if let center = effectiveCenter {
-                cameraPosition = .region(MKCoordinateRegion(
-                    center: center,
-                    latitudinalMeters: radiusMeters * 3,
-                    longitudinalMeters: radiusMeters * 3
-                ))
-            } else if let first = locations.values.first {
-                cameraPosition = .region(MKCoordinateRegion(
-                    center: first,
-                    span: MKCoordinateSpan(latitudeDelta: 0.5, longitudeDelta: 0.5)
-                ))
-            }
-        }
-    }
 }
 
 // MARK: - Location Manager
@@ -610,7 +900,7 @@ struct CompactRideRow: View {
                 
                 // Status indicator
                 Circle()
-                    .fill(ride.status == .pending ? Color.black : Color.green)
+                    .fill(ride.status == .posted ? Color.black : Color.green)
                     .frame(width: 8, height: 8)
                 
                 Image(systemName: "chevron.right")
@@ -634,6 +924,8 @@ struct RideDetailSheet: View {
     @EnvironmentObject var storage: RideStorage
     @Environment(\.dismiss) var dismiss
     @State private var showingAcceptConfirmation = false
+    @State private var isAccepting = false
+    @State private var acceptError: String?
     
     var body: some View {
         NavigationStack {
@@ -736,7 +1028,7 @@ struct RideDetailSheet: View {
                     .cornerRadius(12)
                     
                     // Actions
-                    if ride.status == .pending {
+                    if ride.status == .posted {
                         VStack(spacing: 12) {
                             Button {
                                 openWhatsApp()
@@ -801,9 +1093,32 @@ struct RideDetailSheet: View {
     }
     
     func acceptRide() {
-        var updatedRide = ride
-        updatedRide.status = .accepted
-        storage.updateRide(updatedRide)
+        guard let uid = Auth.auth().currentUser?.uid else { return }
+        isAccepting = true
+        acceptError = nil
+        Task {
+            do {
+                // Load driver profile
+                let db = Firestore.firestore()
+                let profileData = try? await db.collection("users").document(uid).getDocument().data()
+                let driverName    = Auth.auth().currentUser?.displayName ?? (profileData?["displayName"] as? String ?? "Driver")
+                let driverPhone   = profileData?["phone"] as? String ?? ""
+                let driverWhatsapp = profileData?["whatsapp"] as? String ?? driverPhone
+
+                try await RideService.shared.acceptRide(
+                    ride,
+                    driverName: driverName,
+                    driverPhone: driverPhone,
+                    driverWhatsapp: driverWhatsapp
+                )
+                await MainActor.run { dismiss() }
+            } catch {
+                await MainActor.run {
+                    acceptError = error.localizedDescription
+                    isAccepting = false
+                }
+            }
+        }
     }
 
     func openWhatsApp() {
@@ -991,8 +1306,10 @@ struct PostRideSheet: View {
     @State private var whatsappPhone = ""
     @State private var sameNumberForBoth = true
     @State private var isCalculatingDistance = false
+    @State private var isSubmitting = false
     @State private var distanceError: String?
-    
+    @State private var cachedPickupCoord: (lat: Double, lon: Double)? = nil
+
     private let distanceCalculator = DistanceCalculator()
     
     init(editingRide: Ride? = nil) {
@@ -1026,7 +1343,8 @@ struct PostRideSheet: View {
         coins > 0 &&
         !name.isEmpty &&
         phone.count >= 6 &&
-        (sameNumberForBoth || whatsappPhone.count >= 6)
+        (sameNumberForBoth || whatsappPhone.count >= 6) &&
+        !isSubmitting
     }
     
     var canCalculateDistance: Bool {
@@ -1215,13 +1533,19 @@ struct PostRideSheet: View {
                 Button {
                     submitRide()
                 } label: {
-                    Text(editingRide == nil ? "Post Ride Request" : "Update Ride Request")
-                        .font(.headline)
-                        .foregroundStyle(.white)
-                        .frame(maxWidth: .infinity)
-                        .padding()
-                        .background(isValid ? Color.black : Color.gray)
-                        .cornerRadius(12)
+                    Group {
+                        if isSubmitting {
+                            ProgressView().tint(.white)
+                        } else {
+                            Text(editingRide == nil ? "Post Ride Request" : "Update Ride Request")
+                        }
+                    }
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(isValid ? Color.black : Color.gray)
+                    .cornerRadius(12)
                 }
                 .disabled(!isValid)
                 .padding()
@@ -1252,7 +1576,7 @@ struct PostRideSheet: View {
     func submitRide() {
         let finalWhatsappPhone = sameNumberForBoth ? phone : whatsappPhone
         let finalWhatsappCountryCode = sameNumberForBoth ? phoneCountryCode : whatsappCountryCode
-        
+
         if let editingRide = editingRide {
             var updatedRide = editingRide
             updatedRide.name = name
@@ -1267,41 +1591,54 @@ struct PostRideSheet: View {
             updatedRide.hotDuration = hotDuration
             updatedRide.pickupDate = pickupDate
             storage.updateRide(updatedRide)
+            dismiss()
         } else {
-            let ride = Ride(
-                id: UUID(),
-                name: name,
-                phone: phone,
-                phoneCountryCode: phoneCountryCode,
-                whatsappPhone: finalWhatsappPhone,
-                whatsappCountryCode: finalWhatsappCountryCode,
-                from: pickupFrom,
-                to: goingTo,
-                miles: miles,
-                coins: coins,
-                hotDuration: hotDuration,
-                pickupDate: pickupDate,
-                status: .pending,
-                createdAt: Date()
-            )
-            storage.addRide(ride)
+            // Geocode pickup location before saving so drivers can filter by distance
+            isSubmitting = true
+            Task {
+                // Use cached coord if available (from "Calculate Distance" tap)
+                var lat = cachedPickupCoord?.lat
+                var lng = cachedPickupCoord?.lon
+                if lat == nil, let coord = try? await distanceCalculator.geocode(address: pickupFrom) {
+                    lat = coord.lat
+                    lng = coord.lon
+                }
+                let ride = Ride(
+                    riderId: Auth.auth().currentUser?.uid ?? "",
+                    name: name,
+                    phone: phone,
+                    phoneCountryCode: phoneCountryCode,
+                    whatsappPhone: finalWhatsappPhone,
+                    whatsappCountryCode: finalWhatsappCountryCode,
+                    from: pickupFrom,
+                    to: goingTo,
+                    miles: miles,
+                    pickupLat: lat,
+                    pickupLng: lng,
+                    coins: coins,
+                    hotDuration: hotDuration,
+                    pickupDate: pickupDate,
+                    status: .posted
+                )
+                await MainActor.run {
+                    storage.addRide(ride)
+                    isSubmitting = false
+                    dismiss()
+                }
+            }
         }
-        
-        dismiss()
     }
     
     func calculateDistance() {
         Task {
             isCalculatingDistance = true
             distanceError = nil
-            
             do {
-                let calculatedMiles = try await distanceCalculator.calculateDistance(
-                    from: pickupFrom,
-                    to: goingTo
-                )
-                
+                // Geocode pickup first (cache the coord for submission)
+                let coord = try await distanceCalculator.geocode(address: pickupFrom)
+                let calculatedMiles = try await distanceCalculator.calculateDistance(from: pickupFrom, to: goingTo)
                 await MainActor.run {
+                    cachedPickupCoord = coord
                     milesText = String(format: "%.1f", calculatedMiles)
                     coinsText = "\(max(1, Int(calculatedMiles)))"
                     isCalculatingDistance = false
@@ -1423,7 +1760,7 @@ struct RideCard: View {
             Divider()
             
             // Actions
-            if ride.status == .pending {
+            if ride.status == .posted {
                 if isDriverMode {
                     HStack(spacing: 12) {
                         Button {
@@ -1531,25 +1868,56 @@ func formatCountdown(_ seconds: TimeInterval) -> String {
 
 struct StatusChip: View {
     let status: RideStatus
-    
+
+    var label: String {
+        switch status {
+        case .posted:        return "Posted"
+        case .accepted:      return "Accepted"
+        case .driverEnroute: return "En Route"
+        case .driverArrived: return "Arrived"
+        case .rideStarted:   return "In Progress"
+        case .completed:     return "Completed"
+        case .cancelled:     return "Cancelled"
+        case .expired:       return "Expired"
+        }
+    }
+
+    var icon: String {
+        switch status {
+        case .posted:        return "circle.fill"
+        case .accepted:      return "checkmark"
+        case .driverEnroute: return "car.fill"
+        case .driverArrived: return "mappin.circle.fill"
+        case .rideStarted:   return "play.circle.fill"
+        case .completed:     return "checkmark.circle.fill"
+        case .cancelled:     return "xmark.circle.fill"
+        case .expired:       return "clock.badge.xmark"
+        }
+    }
+
+    var color: Color {
+        switch status {
+        case .posted:                return .secondary
+        case .accepted:              return .blue
+        case .driverEnroute,
+             .driverArrived:        return .orange
+        case .rideStarted:           return .green
+        case .completed:             return .green
+        case .cancelled, .expired:   return .red
+        }
+    }
+
     var body: some View {
         HStack(spacing: 4) {
-            if status == .pending {
-                Image(systemName: "circle.fill")
-                    .font(.system(size: 6))
-                Text("Pending")
-            } else {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 10))
-                Text("Accepted")
-            }
+            Image(systemName: icon).font(.system(size: 8))
+            Text(label)
         }
         .font(.caption)
         .fontWeight(.medium)
-        .foregroundStyle(status == .pending ? Color.secondary : Color.green)
+        .foregroundStyle(color)
         .padding(.horizontal, 10)
         .padding(.vertical, 4)
-        .background(status == .pending ? Color.gray.opacity(0.15) : Color.green.opacity(0.15))
+        .background(color.opacity(0.15))
         .cornerRadius(12)
     }
 }
