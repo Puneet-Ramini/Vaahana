@@ -549,6 +549,7 @@ struct DriverView: View {
     @State private var selectedRide: Ride?
     @State private var isOnline = true
     @State private var showingActiveRide = false
+    @State private var showingMyBids = false
     @State private var cameraPosition: MapCameraPosition = .automatic
     @StateObject private var locationManager = LocationManager()
 
@@ -667,6 +668,9 @@ struct DriverView: View {
                 ActiveRideView(ride: active, role: .driver)
             }
         }
+        .sheet(isPresented: $showingMyBids) {
+            DriverBidsView()
+        }
     }
 
     // MARK: - Control Panel
@@ -699,6 +703,24 @@ struct DriverView: View {
                 .buttonStyle(.plain)
                 Divider()
             }
+
+            // My Bids shortcut
+            Button { showingMyBids = true } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "list.bullet.rectangle.portrait.fill")
+                        .font(.title3).foregroundStyle(.purple)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("My Bids").font(.subheadline).fontWeight(.semibold)
+                        Text("Track bids you've placed").font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal).padding(.vertical, 10)
+                .background(Color.purple.opacity(0.07))
+            }
+            .buttonStyle(.plain)
+            Divider()
 
             // Online / Offline toggle
             HStack {
@@ -1810,25 +1832,46 @@ struct RideCard: View {
                     }
                 } else {
                     // Rider mode - show edit/delete buttons
-                    HStack(spacing: 12) {
-                        Button {
-                            onEdit?()
-                        } label: {
-                            Label("Edit", systemImage: "pencil")
-                                .font(.subheadline)
-                                .foregroundStyle(.blue)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 8)
+                    if ride.bidCount > 0 {
+                        // Edit locked — drivers have placed bids
+                        VStack(spacing: 6) {
+                            Label("Editing locked — \(ride.bidCount) driver bid\(ride.bidCount == 1 ? "" : "s") placed", systemImage: "lock.fill")
+                                .font(.caption).fontWeight(.semibold)
+                                .foregroundStyle(.orange)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Button {
+                                onDelete?()
+                            } label: {
+                                Label("Cancel Ride", systemImage: "xmark")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.red)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                                    .background(Color.red.opacity(0.1))
+                                    .cornerRadius(8)
+                            }
                         }
-                        
-                        Button {
-                            onDelete?()
-                        } label: {
-                            Label("Cancel", systemImage: "xmark")
-                                .font(.subheadline)
-                                .foregroundStyle(.red)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 8)
+                    } else {
+                        HStack(spacing: 12) {
+                            Button {
+                                onEdit?()
+                            } label: {
+                                Label("Edit", systemImage: "pencil")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.blue)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                            }
+
+                            Button {
+                                onDelete?()
+                            } label: {
+                                Label("Cancel", systemImage: "xmark")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.red)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                            }
                         }
                     }
                 }

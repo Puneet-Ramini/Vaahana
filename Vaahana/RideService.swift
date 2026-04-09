@@ -179,6 +179,7 @@ final class RideService {
 
     /// Driver places or updates their bid on a posted ride.
     /// One active bid per driver per ride — upserts if one already exists.
+    /// Rejects if driver is offline (isAvailable == false) or already on an active ride (activeRideId set).
     func placeBid(
         ride: Ride,
         existingBidId: String?,
@@ -191,6 +192,20 @@ final class RideService {
         guard let driverId = Auth.auth().currentUser?.uid else {
             throw RideServiceError.notAuthenticated
         }
+
+        // Guard: driver must be online and not on an active ride
+        let driverSnap = try await db.collection("users").document(driverId).getDocument()
+        let driverData = driverSnap.data() ?? [:]
+        let isAvailable  = driverData["isAvailable"] as? Bool ?? true
+        let activeRideId = driverData["activeRideId"] as? String
+
+        if !isAvailable {
+            throw RideServiceError.driverOffline
+        }
+        if let arId = activeRideId, !arId.isEmpty {
+            throw RideServiceError.driverBusy
+        }
+
         let rideRef  = db.collection("rides").document(ride.id.uuidString)
         let bidsRef  = rideRef.collection("bids")
         let now      = Timestamp(date: Date())
@@ -209,7 +224,7 @@ final class RideService {
                 try await rideRef.updateData(["lowestBidCoins": bidCoins, "latestBidAt": now])
             }
         } else {
-            // New bid — create document
+            // New bid — create document, embed route info for collection-group queries
             let bidId = UUID().uuidString
             var bidData: [String: Any] = [
                 "id":             bidId,
@@ -221,7 +236,11 @@ final class RideService {
                 "bidCoins":       bidCoins,
                 "status":         "active",
                 "createdAt":      now,
-                "updatedAt":      now
+                "updatedAt":      now,
+                // Denormalized route info for DriverBidsStore collection-group listener
+                "rideFrom":       ride.from,
+                "rideTo":         ride.to,
+                "rideCoins":      ride.coins
             ]
             if let msg = message { bidData["message"] = msg }
             try await bidsRef.document(bidId).setData(bidData)
@@ -253,14 +272,17 @@ final class RideService {
     // MARK: - Select Bid (rider)
 
     /// Rider selects a driver bid. Runs a Firestore transaction to atomically:
+    /// - verify chosen driver has no active ride
     /// - mark ride accepted with selected driver details
     /// - lock finalCoins from rider
     /// - mark chosen bid as selected
-    /// Then batch-rejects remaining active bids outside the transaction.
+    /// Then batch-rejects remaining bids on this ride and auto-closes the selected
+    /// driver's other active bids across all rides.
     func selectBid(ride: Ride, bid: RideBid) async throws {
         let rideRef   = db.collection("rides").document(ride.id.uuidString)
         let bidRef    = rideRef.collection("bids").document(bid.id)
         let riderRef  = db.collection("users").document(ride.riderId)
+        let driverRef = db.collection("users").document(bid.driverId)
         let now       = Date()
 
         // Transaction: verify + accept + lock coins
@@ -284,6 +306,18 @@ final class RideService {
                 errorPointer?.pointee = NSError(
                     domain: "RideService", code: 410,
                     userInfo: [NSLocalizedDescriptionKey: "This bid is no longer available."])
+                return nil
+            }
+
+            // Verify the chosen driver is not already on an active ride
+            let driverDoc: DocumentSnapshot
+            do { driverDoc = try transaction.getDocument(driverRef) }
+            catch let e { errorPointer?.pointee = e as NSError; return nil }
+
+            if let arId = driverDoc.data()?["activeRideId"] as? String, !arId.isEmpty {
+                errorPointer?.pointee = NSError(
+                    domain: "RideService", code: 423,
+                    userInfo: [NSLocalizedDescriptionKey: "This driver just accepted another ride. Please choose a different driver."])
                 return nil
             }
 
@@ -320,6 +354,11 @@ final class RideService {
                 "coinsLocked": FieldValue.increment(Int64(bid.bidCoins))
             ], forDocument: riderRef)
 
+            // Mark the driver's activeRideId so they can't be double-booked
+            transaction.updateData([
+                "activeRideId": ride.id.uuidString
+            ], forDocument: driverRef)
+
             // Mark winning bid as selected
             transaction.updateData([
                 "status":    "selected",
@@ -329,7 +368,7 @@ final class RideService {
             return nil
         }
 
-        // Batch-reject all remaining active bids (outside transaction for scalability)
+        // Batch-reject all remaining active bids on this ride (outside transaction)
         if let otherBids = try? await rideRef.collection("bids")
             .whereField("status", isEqualTo: "active")
             .getDocuments() {
@@ -337,6 +376,20 @@ final class RideService {
                 let batch = db.batch()
                 for doc in otherBids.documents {
                     batch.updateData(["status": "rejected", "updatedAt": Timestamp(date: now)], forDocument: doc.reference)
+                }
+                try? await batch.commit()
+            }
+        }
+
+        // Auto-close all other active bids by this driver across all rides
+        if let driverOtherBids = try? await db.collectionGroup("bids")
+            .whereField("driverId", isEqualTo: bid.driverId)
+            .whereField("status", isEqualTo: "active")
+            .getDocuments() {
+            if !driverOtherBids.documents.isEmpty {
+                let batch = db.batch()
+                for doc in driverOtherBids.documents {
+                    batch.updateData(["status": "autoClosed", "updatedAt": Timestamp(date: now)], forDocument: doc.reference)
                 }
                 try? await batch.commit()
             }
@@ -367,11 +420,15 @@ final class RideService {
 enum RideServiceError: LocalizedError {
     case notAuthenticated
     case missingDriver
+    case driverOffline
+    case driverBusy
 
     var errorDescription: String? {
         switch self {
         case .notAuthenticated: return "You must be signed in to perform this action."
         case .missingDriver:    return "No driver assigned to this ride."
+        case .driverOffline:    return "You must be online to place a bid. Turn on your availability toggle."
+        case .driverBusy:       return "You already have an active ride. Complete or cancel it before placing new bids."
         }
     }
 }

@@ -16,6 +16,21 @@ enum BidStatus: String, Codable {
     case rejected   // rider chose someone else
     case withdrawn  // driver cancelled their bid
     case expired    // ride expired or was cancelled before selection
+    case autoClosed // system-closed: driver got selected on a different ride
+
+    var displayLabel: String {
+        switch self {
+        case .active:     return "Pending"
+        case .selected:   return "Selected"
+        case .rejected:   return "Not chosen"
+        case .withdrawn:  return "Withdrawn"
+        case .expired:    return "Expired"
+        case .autoClosed: return "Closed — accepted another ride"
+        }
+    }
+
+    var isOpen: Bool { self == .active }
+    var isClosed: Bool { self == .rejected || self == .expired || self == .autoClosed || self == .withdrawn }
 }
 
 // MARK: - RideBid
