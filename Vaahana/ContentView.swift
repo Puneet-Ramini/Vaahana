@@ -260,300 +260,257 @@ struct RiderView: View {
 struct DriverView: View {
     @EnvironmentObject var storage: RideStorage
     @State private var selectedRide: Ride?
-    @State private var showingList = true
-    @State private var showingFilters = false
-    @State private var showingRideDetail = false
     @State private var rideLocations: [UUID: CLLocationCoordinate2D] = [:]
     @State private var cameraPosition: MapCameraPosition = .automatic
+    @State private var hasSetInitialCamera = false
     @StateObject private var locationManager = LocationManager()
-    
-    // Filter settings
+
+    // Persisted filter settings
     @AppStorage("filterRadius") private var filterRadius = 5.0
-    @State private var tempFilterRadius = 5.0
+    @AppStorage("driverCenterLat") private var driverCenterLat: Double = 0
+    @AppStorage("driverCenterLon") private var driverCenterLon: Double = 0
+    @AppStorage("driverCenterCustom") private var driverCenterCustom: Bool = false
+
+    var effectiveCenter: CLLocationCoordinate2D? {
+        if driverCenterCustom {
+            return CLLocationCoordinate2D(latitude: driverCenterLat, longitude: driverCenterLon)
+        }
+        return locationManager.location?.coordinate
+    }
+
+    var radiusMeters: CLLocationDistance { filterRadius * 1609.34 }
 
     var filteredRides: [Ride] {
         let hot = storage.hotPendingRides
-        guard let userLocation = locationManager.location else { return hot }
+        guard let center = effectiveCenter else { return hot }
+        let centerLoc = CLLocation(latitude: center.latitude, longitude: center.longitude)
         return hot.filter { ride in
-            guard let rideLocation = rideLocations[ride.id] else { return true }
-            let distance = userLocation.distance(from: CLLocation(latitude: rideLocation.latitude, longitude: rideLocation.longitude))
-            return (distance / 1609.34) <= filterRadius
+            guard let coord = rideLocations[ride.id] else { return true }
+            return (centerLoc.distance(from: CLLocation(latitude: coord.latitude, longitude: coord.longitude)) / 1609.34) <= filterRadius
         }
     }
-    
-    var body: some View {
-        ZStack {
-            if storage.isLoading {
-                ProgressView("Loading rides...")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if storage.hotPendingRides.isEmpty {
-                emptyStateView
-            } else {
-                mapViewWithList
-            }
-        }
-        .task {
-            await loadRideLocations()
-        }
-        .onChange(of: storage.rides) { oldValue, newValue in
-            Task {
-                await loadRideLocations()
-            }
-        }
-        .onAppear {
-            locationManager.requestLocation()
-            tempFilterRadius = filterRadius
-        }
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    showingFilters = true
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "slider.horizontal.3")
-                        Text("\(Int(filterRadius))mi")
-                            .font(.caption2)
-                    }
-                }
-            }
-        }
-        .sheet(isPresented: $showingFilters) {
-            filterSheet
-        }
-        .sheet(item: $selectedRide) { ride in
-            RideDetailSheet(ride: ride)
-        }
-    }
-    
-    private var filterSheet: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("Pickup radius")
-                            Spacer()
-                            Text("\(Int(tempFilterRadius)) miles")
-                                .foregroundStyle(.secondary)
-                        }
-                        Slider(value: $tempFilterRadius, in: 1...50, step: 1)
-                    }
-                } header: {
-                    Text("Filter Settings")
-                } footer: {
-                    Text("Show only hot ride requests within this distance of your live location.")
-                }
 
-                Section {
-                    Button("Reset to Default (5 mi)") {
-                        tempFilterRadius = 5
-                    }
-                    .foregroundStyle(.red)
-                }
-            }
-            .navigationTitle("Filters")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        showingFilters = false
-                        tempFilterRadius = filterRadius
-                    }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Apply") {
-                        filterRadius = tempFilterRadius
-                        showingFilters = false
-                    }
-                }
-            }
-        }
-        .presentationDetents([.medium])
-    }
-    
-    private var emptyStateView: some View {
-        VStack(spacing: 16) {
-            Text("🚗")
-                .font(.system(size: 72))
-            Text("No rides available")
-                .font(.headline)
-            Text("Check back soon for ride requests")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-    
-    private var mapViewWithList: some View {
-        GeometryReader { geometry in
+    var body: some View {
+        GeometryReader { geo in
             VStack(spacing: 0) {
-                // Map - takes remaining space
-                mapView
-                    .frame(height: showingList ? geometry.size.height / 2 : geometry.size.height)
-                
-                // List - half screen
-                if showingList {
-                    listView
-                        .frame(height: geometry.size.height / 2)
-                }
-            }
-        }
-    }
-    
-    private var mapView: some View {
-        Map(position: $cameraPosition) {
-            // User location - blue pulsing dot
-            if let userLocation = locationManager.location {
-                Annotation("My Location", coordinate: userLocation.coordinate) {
-                    ZStack {
-                        Circle()
-                            .fill(Color.blue.opacity(0.3))
-                            .frame(width: 40, height: 40)
-                        Circle()
-                            .fill(Color.blue)
-                            .frame(width: 20, height: 20)
-                        Circle()
-                            .stroke(Color.white, lineWidth: 3)
-                            .frame(width: 20, height: 20)
+                // ── Map ──
+                MapReader { proxy in
+                    Map(position: $cameraPosition) {
+                        // Live location dot
+                        if let loc = locationManager.location {
+                            Annotation("Me", coordinate: loc.coordinate) {
+                                ZStack {
+                                    Circle().fill(Color.blue.opacity(0.25)).frame(width: 36, height: 36)
+                                    Circle().fill(Color.blue).frame(width: 16, height: 16)
+                                    Circle().stroke(Color.white, lineWidth: 2.5).frame(width: 16, height: 16)
+                                }
+                                .shadow(color: .blue.opacity(0.4), radius: 6)
+                            }
+                        }
+
+                        // Drive-radius circle overlay
+                        if let center = effectiveCenter {
+                            MapCircle(center: center, radius: radiusMeters)
+                                .foregroundStyle(Color.blue.opacity(0.1))
+                                .stroke(Color.blue, lineWidth: 2)
+
+                            // Custom-center pin
+                            if driverCenterCustom {
+                                Annotation("Drive Area", coordinate: center) {
+                                    ZStack {
+                                        Circle().fill(Color.blue).frame(width: 34, height: 34)
+                                        Image(systemName: "scope")
+                                            .font(.system(size: 16, weight: .bold))
+                                            .foregroundStyle(.white)
+                                    }
+                                    .shadow(radius: 4)
+                                }
+                            }
+                        }
+
+                        // Ride pins
+                        ForEach(filteredRides) { ride in
+                            if let loc = rideLocations[ride.id] {
+                                Annotation(ride.from, coordinate: loc) {
+                                    rideAnnotationView(for: ride)
+                                }
+                            }
+                        }
                     }
-                    .shadow(color: .blue.opacity(0.4), radius: 8)
-                }
-            }
-            
-            // Ride locations
-            ForEach(filteredRides) { ride in
-                if let location = rideLocations[ride.id] {
-                    Annotation(ride.from, coordinate: location) {
-                        rideAnnotationView(for: ride)
+                    .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
+                    .mapControls {
+                        MapUserLocationButton()
+                        MapCompass()
+                    }
+                    .onTapGesture { screenPoint in
+                        if let coord = proxy.convert(screenPoint, from: .local) {
+                            driverCenterLat = coord.latitude
+                            driverCenterLon = coord.longitude
+                            driverCenterCustom = true
+                            withAnimation {
+                                cameraPosition = .region(MKCoordinateRegion(
+                                    center: coord,
+                                    latitudinalMeters: radiusMeters * 3,
+                                    longitudinalMeters: radiusMeters * 3
+                                ))
+                            }
+                        }
                     }
                 }
+                .frame(height: geo.size.height * 0.52)
+
+                // ── Bottom control panel ──
+                controlPanel
             }
         }
-        .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
-        .mapControls {
-            MapUserLocationButton()
-            MapCompass()
-            MapScaleView()
-        }
+        .task { await loadRideLocations() }
+        .onChange(of: storage.rides) { _, _ in Task { await loadRideLocations() } }
+        .onAppear { locationManager.requestLocation() }
+        .sheet(item: $selectedRide) { ride in RideDetailSheet(ride: ride) }
     }
-    
+
+    // MARK: - Control Panel
+
+    private var controlPanel: some View {
+        VStack(spacing: 0) {
+            // Handle
+            Capsule()
+                .fill(Color.secondary.opacity(0.4))
+                .frame(width: 36, height: 4)
+                .padding(.top, 10)
+                .padding(.bottom, 12)
+
+            // Location + radius
+            VStack(spacing: 10) {
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 5) {
+                            Image(systemName: driverCenterCustom ? "mappin.circle.fill" : "location.fill")
+                                .foregroundStyle(driverCenterCustom ? .orange : .blue)
+                            Text(driverCenterCustom ? "Custom Location" : "Live Location")
+                                .font(.subheadline).fontWeight(.semibold)
+                        }
+                        Text(driverCenterCustom
+                             ? "Tap the map to move your search area"
+                             : "Tap anywhere on the map to pin a location")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if driverCenterCustom {
+                        Button {
+                            driverCenterCustom = false
+                            if let loc = locationManager.location {
+                                withAnimation {
+                                    cameraPosition = .region(MKCoordinateRegion(
+                                        center: loc.coordinate,
+                                        latitudinalMeters: radiusMeters * 3,
+                                        longitudinalMeters: radiusMeters * 3
+                                    ))
+                                }
+                            }
+                        } label: {
+                            Label("Live", systemImage: "location.fill")
+                                .font(.caption).fontWeight(.semibold)
+                                .padding(.horizontal, 10).padding(.vertical, 6)
+                                .background(Color.blue).foregroundStyle(.white)
+                                .cornerRadius(8)
+                        }
+                    }
+                }
+                .padding(.horizontal)
+
+                // Radius slider
+                VStack(spacing: 4) {
+                    HStack {
+                        Text("Search radius").font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        Text("\(Int(filterRadius)) miles")
+                            .font(.caption).fontWeight(.semibold).foregroundStyle(.blue)
+                    }
+                    Slider(value: $filterRadius, in: 1...50, step: 1).tint(.blue)
+                }
+                .padding(.horizontal)
+            }
+
+            Divider().padding(.top, 8)
+
+            // Rides header
+            HStack {
+                Text("🔥 Hot Requests").font(.subheadline).fontWeight(.semibold)
+                Text("(\(filteredRides.count))").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+
+            // Rides list / empty state
+            if storage.isLoading {
+                ProgressView().frame(maxWidth: .infinity).padding()
+            } else if filteredRides.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: storage.hotPendingRides.isEmpty ? "flame.slash" : "map.circle")
+                        .font(.title2).foregroundStyle(.secondary)
+                    Text(storage.hotPendingRides.isEmpty
+                         ? "No hot requests right now"
+                         : "No hot requests within \(Int(filterRadius)) mi")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity).padding()
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(filteredRides.sorted { $0.hotUntil < $1.hotUntil }) { ride in
+                            CompactRideRow(ride: ride) { selectedRide = ride }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .background(Color(UIColor.systemBackground))
+    }
+
+    // MARK: - Map Annotation
+
     private func rideAnnotationView(for ride: Ride) -> some View {
-        Button {
-            selectedRide = ride
-        } label: {
+        Button { selectedRide = ride } label: {
             ZStack {
-                Circle()
-                    .fill(ride.status == .pending ? Color.black : Color.green)
-                    .frame(width: 44, height: 44)
-                
-                VStack(spacing: 2) {
+                Circle().fill(Color.orange).frame(width: 44, height: 44)
+                VStack(spacing: 1) {
                     Image(systemName: "figure.wave")
-                        .font(.system(size: 14))
-                        .foregroundStyle(.white)
+                        .font(.system(size: 13)).foregroundStyle(.white)
                     Text("🪙\(ride.coins)")
-                        .font(.caption2)
-                        .fontWeight(.bold)
-                        .foregroundStyle(.white)
+                        .font(.system(size: 9, weight: .bold)).foregroundStyle(.white)
                 }
             }
             .shadow(color: .black.opacity(0.3), radius: 4, x: 0, y: 2)
         }
     }
-    
-    private var listView: some View {
-        VStack(spacing: 0) {
-            // Toggle button
-            Button {
-                withAnimation(.spring(response: 0.3)) {
-                    showingList.toggle()
-                }
-            } label: {
-                VStack(spacing: 8) {
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(Color.secondary.opacity(0.5))
-                        .frame(width: 40, height: 5)
-                        .padding(.top, 8)
-                    
-                    HStack {
-                        Text("Hot Requests")
-                            .font(.headline)
-                        Text("(\(filteredRides.count))")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Image(systemName: showingList ? "chevron.down" : "chevron.up")
-                            .font(.caption)
-                    }
-                    .padding(.horizontal)
-                    .padding(.bottom, 8)
-                }
-            }
-            .buttonStyle(.plain)
-            .background(Color(UIColor.systemBackground))
-            
-            Divider()
-            
-            // Ride list - compact view
-            ScrollView {
-                LazyVStack(spacing: 8) {
-                    ForEach(filteredRides.sorted(by: { $0.hotUntil < $1.hotUntil })) { ride in
-                        CompactRideRow(ride: ride) {
-                            selectedRide = ride
-                        }
-                    }
-                }
-                .padding(.vertical, 8)
-            }
-            .background(Color(UIColor.systemBackground))
-            .gesture(
-                DragGesture()
-                    .onChanged { value in
-                        // Prevent infinite scroll by limiting drag
-                        if value.translation.height < -50 {
-                            showingList = false
-                        }
-                    }
-            )
-        }
-    }
-    
-    private func rideCardView(for ride: Ride) -> some View {
-        RideCard(ride: ride, isDriverMode: true)
-            .onTapGesture {
-                if let location = rideLocations[ride.id] {
-                    selectedRide = ride
-                    withAnimation {
-                        cameraPosition = .region(MKCoordinateRegion(
-                            center: location,
-                            span: MKCoordinateSpan(latitudeDelta: 0.05, longitudeDelta: 0.05)
-                        ))
-                    }
-                }
-            }
-    }
-    
+
+    // MARK: - Data
+
     func loadRideLocations() async {
         let calculator = DistanceCalculator()
-        var locations: [UUID: CLLocationCoordinate2D] = [:]
-        
-        for ride in storage.rides {
+        var locations = rideLocations
+        for ride in storage.rides where locations[ride.id] == nil {
             if let coord = try? await calculator.geocode(address: ride.from) {
                 locations[ride.id] = CLLocationCoordinate2D(latitude: coord.lat, longitude: coord.lon)
             }
         }
-        
         await MainActor.run {
             rideLocations = locations
-            
-            // Set initial camera position to user location or first ride
-            if let userLocation = locationManager.location {
+            guard !hasSetInitialCamera else { return }
+            hasSetInitialCamera = true
+            if let center = effectiveCenter {
                 cameraPosition = .region(MKCoordinateRegion(
-                    center: userLocation.coordinate,
-                    span: MKCoordinateSpan(latitudeDelta: 0.5, longitudeDelta: 0.5)
+                    center: center,
+                    latitudinalMeters: radiusMeters * 3,
+                    longitudinalMeters: radiusMeters * 3
                 ))
-            } else if let firstLocation = locations.values.first {
+            } else if let first = locations.values.first {
                 cameraPosition = .region(MKCoordinateRegion(
-                    center: firstLocation,
+                    center: first,
                     span: MKCoordinateSpan(latitudeDelta: 0.5, longitudeDelta: 0.5)
                 ))
             }
