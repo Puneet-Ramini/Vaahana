@@ -138,6 +138,13 @@ struct Ride: Identifiable, Codable, Equatable {
     var cancelledBy: String?
     var cancellationReasonCode: String?
 
+    // Bid marketplace summary (denormalized for quick display)
+    var bidCount: Int
+    var selectedBidId: String?
+    var finalCoins: Int?          // agreed coin amount after bid selection
+    var lowestBidCoins: Int?
+    var latestBidAt: Date?
+
     // MARK: Computed
 
     var hotUntil: Date { createdAt.addingTimeInterval(TimeInterval(hotDuration * 60)) }
@@ -224,6 +231,11 @@ struct Ride: Identifiable, Codable, Equatable {
         self.cancelledAt = nil
         self.cancelledBy = nil
         self.cancellationReasonCode = nil
+        self.bidCount = 0
+        self.selectedBidId = nil
+        self.finalCoins = nil
+        self.lowestBidCoins = nil
+        self.latestBidAt = nil
     }
 
     // MARK: Custom Decoder — backward compat with old Firestore docs
@@ -263,6 +275,11 @@ struct Ride: Identifiable, Codable, Equatable {
         cancelledAt            = try? c.decodeIfPresent(Date.self, forKey: .cancelledAt)
         cancelledBy            = try? c.decodeIfPresent(String.self, forKey: .cancelledBy)
         cancellationReasonCode = try? c.decodeIfPresent(String.self, forKey: .cancellationReasonCode)
+        bidCount               = (try? c.decodeIfPresent(Int.self, forKey: .bidCount))         ?? 0
+        selectedBidId          = try? c.decodeIfPresent(String.self, forKey: .selectedBidId)
+        finalCoins             = try? c.decodeIfPresent(Int.self, forKey: .finalCoins)
+        lowestBidCoins         = try? c.decodeIfPresent(Int.self, forKey: .lowestBidCoins)
+        latestBidAt            = try? c.decodeIfPresent(Date.self, forKey: .latestBidAt)
     }
 }
 
@@ -402,7 +419,7 @@ struct RiderView: View {
     @State private var showingPostSheet = false
     @State private var editingRide: Ride?
     @State private var showingActiveRide = false
-    @State private var showingHistory = false
+    @State private var viewingBidsRide: Ride?
 
     var pastRides: [Ride] {
         storage.myRides.filter { $0.status.isFinal }
@@ -434,6 +451,8 @@ struct RiderView: View {
                                     editingRide = ride
                                 }, onDelete: {
                                     storage.deleteRide(ride)
+                                }, onViewBids: {
+                                    viewingBidsRide = ride
                                 })
                             }
                         }
@@ -479,6 +498,9 @@ struct RiderView: View {
             if let active = storage.activeRide {
                 ActiveRideView(ride: active, role: .rider)
             }
+        }
+        .sheet(item: $viewingBidsRide) { ride in
+            BidListView(ride: ride)
         }
     }
 
@@ -923,9 +945,9 @@ struct RideDetailSheet: View {
     let ride: Ride
     @EnvironmentObject var storage: RideStorage
     @Environment(\.dismiss) var dismiss
-    @State private var showingAcceptConfirmation = false
-    @State private var isAccepting = false
-    @State private var acceptError: String?
+    @State private var showingBidSheet = false
+    @State private var existingBid: RideBid?
+    @State private var isLoadingBid = false
     
     var body: some View {
         NavigationStack {
@@ -1030,41 +1052,41 @@ struct RideDetailSheet: View {
                     // Actions
                     if ride.status == .posted {
                         VStack(spacing: 12) {
-                            Button {
-                                openWhatsApp()
-                            } label: {
+                            Button { openWhatsApp() } label: {
                                 Label("Text on WhatsApp", systemImage: "message.fill")
-                                    .font(.headline)
-                                    .foregroundStyle(.white)
-                                    .frame(maxWidth: .infinity)
-                                    .padding()
-                                    .background(Color.green)
-                                    .cornerRadius(12)
+                                    .font(.headline).foregroundStyle(.white)
+                                    .frame(maxWidth: .infinity).padding()
+                                    .background(Color.green).cornerRadius(12)
                             }
-                            
-                            Button {
-                                showingAcceptConfirmation = true
-                            } label: {
-                                Label("Accept Ride", systemImage: "checkmark.circle.fill")
-                                    .font(.headline)
-                                    .foregroundStyle(.white)
-                                    .frame(maxWidth: .infinity)
-                                    .padding()
-                                    .background(Color.black)
-                                    .cornerRadius(12)
+
+                            Button { showingBidSheet = true } label: {
+                                HStack {
+                                    if isLoadingBid { ProgressView().tint(.white) }
+                                    Label(existingBid == nil ? "Place Bid" : "Edit Your Bid",
+                                          systemImage: existingBid == nil ? "hand.raised.fill" : "pencil.circle.fill")
+                                }
+                                .font(.headline).foregroundStyle(.white)
+                                .frame(maxWidth: .infinity).padding()
+                                .background(Color.black).cornerRadius(12)
+                            }
+                            .disabled(isLoadingBid)
+
+                            if let bid = existingBid {
+                                HStack {
+                                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                                    Text("Your bid: 🪙 \(bid.bidCoins)").font(.subheadline)
+                                    Spacer()
+                                    Text("Waiting for rider").font(.caption).foregroundStyle(.secondary)
+                                }
+                                .padding(.horizontal, 4)
                             }
                         }
                     } else {
-                        Button {
-                            openWhatsApp()
-                        } label: {
+                        Button { openWhatsApp() } label: {
                             Label("Message Rider", systemImage: "message.fill")
-                                .font(.headline)
-                                .foregroundStyle(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding()
-                                .background(Color.green)
-                                .cornerRadius(12)
+                                .font(.headline).foregroundStyle(.white)
+                                .frame(maxWidth: .infinity).padding()
+                                .background(Color.green).cornerRadius(12)
                         }
                     }
                 }
@@ -1080,45 +1102,24 @@ struct RideDetailSheet: View {
                     }
                 }
             }
-            .confirmationDialog("Accept this ride?", isPresented: $showingAcceptConfirmation) {
-                Button("Accept Ride") {
-                    acceptRide()
-                    dismiss()
-                }
-                Button("Cancel", role: .cancel) { }
-            } message: {
-                Text("You'll be connected with \(ride.name) via WhatsApp to finalize pickup details.")
-            }
         }
+        .sheet(isPresented: $showingBidSheet) {
+            PlaceBidSheet(ride: ride, existingBid: existingBid)
+        }
+        .task { await loadExistingBid() }
     }
-    
-    func acceptRide() {
-        guard let uid = Auth.auth().currentUser?.uid else { return }
-        isAccepting = true
-        acceptError = nil
-        Task {
-            do {
-                // Load driver profile
-                let db = Firestore.firestore()
-                let profileData = try? await db.collection("users").document(uid).getDocument().data()
-                let driverName    = Auth.auth().currentUser?.displayName ?? (profileData?["displayName"] as? String ?? "Driver")
-                let driverPhone   = profileData?["phone"] as? String ?? ""
-                let driverWhatsapp = profileData?["whatsapp"] as? String ?? driverPhone
 
-                try await RideService.shared.acceptRide(
-                    ride,
-                    driverName: driverName,
-                    driverPhone: driverPhone,
-                    driverWhatsapp: driverWhatsapp
-                )
-                await MainActor.run { dismiss() }
-            } catch {
-                await MainActor.run {
-                    acceptError = error.localizedDescription
-                    isAccepting = false
-                }
-            }
-        }
+    private func loadExistingBid() async {
+        guard let uid = Auth.auth().currentUser?.uid, ride.status == .posted else { return }
+        isLoadingBid = true
+        let snapshot = try? await Firestore.firestore()
+            .collection("rides").document(ride.id.uuidString)
+            .collection("bids")
+            .whereField("driverId", isEqualTo: uid)
+            .whereField("status", isEqualTo: "active")
+            .getDocuments()
+        existingBid  = snapshot?.documents.compactMap { try? $0.data(as: RideBid.self) }.first
+        isLoadingBid = false
     }
 
     func openWhatsApp() {
@@ -1660,6 +1661,7 @@ struct RideCard: View {
     let isDriverMode: Bool
     var onEdit: (() -> Void)? = nil
     var onDelete: (() -> Void)? = nil
+    var onViewBids: (() -> Void)? = nil
     @EnvironmentObject var storage: RideStorage
     
     var body: some View {
@@ -1759,6 +1761,29 @@ struct RideCard: View {
             
             Divider()
             
+            // Bid count button (rider mode, posted rides)
+            if !isDriverMode && ride.status == .posted && ride.bidCount > 0 {
+                Button { onViewBids?() } label: {
+                    HStack {
+                        Image(systemName: "person.2.fill")
+                        Text("\(ride.bidCount) driver bid\(ride.bidCount == 1 ? "" : "s")")
+                            .fontWeight(.semibold)
+                        if let lowest = ride.lowestBidCoins {
+                            Text("· best 🪙 \(lowest)")
+                                .foregroundStyle(.green)
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                    }
+                    .font(.subheadline)
+                    .foregroundStyle(.white)
+                    .padding()
+                    .background(Color.blue)
+                    .cornerRadius(12)
+                }
+                .buttonStyle(.plain)
+            }
+
             // Actions
             if ride.status == .posted {
                 if isDriverMode {
