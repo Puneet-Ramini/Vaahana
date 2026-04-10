@@ -84,30 +84,89 @@ final class RideService {
 
     // MARK: - Update Ride Status (enroute / arrived / started)
 
-    /// Advances ride through intermediate states. No coin changes.
+    /// Advances ride through driver-controlled intermediate states.
+    /// Validates: actor is assigned driver, current status is not final, transition is legal.
     func updateRideStatus(_ ride: Ride, to newStatus: RideStatus) async throws {
+        guard let actorId = Auth.auth().currentUser?.uid else {
+            throw RideServiceError.notAuthenticated
+        }
+
+        // Legal driver-only forward transitions
+        let validTransitions: [String: String] = [
+            "accepted":       "driver_enroute",
+            "driver_enroute": "driver_arrived",
+            "driver_arrived": "ride_started"
+        ]
+
         let rideRef = db.collection("rides").document(ride.id.uuidString)
         let now = Timestamp(date: Date())
 
-        var fields: [String: Any] = [
-            "status":    newStatus.rawValue,
-            "updatedAt": now
-        ]
-        switch newStatus {
-        case .driverEnroute:  fields["driverEnrouteAt"] = now
-        case .driverArrived:  fields["arrivedAt"]       = now
-        case .rideStarted:    fields["startedAt"]       = now
-        default: break
+        try await db.runTransaction { transaction, errorPointer in
+            let rideDoc: DocumentSnapshot
+            do { rideDoc = try transaction.getDocument(rideRef) }
+            catch let e { errorPointer?.pointee = e as NSError; return nil }
+
+            guard let data = rideDoc.data() else {
+                errorPointer?.pointee = NSError(domain: "RideService", code: 404,
+                    userInfo: [NSLocalizedDescriptionKey: "Ride not found."])
+                return nil
+            }
+
+            let rawStatus = data["status"] as? String ?? ""
+
+            // Final-state immutability guard
+            if RideStatus(rawValue: rawStatus)?.isFinal == true {
+                errorPointer?.pointee = NSError(domain: "RideService", code: 409,
+                    userInfo: [NSLocalizedDescriptionKey: "This ride is already finished and cannot be modified."])
+                return nil
+            }
+
+            // Actor must be the assigned driver
+            guard data["driverId"] as? String == actorId else {
+                errorPointer?.pointee = NSError(domain: "RideService", code: 403,
+                    userInfo: [NSLocalizedDescriptionKey: "Only the assigned driver can advance this ride."])
+                return nil
+            }
+
+            // Validate legal transition
+            guard validTransitions[rawStatus] == newStatus.rawValue else {
+                errorPointer?.pointee = NSError(domain: "RideService", code: 422,
+                    userInfo: [NSLocalizedDescriptionKey: "Invalid status transition: \(rawStatus) → \(newStatus.rawValue)."])
+                return nil
+            }
+
+            var fields: [String: Any] = ["status": newStatus.rawValue, "updatedAt": now]
+            switch newStatus {
+            case .driverEnroute: fields["driverEnrouteAt"] = now
+            case .driverArrived: fields["arrivedAt"]       = now
+            case .rideStarted:   fields["startedAt"]       = now
+            default: break
+            }
+            transaction.updateData(fields, forDocument: rideRef)
+            return nil
         }
-        try await rideRef.updateData(fields)
     }
 
     // MARK: - Cancel Ride
 
-    /// Cancels the ride. If coins are locked, refunds them to the rider atomically.
+    /// Cancels the ride. Validates ownership, final-state, and cancellation rules.
+    /// Refunds locked coins and clears driver's activeRideId atomically.
     func cancelRide(_ ride: Ride, cancelledBy uid: String, reason: String? = nil) async throws {
-        let rideRef  = db.collection("rides").document(ride.id.uuidString)
-        let now = Date()
+        guard let actorId = Auth.auth().currentUser?.uid, actorId == uid else {
+            throw RideServiceError.notAuthenticated
+        }
+
+        // Ownership: actor must be the rider or the assigned driver
+        let isRider  = uid == ride.riderId
+        let isDriver = ride.driverId != nil && uid == ride.driverId
+        guard isRider || isDriver else {
+            throw RideServiceError.notAuthorized
+        }
+
+        let rideRef   = db.collection("rides").document(ride.id.uuidString)
+        let riderRef  = db.collection("users").document(ride.riderId)
+        let driverRef = ride.driverId.map { db.collection("users").document($0) }
+        let now       = Date()
 
         var cancelFields: [String: Any] = [
             "status":      "cancelled",
@@ -117,21 +176,45 @@ final class RideService {
         ]
         if let reason { cancelFields["cancellationReasonCode"] = reason }
 
-        if ride.coinStatus == .locked && ride.coinsLocked > 0 {
-            // Refund coins to rider atomically
-            let riderRef = db.collection("users").document(ride.riderId)
-            cancelFields["coinStatus"] = "refunded"
+        try await db.runTransaction { transaction, errorPointer in
+            let rideDoc: DocumentSnapshot
+            do { rideDoc = try transaction.getDocument(rideRef) }
+            catch let e { errorPointer?.pointee = e as NSError; return nil }
 
-            try await db.runTransaction { transaction, errorPointer in
-                transaction.updateData([
-                    "coins":       FieldValue.increment(Int64(ride.coinsLocked)),
-                    "coinsLocked": FieldValue.increment(Int64(-ride.coinsLocked))
-                ], forDocument: riderRef)
-                transaction.updateData(cancelFields, forDocument: rideRef)
+            let rawStatus = rideDoc.data()?["status"] as? String ?? ""
+            let currentStatus = RideStatus(rawValue: rawStatus) ?? .posted
+
+            // Final-state immutability guard
+            if currentStatus.isFinal {
+                errorPointer?.pointee = NSError(domain: "RideService", code: 409,
+                    userInfo: [NSLocalizedDescriptionKey: "This ride is already in a final state."])
                 return nil
             }
-        } else {
-            try await rideRef.updateData(cancelFields)
+
+            // Rider cannot cancel once the ride is in progress
+            if isRider && rawStatus == RideStatus.rideStarted.rawValue {
+                errorPointer?.pointee = NSError(domain: "RideService", code: 403,
+                    userInfo: [NSLocalizedDescriptionKey: "A ride in progress can only be cancelled by the driver."])
+                return nil
+            }
+
+            // Refund locked coins if applicable
+            let coinsLocked = rideDoc.data()?["coinsLocked"] as? Int ?? 0
+            if coinsLocked > 0 {
+                cancelFields["coinStatus"] = "refunded"
+                transaction.updateData([
+                    "coins":       FieldValue.increment(Int64(coinsLocked)),
+                    "coinsLocked": FieldValue.increment(Int64(-coinsLocked))
+                ], forDocument: riderRef)
+            }
+
+            // Clear driver's active ride slot
+            if let dr = driverRef {
+                transaction.updateData(["activeRideId": FieldValue.delete()], forDocument: dr)
+            }
+
+            transaction.updateData(cancelFields, forDocument: rideRef)
+            return nil
         }
     }
 
@@ -139,24 +222,49 @@ final class RideService {
 
     /// Completes the ride and transfers coins to the driver.
     /// Uses `finalCoins` (the agreed bid amount) if available, else `coinsLocked`.
+    /// Validates: actor is assigned driver, ride is in rideStarted state.
     func completeRide(_ ride: Ride) async throws {
+        guard let actorId = Auth.auth().currentUser?.uid else {
+            throw RideServiceError.notAuthenticated
+        }
         guard let driverId = ride.driverId else {
             throw RideServiceError.missingDriver
         }
+        guard actorId == driverId else {
+            throw RideServiceError.notAuthorized
+        }
+
         let rideRef   = db.collection("rides").document(ride.id.uuidString)
         let riderRef  = db.collection("users").document(ride.riderId)
         let driverRef = db.collection("users").document(driverId)
         let txnRef    = db.collection("coinTransactions").document(UUID().uuidString)
         let now       = Date()
-        let coins     = ride.finalCoins ?? ride.coinsLocked   // prefer agreed bid amount
+        let coins     = ride.finalCoins ?? ride.coinsLocked
 
         try await db.runTransaction { transaction, errorPointer in
-            transaction.updateData([
-                "coinsLocked": FieldValue.increment(Int64(-coins))
-            ], forDocument: riderRef)
-            transaction.updateData([
-                "coins": FieldValue.increment(Int64(coins))
-            ], forDocument: driverRef)
+            let rideDoc: DocumentSnapshot
+            do { rideDoc = try transaction.getDocument(rideRef) }
+            catch let e { errorPointer?.pointee = e as NSError; return nil }
+
+            let rawStatus = rideDoc.data()?["status"] as? String ?? ""
+
+            // Final-state immutability guard
+            if RideStatus(rawValue: rawStatus)?.isFinal == true {
+                errorPointer?.pointee = NSError(domain: "RideService", code: 409,
+                    userInfo: [NSLocalizedDescriptionKey: "This ride is already in a final state."])
+                return nil
+            }
+
+            // Must be in rideStarted to complete
+            guard rawStatus == RideStatus.rideStarted.rawValue else {
+                errorPointer?.pointee = NSError(domain: "RideService", code: 422,
+                    userInfo: [NSLocalizedDescriptionKey: "Ride must be started before it can be completed."])
+                return nil
+            }
+
+            transaction.updateData(["coinsLocked": FieldValue.increment(Int64(-coins))], forDocument: riderRef)
+            transaction.updateData(["coins": FieldValue.increment(Int64(coins)),
+                                    "activeRideId": FieldValue.delete()], forDocument: driverRef)
             transaction.updateData([
                 "status":           "completed",
                 "coinStatus":       "transferred",
@@ -209,6 +317,12 @@ final class RideService {
         let rideRef  = db.collection("rides").document(ride.id.uuidString)
         let bidsRef  = rideRef.collection("bids")
         let now      = Timestamp(date: Date())
+
+        // Verify ride is still accepting bids
+        let rideSnap = try await rideRef.getDocument()
+        guard rideSnap.data()?["status"] as? String == "posted" else {
+            throw RideServiceError.rideNotAvailable
+        }
 
         if let existingId = existingBidId {
             // Update the driver's existing bid
@@ -272,6 +386,7 @@ final class RideService {
     // MARK: - Select Bid (rider)
 
     /// Rider selects a driver bid. Runs a Firestore transaction to atomically:
+    /// - verify caller is the ride's rider
     /// - verify chosen driver has no active ride
     /// - mark ride accepted with selected driver details
     /// - lock finalCoins from rider
@@ -279,6 +394,9 @@ final class RideService {
     /// Then batch-rejects remaining bids on this ride and auto-closes the selected
     /// driver's other active bids across all rides.
     func selectBid(ride: Ride, bid: RideBid) async throws {
+        guard let actorId = Auth.auth().currentUser?.uid, actorId == ride.riderId else {
+            throw RideServiceError.notAuthorized
+        }
         let rideRef   = db.collection("rides").document(ride.id.uuidString)
         let bidRef    = rideRef.collection("bids").document(bid.id)
         let riderRef  = db.collection("users").document(ride.riderId)
@@ -396,6 +514,18 @@ final class RideService {
         }
     }
 
+    // MARK: - Expire Stale Ride (client-side, called by rider listener)
+
+    /// Marks a posted ride as expired when its hot window has passed.
+    /// Only called for rides owned by the current user — no ownership check needed.
+    func expireRide(_ ride: Ride) async {
+        guard ride.status == .posted, !ride.isHot else { return }
+        let rideRef = db.collection("rides").document(ride.id.uuidString)
+        let now = Timestamp(date: Date())
+        try? await rideRef.updateData(["status": "expired", "updatedAt": now])
+        await expireBids(for: ride)
+    }
+
     // MARK: - Expire Bids (called when ride is cancelled/expired)
 
     func expireBids(for ride: Ride) async {
@@ -419,16 +549,22 @@ final class RideService {
 
 enum RideServiceError: LocalizedError {
     case notAuthenticated
+    case notAuthorized
     case missingDriver
     case driverOffline
     case driverBusy
+    case rideNotAvailable
+    case cancelNotAllowed
 
     var errorDescription: String? {
         switch self {
-        case .notAuthenticated: return "You must be signed in to perform this action."
-        case .missingDriver:    return "No driver assigned to this ride."
-        case .driverOffline:    return "You must be online to place a bid. Turn on your availability toggle."
-        case .driverBusy:       return "You already have an active ride. Complete or cancel it before placing new bids."
+        case .notAuthenticated:  return "You must be signed in to perform this action."
+        case .notAuthorized:     return "You are not authorized to perform this action."
+        case .missingDriver:     return "No driver assigned to this ride."
+        case .driverOffline:     return "You must be online to place a bid. Turn on your availability toggle."
+        case .driverBusy:        return "You already have an active ride. Complete or cancel it before placing new bids."
+        case .rideNotAvailable:  return "This ride is no longer accepting bids."
+        case .cancelNotAllowed:  return "This ride cannot be cancelled at its current stage."
         }
     }
 }

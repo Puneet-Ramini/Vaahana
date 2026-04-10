@@ -321,6 +321,11 @@ class RideStorage: ObservableObject {
                     self.myRides = rides.sorted { $0.createdAt > $1.createdAt }
                     self.activeRide = rides.first { $0.status.isActive }
                     self.isLoading = false
+
+                    // Client-side expiry: mark stale posted rides as expired
+                    for ride in rides where ride.status == .posted && !ride.isHot {
+                        Task { await RideService.shared.expireRide(ride) }
+                    }
                 }
             listeners.append(l)
         } else {
