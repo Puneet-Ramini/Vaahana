@@ -831,10 +831,9 @@ function inferPickupDate(text, timeStr, msgTimestamp) {
     targetDate = new Date();
     targetDate.setDate(targetDate.getDate() + 3);
   } else {
-    // No date cue at all — assume they mean tomorrow morning.
-    // Never use the message timestamp as-is: it may be hours/days in the past.
-    targetDate = new Date();
-    targetDate.setDate(targetDate.getDate() + 1);
+    // No date cue at all — treat as needed now.
+    // Set pickup to current time + 30 minutes.
+    targetDate = new Date(Date.now() + 30 * 60 * 1000);
   }
 
   // Apply extracted time if present
@@ -887,6 +886,8 @@ function inferHotDuration(text, pickupDate, msgTimestamp) {
   if (URGENCY_VAGUE.test(text))    return 2880;
   // Explicit date: stay hot until the pickup day arrives (max 48h cap)
   if (extractExplicitDate(text))   return 2880;
+  // No date cue — treat as immediate, short hot window
+  return 60;
 
   // Fallback: compare pickup date to message date
   const msUntilPickup = pickupDate.getTime() - new Date(msgTimestamp).getTime();
