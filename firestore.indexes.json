@@ -1,0 +1,23 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "rides",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "source",        "order": "ASCENDING" },
+        { "fieldPath": "whatsappPhone", "order": "ASCENDING" },
+        { "fieldPath": "createdAt",     "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "rides",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "source",    "order": "ASCENDING" },
+        { "fieldPath": "status",    "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

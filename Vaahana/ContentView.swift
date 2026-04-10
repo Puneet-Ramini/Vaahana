@@ -294,6 +294,11 @@ class RideStorage: ObservableObject {
     @Published var activeRide: Ride? = nil
     @Published var isLoading = true
 
+    /// Set to a ride that just transitioned to .completed — consumed by the views to show a rating prompt.
+    @Published var recentlyCompletedRide: Ride? = nil
+    /// Tracks previous status per ride so we can detect transitions inside snapshot listeners.
+    private var prevStatuses: [UUID: RideStatus] = [:]
+
     private let db = Firestore.firestore()
     private var listeners: [ListenerRegistration] = []
 
@@ -321,6 +326,19 @@ class RideStorage: ObservableObject {
                     self.myRides = rides.sorted { $0.createdAt > $1.createdAt }
                     self.activeRide = rides.first { $0.status.isActive }
                     self.isLoading = false
+
+                    // Detect rides that just completed → trigger rating prompt
+                    for ride in rides {
+                        if self.prevStatuses[ride.id] != .completed && ride.status == .completed {
+                            self.recentlyCompletedRide = ride
+                        }
+                        self.prevStatuses[ride.id] = ride.status
+                    }
+
+                    // Client-side expiry: mark stale posted rides as expired
+                    for ride in rides where ride.status == .posted && !ride.isHot {
+                        Task { await RideService.shared.expireRide(ride) }
+                    }
                 }
             listeners.append(l)
         } else {
@@ -341,6 +359,14 @@ class RideStorage: ObservableObject {
                     guard let self, let snapshot else { return }
                     let driverRides = snapshot.documents.compactMap { try? $0.data(as: Ride.self) }
                     self.activeRide = driverRides.first { $0.status.isActive }
+
+                    // Detect rides that just completed → trigger rating prompt
+                    for ride in driverRides {
+                        if self.prevStatuses[ride.id] != .completed && ride.status == .completed {
+                            self.recentlyCompletedRide = ride
+                        }
+                        self.prevStatuses[ride.id] = ride.status
+                    }
                 }
             listeners.append(l2)
         }
@@ -369,7 +395,9 @@ class RideStorage: ObservableObject {
 struct ContentView: View {
     let role: UserRole
     @StateObject private var storage: RideStorage
+    @EnvironmentObject var userState: UserState
     @State private var showingProfile = false
+    @State private var showingAdmin   = false
 
     init(role: UserRole) {
         self.role = role
@@ -383,6 +411,14 @@ struct ContentView: View {
                 Text("Vaahana")
                     .font(.system(size: 48, weight: .black, design: .rounded))
                 Spacer()
+                if userState.isAdmin {
+                    Button { showingAdmin = true } label: {
+                        Image(systemName: "shield.lefthalf.filled")
+                            .font(.title2)
+                            .foregroundStyle(.orange)
+                    }
+                    .padding(.trailing, 6)
+                }
                 Button {
                     showingProfile = true
                 } label: {
@@ -409,6 +445,9 @@ struct ContentView: View {
         .sheet(isPresented: $showingProfile) {
             ProfileView()
         }
+        .sheet(isPresented: $showingAdmin) {
+            AdminView()
+        }
     }
 }
 
@@ -420,6 +459,7 @@ struct RiderView: View {
     @State private var editingRide: Ride?
     @State private var showingActiveRide = false
     @State private var viewingBidsRide: Ride?
+    @State private var ratingRide: Ride?
 
     var pastRides: [Ride] {
         storage.myRides.filter { $0.status.isFinal }
@@ -502,6 +542,18 @@ struct RiderView: View {
         .sheet(item: $viewingBidsRide) { ride in
             BidListView(ride: ride)
         }
+        .sheet(item: $ratingRide) { ride in
+            RatingView(ride: ride, raterRole: .rider, targetUid: ride.driverId ?? "")
+                .onDisappear {
+                    UserDefaults.standard.set(true, forKey: "rated_rider_\(ride.id.uuidString)")
+                    storage.recentlyCompletedRide = nil
+                }
+        }
+        .onChange(of: storage.recentlyCompletedRide) { _, ride in
+            guard let ride, let driverId = ride.driverId, !driverId.isEmpty else { return }
+            let key = "rated_rider_\(ride.id.uuidString)"
+            if !UserDefaults.standard.bool(forKey: key) { ratingRide = ride }
+        }
     }
 
     private func activeRideBanner(_ ride: Ride) -> some View {
@@ -549,6 +601,8 @@ struct DriverView: View {
     @State private var selectedRide: Ride?
     @State private var isOnline = true
     @State private var showingActiveRide = false
+    @State private var showingMyBids = false
+    @State private var ratingRide: Ride?
     @State private var cameraPosition: MapCameraPosition = .automatic
     @StateObject private var locationManager = LocationManager()
 
@@ -667,6 +721,21 @@ struct DriverView: View {
                 ActiveRideView(ride: active, role: .driver)
             }
         }
+        .sheet(isPresented: $showingMyBids) {
+            DriverBidsView()
+        }
+        .sheet(item: $ratingRide) { ride in
+            RatingView(ride: ride, raterRole: .driver, targetUid: ride.riderId)
+                .onDisappear {
+                    UserDefaults.standard.set(true, forKey: "rated_driver_\(ride.id.uuidString)")
+                    storage.recentlyCompletedRide = nil
+                }
+        }
+        .onChange(of: storage.recentlyCompletedRide) { _, ride in
+            guard let ride else { return }
+            let key = "rated_driver_\(ride.id.uuidString)"
+            if !UserDefaults.standard.bool(forKey: key) { ratingRide = ride }
+        }
     }
 
     // MARK: - Control Panel
@@ -699,6 +768,24 @@ struct DriverView: View {
                 .buttonStyle(.plain)
                 Divider()
             }
+
+            // My Bids shortcut
+            Button { showingMyBids = true } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "list.bullet.rectangle.portrait.fill")
+                        .font(.title3).foregroundStyle(.purple)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("My Bids").font(.subheadline).fontWeight(.semibold)
+                        Text("Track bids you've placed").font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal).padding(.vertical, 10)
+                .background(Color.purple.opacity(0.07))
+            }
+            .buttonStyle(.plain)
+            Divider()
 
             // Online / Offline toggle
             HStack {
@@ -1291,32 +1378,40 @@ struct RouteSummary: Codable {
 struct PostRideSheet: View {
     @EnvironmentObject var storage: RideStorage
     @Environment(\.dismiss) var dismiss
-    
+
     let editingRide: Ride?
-    
-    @State private var goingTo = ""
-    @State private var pickupFrom = ""
+
+    // Route
+    @State private var pickupResult: PlaceResult? = nil
+    @State private var dropoffResult: PlaceResult? = nil
+    @State private var routeCoords: [CLLocationCoordinate2D] = []
+    @State private var routeETA: String? = nil
     @State private var milesText = ""
     @State private var coinsText = ""
+    @State private var isCalculatingRoute = false
+
+    // Location pickers
+    @State private var showingPickupPicker = false
+    @State private var showingDropoffPicker = false
+
+    // Schedule
     @State private var hotDuration = 5
     @State private var pickupDate = Date()
+
+    // Contact
     @State private var name = ""
     @State private var phoneCountryCode = "+1"
     @State private var phone = ""
     @State private var whatsappCountryCode = "+1"
     @State private var whatsappPhone = ""
     @State private var sameNumberForBoth = true
-    @State private var isCalculatingDistance = false
-    @State private var isSubmitting = false
-    @State private var distanceError: String?
-    @State private var cachedPickupCoord: (lat: Double, lon: Double)? = nil
 
-    private let distanceCalculator = DistanceCalculator()
-    
+    @State private var isSubmitting = false
+
     init(editingRide: Ride? = nil) {
         self.editingRide = editingRide
     }
-    
+
     let countryCodes = [
         ("🇺🇸", "+1"),
         ("🇮🇳", "+91"),
@@ -1324,22 +1419,14 @@ struct PostRideSheet: View {
         ("🇦🇺", "+61"),
         ("🇦🇪", "+971")
     ]
-    
-    var miles: Double {
-        Double(milesText) ?? 0
-    }
-    
-    var coins: Int {
-        Int(coinsText) ?? 0
-    }
 
-    var suggestedCoins: Int {
-        max(1, Int(miles))
-    }
+    var miles: Double { Double(milesText) ?? 0 }
+    var coins: Int    { Int(coinsText)    ?? 0 }
+    var suggestedCoins: Int { max(1, Int(miles)) }
 
     var isValid: Bool {
-        !goingTo.isEmpty &&
-        !pickupFrom.isEmpty &&
+        pickupResult != nil &&
+        dropoffResult != nil &&
         miles > 0 &&
         coins > 0 &&
         !name.isEmpty &&
@@ -1347,90 +1434,59 @@ struct PostRideSheet: View {
         (sameNumberForBoth || whatsappPhone.count >= 6) &&
         !isSubmitting
     }
-    
-    var canCalculateDistance: Bool {
-        !pickupFrom.isEmpty && !goingTo.isEmpty && !isCalculatingDistance
-    }
-    
+
     var body: some View {
         NavigationStack {
             Form {
+                // MARK: Route section
                 Section {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Pickup Location")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        TextField("e.g. Boston, MA", text: $pickupFrom)
-                            .font(.body)
-                            .onChange(of: pickupFrom) { oldValue, newValue in
-                                distanceError = nil
-                            }
+                    // Pickup row
+                    Button { showingPickupPicker = true } label: {
+                        LocationRow(
+                            label: "Pickup",
+                            systemImage: "circle.fill",
+                            color: .green,
+                            result: pickupResult
+                        )
                     }
-                    
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Drop-off Location")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        TextField("e.g. Nashua, NH", text: $goingTo)
-                            .font(.body)
-                            .onChange(of: goingTo) { oldValue, newValue in
-                                distanceError = nil
-                            }
+                    .buttonStyle(.plain)
+
+                    // Drop-off row
+                    Button { showingDropoffPicker = true } label: {
+                        LocationRow(
+                            label: "Drop-off",
+                            systemImage: "mappin.circle.fill",
+                            color: .red,
+                            result: dropoffResult
+                        )
                     }
-                    
-                    VStack(spacing: 8) {
-                        HStack {
-                            TextField("0.0", text: $milesText)
-                                .keyboardType(.decimalPad)
-                                .font(.body)
-                                .disabled(isCalculatingDistance)
-                                .onChange(of: milesText) { oldValue, newValue in
-                                    if coinsText.isEmpty || Int(coinsText) == max(1, Int(Double(oldValue) ?? 0)) {
-                                        if let milesValue = Double(newValue) {
-                                            coinsText = "\(max(1, Int(milesValue)))"
-                                        }
-                                    }
+                    .buttonStyle(.plain)
+
+                    // Route preview map + stats (shown after both locations chosen)
+                    if pickupResult != nil && dropoffResult != nil {
+                        routePreviewCard
+                    }
+
+                    // Miles row (editable; auto-filled from route)
+                    HStack {
+                        TextField("0.0", text: $milesText)
+                            .keyboardType(.decimalPad)
+                            .onChange(of: milesText) { old, new in
+                                // Only auto-update coins if user hasn't customised them
+                                if coinsText.isEmpty || Int(coinsText) == max(1, Int(Double(old) ?? 0)) {
+                                    if let v = Double(new) { coinsText = "\(max(1, Int(v)))" }
                                 }
-                            
-                            if isCalculatingDistance {
-                                ProgressView()
-                                    .scaleEffect(0.8)
                             }
-                            
-                            Text("miles")
-                                .foregroundStyle(.secondary)
+                        if isCalculatingRoute {
+                            ProgressView().scaleEffect(0.8)
                         }
-                        
-                        if canCalculateDistance {
-                            Button {
-                                calculateDistance()
-                            } label: {
-                                HStack {
-                                    Image(systemName: "arrow.triangle.2.circlepath")
-                                    Text("Calculate Distance")
-                                }
-                                .font(.subheadline)
-                                .fontWeight(.medium)
-                                .foregroundStyle(.blue)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 8)
-                                .background(Color.blue.opacity(0.1))
-                                .cornerRadius(8)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    
-                    if let error = distanceError {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundStyle(.red)
+                        Text("miles").foregroundStyle(.secondary)
                     }
                 } header: {
                     Text("Route")
                 }
-                
-                // Date & Time Section
+
+                // MARK: When
                 Section {
                     DatePicker("Pickup Date & Time", selection: $pickupDate, in: Date()...)
                         .datePickerStyle(.compact)
@@ -1439,23 +1495,18 @@ struct PostRideSheet: View {
                 } footer: {
                     Text("Select when you need to be picked up")
                 }
-                
-                // Coins Section
+
+                // MARK: Coins
                 Section {
                     HStack {
-                        Text("🪙")
-                            .font(.title3)
+                        Text("🪙").font(.title3)
                         TextField("0", text: $coinsText)
                             .keyboardType(.numberPad)
                             .font(.title3)
                             .fontWeight(.semibold)
-
                         if miles > 0 && suggestedCoins != coins {
-                            Button {
-                                coinsText = "\(suggestedCoins)"
-                            } label: {
-                                Text("Use \(suggestedCoins)")
-                                    .font(.caption)
+                            Button { coinsText = "\(suggestedCoins)" } label: {
+                                Text("Use \(suggestedCoins)").font(.caption)
                             }
                             .buttonStyle(.borderless)
                         }
@@ -1468,7 +1519,7 @@ struct PostRideSheet: View {
                         : Text("Coins are community currency. No real money involved.")
                 }
 
-                // Hot Duration Section
+                // MARK: Hot duration
                 Section {
                     Stepper("\(hotDuration) minutes", value: $hotDuration, in: 5...60, step: 5)
                 } header: {
@@ -1476,30 +1527,25 @@ struct PostRideSheet: View {
                 } footer: {
                     Text("Your request disappears from drivers after this time. Default is 5 minutes.")
                 }
-                
+
+                // MARK: Contact
                 Section {
-                    TextField("e.g. John Doe", text: $name)
-                        .font(.body)
-                    
+                    TextField("e.g. John Doe", text: $name).font(.body)
+
                     HStack(spacing: 8) {
                         Picker("Code", selection: $phoneCountryCode) {
                             ForEach(countryCodes, id: \.1) { flag, code in
                                 Text("\(flag) \(code)").tag(code)
                             }
                         }
-                        .labelsHidden()
-                        .frame(width: 100)
-                        
-                        TextField("Phone number", text: $phone)
-                            .keyboardType(.numberPad)
-                            .font(.body)
+                        .labelsHidden().frame(width: 100)
+                        TextField("Phone number", text: $phone).keyboardType(.numberPad)
                     }
-                    
+
                     Toggle(isOn: $sameNumberForBoth) {
-                        Text("Same number for WhatsApp")
-                            .font(.subheadline)
+                        Text("Same number for WhatsApp").font(.subheadline)
                     }
-                    
+
                     if !sameNumberForBoth {
                         HStack(spacing: 8) {
                             Picker("Code", selection: $whatsappCountryCode) {
@@ -1507,12 +1553,8 @@ struct PostRideSheet: View {
                                     Text("\(flag) \(code)").tag(code)
                                 }
                             }
-                            .labelsHidden()
-                            .frame(width: 100)
-                            
-                            TextField("WhatsApp number", text: $whatsappPhone)
-                                .keyboardType(.numberPad)
-                                .font(.body)
+                            .labelsHidden().frame(width: 100)
+                            TextField("WhatsApp number", text: $whatsappPhone).keyboardType(.numberPad)
                         }
                     }
                 } header: {
@@ -1525,9 +1567,7 @@ struct PostRideSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        dismiss()
-                    }
+                    Button("Cancel") { dismiss() }
                 }
             }
             .safeAreaInset(edge: .bottom) {
@@ -1552,16 +1592,79 @@ struct PostRideSheet: View {
                 .padding()
                 .background(Color(UIColor.systemGroupedBackground))
             }
-            .onAppear {
-                loadEditingData()
+            .sheet(isPresented: $showingPickupPicker) {
+                LocationPickerView(title: "Pickup Location") { result in
+                    pickupResult = result
+                    calculateRoute()
+                }
+            }
+            .sheet(isPresented: $showingDropoffPicker) {
+                LocationPickerView(title: "Drop-off Location") { result in
+                    dropoffResult = result
+                    calculateRoute()
+                }
+            }
+            .onAppear { loadEditingData() }
+            .task { await loadProfileDefaults() }
+        }
+    }
+
+    // MARK: - Route preview card
+
+    @ViewBuilder
+    private var routePreviewCard: some View {
+        VStack(spacing: 0) {
+            if !routeCoords.isEmpty, let pickup = pickupResult, let dropoff = dropoffResult {
+                let region = MKCoordinateRegion(
+                    center: CLLocationCoordinate2D(
+                        latitude: (pickup.coordinate.latitude + dropoff.coordinate.latitude) / 2,
+                        longitude: (pickup.coordinate.longitude + dropoff.coordinate.longitude) / 2
+                    ),
+                    span: MKCoordinateSpan(
+                        latitudeDelta: abs(pickup.coordinate.latitude - dropoff.coordinate.latitude) * 1.5 + 0.01,
+                        longitudeDelta: abs(pickup.coordinate.longitude - dropoff.coordinate.longitude) * 1.5 + 0.01
+                    )
+                )
+                Map(initialPosition: .region(region)) {
+                    Annotation("", coordinate: pickup.coordinate) {
+                        Circle().fill(.green).frame(width: 12, height: 12)
+                    }
+                    Annotation("", coordinate: dropoff.coordinate) {
+                        Image(systemName: "mappin.circle.fill")
+                            .foregroundStyle(.red).font(.title2)
+                    }
+                    MapPolyline(coordinates: routeCoords)
+                        .stroke(.blue, lineWidth: 4)
+                }
+                .frame(height: 180)
+                .cornerRadius(10)
+                .padding(.vertical, 6)
+
+                // Stats row
+                if let eta = routeETA {
+                    HStack(spacing: 20) {
+                        Label(milesText + " mi", systemImage: "road.lanes")
+                        Label(eta, systemImage: "clock")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.bottom, 4)
+                }
+            } else if isCalculatingRoute {
+                HStack {
+                    ProgressView()
+                    Text("Calculating route…").font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 8)
             }
         }
     }
-    
+
+    // MARK: - Helpers
+
     func loadEditingData() {
         guard let ride = editingRide else { return }
-        goingTo = ride.to
-        pickupFrom = ride.from
+        // Restore text fields; coordinates are embedded in the ride
         milesText = String(format: "%.1f", ride.miles)
         coinsText = "\(ride.coins)"
         hotDuration = ride.hotDuration
@@ -1572,85 +1675,158 @@ struct PostRideSheet: View {
         whatsappCountryCode = ride.whatsappCountryCode
         whatsappPhone = ride.whatsappPhone
         sameNumberForBoth = (ride.phone == ride.whatsappPhone && ride.phoneCountryCode == ride.whatsappCountryCode)
+
+        // Restore location results from stored text (no re-geocoding needed for display)
+        let pickupCoord = ride.pickupLat.flatMap { lat in
+            ride.pickupLng.map { lng in CLLocationCoordinate2D(latitude: lat, longitude: lng) }
+        }
+        pickupResult = PlaceResult(name: ride.from, subtitle: "", coordinate: pickupCoord ?? CLLocationCoordinate2D())
+        dropoffResult = PlaceResult(name: ride.to, subtitle: "", coordinate: CLLocationCoordinate2D())
     }
-    
+
+    func loadProfileDefaults() async {
+        guard editingRide == nil,
+              let uid = Auth.auth().currentUser?.uid else { return }
+        guard let data = try? await Firestore.firestore()
+                .collection("users").document(uid).getDocument().data() else { return }
+
+        let savedName     = data["displayName"] as? String ?? Auth.auth().currentUser?.displayName ?? ""
+        let savedPhone    = data["phone"]    as? String ?? ""
+        let savedWhatsapp = data["whatsapp"] as? String ?? savedPhone
+
+        await MainActor.run {
+            if name.isEmpty          { name          = savedName }
+            if phone.isEmpty         { phone          = savedPhone }
+            if whatsappPhone.isEmpty { whatsappPhone  = savedWhatsapp }
+        }
+    }
+
     func submitRide() {
-        let finalWhatsappPhone = sameNumberForBoth ? phone : whatsappPhone
+        let finalWhatsappPhone       = sameNumberForBoth ? phone : whatsappPhone
         let finalWhatsappCountryCode = sameNumberForBoth ? phoneCountryCode : whatsappCountryCode
 
         if let editingRide = editingRide {
-            var updatedRide = editingRide
-            updatedRide.name = name
-            updatedRide.phone = phone
-            updatedRide.phoneCountryCode = phoneCountryCode
-            updatedRide.whatsappPhone = finalWhatsappPhone
-            updatedRide.whatsappCountryCode = finalWhatsappCountryCode
-            updatedRide.from = pickupFrom
-            updatedRide.to = goingTo
-            updatedRide.miles = miles
-            updatedRide.coins = coins
-            updatedRide.hotDuration = hotDuration
-            updatedRide.pickupDate = pickupDate
-            storage.updateRide(updatedRide)
+            var updated = editingRide
+            updated.name                 = name
+            updated.phone                = phone
+            updated.phoneCountryCode     = phoneCountryCode
+            updated.whatsappPhone        = finalWhatsappPhone
+            updated.whatsappCountryCode  = finalWhatsappCountryCode
+            updated.from                 = pickupResult?.name ?? editingRide.from
+            updated.to                   = dropoffResult?.name ?? editingRide.to
+            updated.miles                = miles
+            updated.coins                = coins
+            updated.hotDuration          = hotDuration
+            updated.pickupDate           = pickupDate
+            if let coord = pickupResult?.coordinate {
+                updated.pickupLat = coord.latitude
+                updated.pickupLng = coord.longitude
+            }
+            storage.updateRide(updated)
             dismiss()
         } else {
-            // Geocode pickup location before saving so drivers can filter by distance
             isSubmitting = true
-            Task {
-                // Use cached coord if available (from "Calculate Distance" tap)
-                var lat = cachedPickupCoord?.lat
-                var lng = cachedPickupCoord?.lon
-                if lat == nil, let coord = try? await distanceCalculator.geocode(address: pickupFrom) {
-                    lat = coord.lat
-                    lng = coord.lon
+            let coord = pickupResult?.coordinate
+            let ride = Ride(
+                riderId: Auth.auth().currentUser?.uid ?? "",
+                name: name,
+                phone: phone,
+                phoneCountryCode: phoneCountryCode,
+                whatsappPhone: finalWhatsappPhone,
+                whatsappCountryCode: finalWhatsappCountryCode,
+                from: pickupResult?.name ?? "",
+                to: dropoffResult?.name ?? "",
+                miles: miles,
+                pickupLat: coord?.latitude,
+                pickupLng: coord?.longitude,
+                coins: coins,
+                hotDuration: hotDuration,
+                pickupDate: pickupDate,
+                status: .posted
+            )
+            storage.addRide(ride)
+            isSubmitting = false
+            dismiss()
+        }
+    }
+
+    /// Calculates route between pickup and dropoff using MKDirections.
+    /// Populates routeCoords, milesText, coinsText (if not customised), and routeETA.
+    func calculateRoute() {
+        guard let pickup = pickupResult, let dropoff = dropoffResult else { return }
+        // Skip if dropoff has no real coordinate (editing fallback placeholder)
+        guard dropoff.coordinate.latitude != 0 || dropoff.coordinate.longitude != 0 else { return }
+        isCalculatingRoute = true
+        Task {
+            let request = MKDirections.Request()
+            request.source = MKMapItem(placemark: MKPlacemark(coordinate: pickup.coordinate))
+            request.destination = MKMapItem(placemark: MKPlacemark(coordinate: dropoff.coordinate))
+            request.transportType = .automobile
+
+            let response = try? await withCheckedThrowingContinuation { (cont: CheckedContinuation<MKDirections.Response, Error>) in
+                MKDirections(request: request).calculate { response, error in
+                    if let response { cont.resume(returning: response) }
+                    else { cont.resume(throwing: error ?? URLError(.unknown)) }
                 }
-                let ride = Ride(
-                    riderId: Auth.auth().currentUser?.uid ?? "",
-                    name: name,
-                    phone: phone,
-                    phoneCountryCode: phoneCountryCode,
-                    whatsappPhone: finalWhatsappPhone,
-                    whatsappCountryCode: finalWhatsappCountryCode,
-                    from: pickupFrom,
-                    to: goingTo,
-                    miles: miles,
-                    pickupLat: lat,
-                    pickupLng: lng,
-                    coins: coins,
-                    hotDuration: hotDuration,
-                    pickupDate: pickupDate,
-                    status: .posted
-                )
-                await MainActor.run {
-                    storage.addRide(ride)
-                    isSubmitting = false
-                    dismiss()
+            }
+
+            await MainActor.run {
+                isCalculatingRoute = false
+                guard let route = response?.routes.first else { return }
+
+                // Extract polyline coordinates
+                let count = route.polyline.pointCount
+                var coords = [CLLocationCoordinate2D](repeating: CLLocationCoordinate2D(), count: count)
+                route.polyline.getCoordinates(&coords, range: NSRange(location: 0, length: count))
+                routeCoords = coords
+
+                // Distance and coins
+                let calculatedMiles = route.distance / 1609.34
+                let prevSuggested = max(1, Int(Double(milesText) ?? 0))
+                milesText = String(format: "%.1f", calculatedMiles)
+                // Only auto-update coins if user hasn't changed them from the last suggestion
+                if coinsText.isEmpty || Int(coinsText) == prevSuggested {
+                    coinsText = "\(max(1, Int(calculatedMiles)))"
                 }
+
+                // ETA
+                let totalSeconds = Int(route.expectedTravelTime)
+                let h = totalSeconds / 3600
+                let m = (totalSeconds % 3600) / 60
+                routeETA = h > 0 ? "\(h)h \(m)m" : "\(m) min"
             }
         }
     }
-    
-    func calculateDistance() {
-        Task {
-            isCalculatingDistance = true
-            distanceError = nil
-            do {
-                // Geocode pickup first (cache the coord for submission)
-                let coord = try await distanceCalculator.geocode(address: pickupFrom)
-                let calculatedMiles = try await distanceCalculator.calculateDistance(from: pickupFrom, to: goingTo)
-                await MainActor.run {
-                    cachedPickupCoord = coord
-                    milesText = String(format: "%.1f", calculatedMiles)
-                    coinsText = "\(max(1, Int(calculatedMiles)))"
-                    isCalculatingDistance = false
-                }
-            } catch {
-                await MainActor.run {
-                    distanceError = "Could not calculate distance. Please enter manually."
-                    isCalculatingDistance = false
+}
+
+// MARK: - Location Row (tappable card in PostRideSheet)
+
+private struct LocationRow: View {
+    let label: String
+    let systemImage: String
+    let color: Color
+    let result: PlaceResult?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: systemImage)
+                .foregroundStyle(color)
+                .font(.title3)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label).font(.caption).foregroundStyle(.secondary)
+                if let result {
+                    Text(result.displayTitle).font(.body).foregroundStyle(.primary)
+                    if !result.displaySubtitle.isEmpty {
+                        Text(result.displaySubtitle).font(.caption).foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("Tap to choose…").font(.body).foregroundStyle(.tertiary)
                 }
             }
+            Spacer()
+            Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
         }
+        .contentShape(Rectangle())
     }
 }
 
@@ -1810,25 +1986,46 @@ struct RideCard: View {
                     }
                 } else {
                     // Rider mode - show edit/delete buttons
-                    HStack(spacing: 12) {
-                        Button {
-                            onEdit?()
-                        } label: {
-                            Label("Edit", systemImage: "pencil")
-                                .font(.subheadline)
-                                .foregroundStyle(.blue)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 8)
+                    if ride.bidCount > 0 {
+                        // Edit locked — drivers have placed bids
+                        VStack(spacing: 6) {
+                            Label("Editing locked — \(ride.bidCount) driver bid\(ride.bidCount == 1 ? "" : "s") placed", systemImage: "lock.fill")
+                                .font(.caption).fontWeight(.semibold)
+                                .foregroundStyle(.orange)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Button {
+                                onDelete?()
+                            } label: {
+                                Label("Cancel Ride", systemImage: "xmark")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.red)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                                    .background(Color.red.opacity(0.1))
+                                    .cornerRadius(8)
+                            }
                         }
-                        
-                        Button {
-                            onDelete?()
-                        } label: {
-                            Label("Cancel", systemImage: "xmark")
-                                .font(.subheadline)
-                                .foregroundStyle(.red)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 8)
+                    } else {
+                        HStack(spacing: 12) {
+                            Button {
+                                onEdit?()
+                            } label: {
+                                Label("Edit", systemImage: "pencil")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.blue)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                            }
+
+                            Button {
+                                onDelete?()
+                            } label: {
+                                Label("Cancel", systemImage: "xmark")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.red)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                            }
                         }
                     }
                 }
