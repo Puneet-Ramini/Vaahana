@@ -402,9 +402,6 @@
            where, orderBy, limit,
            onSnapshot, getDocs,
            Timestamp }             from "https://www.gstatic.com/firebasejs/11.6.0/firebase-firestore.js";
-  import { getAuth,
-           signInAnonymously }     from "https://www.gstatic.com/firebasejs/11.6.0/firebase-auth.js";
-
   const firebaseConfig = {
     apiKey:            "AIzaSyAqHRI6HHkxbyr3Cb-TZue0r7JvKDpuTxk",
     authDomain:        "vaahana-fb9b8.firebaseapp.com",
@@ -414,12 +411,8 @@
     appId:             "1:803618464965:web:d26b506573186f20893cac",
   };
 
-  const app  = initializeApp(firebaseConfig);
-  const db   = getFirestore(app);
-  const auth = getAuth(app);
-
-  // Sign in anonymously so Firestore rules (require auth) pass
-  await signInAnonymously(auth);
+  const app = initializeApp(firebaseConfig);
+  const db  = getFirestore(app);
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
