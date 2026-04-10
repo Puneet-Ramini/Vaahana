@@ -15,5 +15,13 @@
         ".DS_Store"
       ]
     }
-  ]
+  ],
+  "hosting": {
+    "public": "dashboard/public",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ]
+  }
 }
