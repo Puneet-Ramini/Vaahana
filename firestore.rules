@@ -47,5 +47,17 @@ service cloud.firestore {
                     && request.auth.uid == request.resource.data.raterUid;
       allow update, delete: if false;
     }
+
+    // Placeholder profiles for WhatsApp-sourced riders (no Vaahana account yet)
+    match /whatsappRiders/{docId} {
+      allow read: if request.auth != null;
+      allow write: if false;  // server-only
+    }
+
+    // Ingestion audit trail
+    match /whatsappIngestionLogs/{logId} {
+      allow read: if request.auth != null;
+      allow write: if false;  // server-only
+    }
   }
 }
