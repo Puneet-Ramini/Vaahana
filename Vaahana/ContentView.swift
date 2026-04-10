@@ -1582,6 +1582,9 @@ struct PostRideSheet: View {
             .onAppear {
                 loadEditingData()
             }
+            .task {
+                await loadProfileDefaults()
+            }
         }
     }
     
@@ -1599,6 +1602,27 @@ struct PostRideSheet: View {
         whatsappCountryCode = ride.whatsappCountryCode
         whatsappPhone = ride.whatsappPhone
         sameNumberForBoth = (ride.phone == ride.whatsappPhone && ride.phoneCountryCode == ride.whatsappCountryCode)
+    }
+
+    /// Pre-fills contact fields from the user's saved Firestore profile.
+    /// Only fills fields that are currently empty (doesn't overwrite user edits).
+    func loadProfileDefaults() async {
+        guard editingRide == nil,
+              let uid = Auth.auth().currentUser?.uid else { return }
+        guard let data = try? await Firestore.firestore()
+                .collection("users").document(uid).getDocument().data() else { return }
+
+        let savedName    = data["displayName"] as? String
+                           ?? Auth.auth().currentUser?.displayName
+                           ?? ""
+        let savedPhone   = data["phone"]    as? String ?? ""
+        let savedWhatsapp = data["whatsapp"] as? String ?? savedPhone
+
+        await MainActor.run {
+            if name.isEmpty          { name         = savedName }
+            if phone.isEmpty         { phone         = savedPhone }
+            if whatsappPhone.isEmpty { whatsappPhone = savedWhatsapp }
+        }
     }
     
     func submitRide() {

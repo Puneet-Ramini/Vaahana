@@ -140,14 +140,19 @@ struct ProfileView: View {
 
     private func load() async {
         guard let uid = currentUser?.uid else { return }
-        displayName = currentUser?.displayName ?? ""
         if let data = try? await db.collection("users").document(uid).getDocument().data() {
-            phone = data["phone"] as? String ?? ""
+            // Prefer Firestore displayName; fall back to Firebase Auth
+            displayName = data["displayName"] as? String
+                          ?? currentUser?.displayName
+                          ?? ""
+            phone    = data["phone"]    as? String ?? ""
             whatsapp = data["whatsapp"] as? String ?? ""
-            coins = data["coins"] as? Int ?? 0
+            coins    = data["coins"]    as? Int    ?? 0
             if let rawRole = data["role"] as? String {
                 role = UserRole(rawValue: rawRole)
             }
+        } else {
+            displayName = currentUser?.displayName ?? ""
         }
     }
 
@@ -156,16 +161,17 @@ struct ProfileView: View {
         errorMessage = nil
         Task {
             do {
+                let trimmedName = displayName.trimmingCharacters(in: .whitespaces)
                 // Update display name in Firebase Auth
                 if let user = currentUser {
                     let req = user.createProfileChangeRequest()
-                    req.displayName = displayName.trimmingCharacters(in: .whitespaces)
+                    req.displayName = trimmedName
                     try await req.commitChanges()
                 }
-                // Save contact numbers to Firestore
+                // Save name + contact numbers to Firestore
                 if let uid = currentUser?.uid {
                     try await db.collection("users").document(uid).setData(
-                        ["phone": phone, "whatsapp": whatsapp],
+                        ["displayName": trimmedName, "phone": phone, "whatsapp": whatsapp],
                         merge: true
                     )
                 }

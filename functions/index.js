@@ -413,7 +413,55 @@ exports.reconcileDriverAssignments = onSchedule(
   }
 );
 
-// ─── Function 4: reconcileRide (callable) ────────────────────────────────────
+// ─── Function 4: grantDailyCoins ─────────────────────────────────────────────
+
+/**
+ * Runs at midnight UTC every day.
+ * Grants 100 coins to every user who hasn't already received them today
+ * (checked via the `lastDailyCoinDate` field — "YYYY-MM-DD" string).
+ *
+ * The iOS app also does a client-side grant on launch as a failsafe,
+ * but this function covers users who don't open the app that day.
+ */
+exports.grantDailyCoins = onSchedule(
+  {
+    schedule:       "0 0 * * *",   // midnight UTC
+    timeoutSeconds: 540,
+    memory:         "512MiB",
+  },
+  async () => {
+    const today        = new Date().toISOString().split("T")[0]; // "2026-04-10"
+    const allUsersSnap = await db.collection("users").get();
+
+    const BATCH_SIZE = 450;
+    let batch        = db.batch();
+    let opCount      = 0;
+    let grantCount   = 0;
+
+    for (const userDoc of allUsersSnap.docs) {
+      const lastGrant = userDoc.data().lastDailyCoinDate || "";
+      if (lastGrant === today) continue; // already granted today
+
+      batch.update(userDoc.ref, {
+        coins:             FieldValue.increment(100),
+        lastDailyCoinDate: today,
+      });
+      opCount++;
+      grantCount++;
+
+      if (opCount >= BATCH_SIZE) {
+        await batch.commit();
+        batch   = db.batch();
+        opCount = 0;
+      }
+    }
+
+    if (opCount > 0) await batch.commit();
+    console.log(`[grantDailyCoins] Granted 100 coins to ${grantCount}/${allUsersSnap.size} users on ${today}`);
+  }
+);
+
+// ─── Function 5: reconcileRide (callable) ────────────────────────────────────
 
 /**
  * Admin/debug callable function for deep single-ride inspection.
