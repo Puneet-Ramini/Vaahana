@@ -7,6 +7,7 @@ import SwiftUI
 import Combine
 import MapKit
 import CoreLocation
+import UIKit
 
 // MARK: - PlaceResult
 
@@ -63,27 +64,105 @@ extension LocationCompleter: MKLocalSearchCompleterDelegate {
 
 // MARK: - One-shot location fetcher
 
+@MainActor
 private final class OneTimeLocationFetcher: NSObject, CLLocationManagerDelegate {
-    private let manager = CLLocationManager()
-    private var continuation: CheckedContinuation<CLLocationCoordinate2D?, Never>?
+    enum FetchResult {
+        case success(CLLocationCoordinate2D)
+        case permissionDenied
+        case failed(Error?)
+    }
 
-    func fetch() async -> CLLocationCoordinate2D? {
+    private let manager = CLLocationManager()
+    private var continuation: CheckedContinuation<FetchResult, Never>?
+
+    override init() {
+        super.init()
+        // Manager must be set up on main thread
         manager.delegate = self
-        manager.requestWhenInUseAuthorization()
+        manager.desiredAccuracy = kCLLocationAccuracyKilometer
+    }
+
+    func fetch() async -> FetchResult {
+        let status = manager.authorizationStatus
+
+        if status == .denied || status == .restricted {
+            return .permissionDenied
+        }
+
+        if status == .authorizedWhenInUse || status == .authorizedAlways {
+            // Return cached location immediately if it's fresh (< 30 seconds old)
+            if let cached = manager.location,
+               cached.timestamp.timeIntervalSinceNow > -30 {
+                return .success(cached.coordinate)
+            }
+            return await requestLocation()
+        }
+
+        // Not determined — request permission, then location
         return await withCheckedContinuation { cont in
+            self.continuation = cont
+            self.manager.requestWhenInUseAuthorization()
+        }
+    }
+
+    private func requestLocation() async -> FetchResult {
+        await withCheckedContinuation { cont in
             self.continuation = cont
             self.manager.requestLocation()
         }
     }
 
-    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        continuation?.resume(returning: locations.first?.coordinate)
+    func cancel() {
+        continuation?.resume(returning: .failed(nil))
         continuation = nil
+        manager.delegate = nil
     }
 
-    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        continuation?.resume(returning: nil)
-        continuation = nil
+    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        Task { @MainActor in
+            guard let coordinate = locations.first?.coordinate else {
+                continuation?.resume(returning: .failed(nil))
+                continuation = nil
+                return
+            }
+            continuation?.resume(returning: .success(coordinate))
+            continuation = nil
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        Task { @MainActor in
+            if let clError = error as? CLError, clError.code == .denied {
+                continuation?.resume(returning: .permissionDenied)
+            } else {
+                continuation?.resume(returning: .failed(error))
+            }
+            continuation = nil
+        }
+    }
+
+    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        Task { @MainActor in
+            switch manager.authorizationStatus {
+            case .authorizedWhenInUse, .authorizedAlways:
+                // Check cache first, then request
+                if let cached = self.manager.location,
+                   cached.timestamp.timeIntervalSinceNow > -30 {
+                    continuation?.resume(returning: .success(cached.coordinate))
+                    continuation = nil
+                } else {
+                    self.manager.requestLocation()
+                }
+            case .denied, .restricted:
+                continuation?.resume(returning: .permissionDenied)
+                continuation = nil
+            case .notDetermined:
+                break
+            @unknown default:
+                continuation?.resume(returning: .failed(nil))
+                continuation = nil
+            }
+        }
     }
 }
 
@@ -97,6 +176,51 @@ struct LocationPickerView: View {
     @StateObject private var completer = LocationCompleter()
     @State private var searchText = ""
     @State private var isResolving = false
+    @State private var locationError: LocationError? = nil
+    @State private var locationFetcher: OneTimeLocationFetcher? = nil
+
+    enum LocationError: Identifiable {
+        case locationServicesDisabled
+        case permissionDenied
+        case timedOut
+        case fetchFailed
+
+        var id: Int {
+            switch self {
+            case .locationServicesDisabled: return 0
+            case .permissionDenied: return 1
+            case .timedOut: return 2
+            case .fetchFailed: return 3
+            }
+        }
+
+        var title: String {
+            switch self {
+            case .locationServicesDisabled: return "Location Services Off"
+            case .permissionDenied: return "Location Access Denied"
+            case .timedOut: return "Location Timed Out"
+            case .fetchFailed:      return "Couldn't Get Location"
+            }
+        }
+        var message: String {
+            switch self {
+            case .locationServicesDisabled:
+                return "Turn on Location Services in Settings → Privacy & Security → Location Services."
+            case .permissionDenied: return "To use your current location, go to Settings → Vaahana → Location and allow access."
+            case .timedOut:
+                return "We waited for your location, but no GPS fix arrived. Try again in a place with better signal."
+            case .fetchFailed:      return "Unable to determine your location. Please search for your address manually."
+            }
+        }
+        var showSettings: Bool {
+            switch self {
+            case .permissionDenied:
+                return true
+            case .locationServicesDisabled, .timedOut, .fetchFailed:
+                return false
+            }
+        }
+    }
 
     var body: some View {
         NavigationStack {
@@ -153,6 +277,26 @@ struct LocationPickerView: View {
                     }
                 }
             }
+            .alert(item: $locationError) { error in
+                if error.showSettings {
+                    Alert(
+                        title: Text(error.title),
+                        message: Text(error.message),
+                        primaryButton: .default(Text("Open Settings")) {
+                            if let url = URL(string: UIApplication.openSettingsURLString) {
+                                UIApplication.shared.open(url)
+                            }
+                        },
+                        secondaryButton: .cancel()
+                    )
+                } else {
+                    Alert(
+                        title: Text(error.title),
+                        message: Text(error.message),
+                        dismissButton: .default(Text("OK"))
+                    )
+                }
+            }
         }
     }
 
@@ -182,26 +326,98 @@ struct LocationPickerView: View {
 
     private func fetchCurrentLocation() {
         isResolving = true
+        let fetcher = OneTimeLocationFetcher()
+        locationFetcher = fetcher          // retain until done
         Task {
-            let fetcher = OneTimeLocationFetcher()
-            guard let coord = await fetcher.fetch() else {
-                await MainActor.run { isResolving = false }
-                return
-            }
-            let geocoder = CLGeocoder()
-            let location = CLLocation(latitude: coord.latitude, longitude: coord.longitude)
-            let placemarks = try? await geocoder.reverseGeocodeLocation(location)
+            let result = await fetchCurrentCoordinate(using: fetcher)
             await MainActor.run {
-                isResolving = false
-                if let pm = placemarks?.first {
-                    let name = pm.locality ?? pm.name ?? "Current Location"
-                    let sub = [pm.administrativeArea, pm.isoCountryCode]
-                        .compactMap { $0 }.joined(separator: ", ")
-                    let result = PlaceResult(name: name, subtitle: sub, coordinate: coord)
-                    onSelect(result)
-                    dismiss()
+                locationFetcher = nil
+                switch result {
+                case .success(let coord):
+                    // Keep spinner up while geocoding (3s timeout then fall back to coords)
+                    Task {
+                        let clLocation = CLLocation(latitude: coord.latitude, longitude: coord.longitude)
+                        let placemarks = try? await withThrowingTaskGroup(of: [CLPlacemark]?.self) { group in
+                            group.addTask { try await CLGeocoder().reverseGeocodeLocation(clLocation) }
+                            group.addTask {
+                                try await Task.sleep(for: .seconds(3))
+                                return nil
+                            }
+                            let result = try await group.next() ?? nil
+                            group.cancelAll()
+                            return result
+                        }
+                        await MainActor.run {
+                            isResolving = false
+                            let place: PlaceResult
+                            if let pm = placemarks?.first {
+                                let name = pm.locality ?? pm.subLocality ?? pm.name ?? "Current Location"
+                                let sub  = [pm.administrativeArea, pm.isoCountryCode]
+                                    .compactMap { $0 }.joined(separator: ", ")
+                                place = PlaceResult(name: name, subtitle: sub, coordinate: coord)
+                            } else {
+                                let subtitle = String(format: "%.5f, %.5f", coord.latitude, coord.longitude)
+                                place = PlaceResult(name: "Current Location", subtitle: subtitle, coordinate: coord)
+                            }
+                            onSelect(place)
+                            dismiss()
+                        }
+                    }
+                case .locationServicesDisabled:
+                    isResolving = false
+                    locationError = .locationServicesDisabled
+                case .permissionDenied:
+                    isResolving = false
+                    locationError = .permissionDenied
+                case .timedOut:
+                    isResolving = false
+                    locationError = .timedOut
+                case .fetchFailed:
+                    isResolving = false
+                    locationError = .fetchFailed
                 }
             }
         }
     }
+
+    private func fetchCurrentCoordinate(using fetcher: OneTimeLocationFetcher) async -> LocationErrorOrCoordinate {
+        if !CLLocationManager.locationServicesEnabled() {
+            return .locationServicesDisabled
+        }
+
+        // Run fetch with a 5-second watchdog on the main actor
+        return await withCheckedContinuation { @MainActor outer in
+            var resumed = false
+            func finish(_ r: LocationErrorOrCoordinate) {
+                guard !resumed else { return }
+                resumed = true
+                outer.resume(returning: r)
+            }
+
+            let watchdog = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(5))
+                fetcher.cancel()
+                finish(.timedOut)
+            }
+
+            Task { @MainActor in
+                let result: LocationErrorOrCoordinate
+                switch await fetcher.fetch() {
+                case .success(let coord): result = .success(coord)
+                case .permissionDenied:   result = .permissionDenied
+                case .failed:             result = .fetchFailed
+                }
+                watchdog.cancel()
+                finish(result)
+            }
+        }
+    }
+}
+
+private enum LocationErrorOrCoordinate {
+    case success(CLLocationCoordinate2D)
+    case locationServicesDisabled
+    case permissionDenied
+    case timedOut
+    case fetchFailed
 }

@@ -38,6 +38,7 @@ const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const { getMessaging } = require("firebase-admin/messaging");
 const { defineSecret } = require("firebase-functions/params");
 const crypto = require("crypto");
+const https  = require("https");
 
 const WHATSAPP_API_KEY = defineSecret("WHATSAPP_INGEST_API_KEY");
 
@@ -595,11 +596,20 @@ function parseWhatsAppExport(rawText) {
     const trimmed = chunk.trim();
     if (!trimmed) continue;
 
-    const match = trimmed.match(/^\[(\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?),?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\]\s*([+\d][\d\s\-().]{6,20}?):\s*([\s\S]+)$/i);
+    // Accept either a phone number (+1...) or a display name as the sender
+    const match = trimmed.match(/^\[(\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?),?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\]\s*(.+?):\s*([\s\S]+)$/i);
     if (!match) continue;
 
-    const [, timePart, datePart, rawPhone, text] = match;
-    const phone = normalizePhone(rawPhone.trim());
+    const [, timePart, datePart, rawSender, text] = match;
+    // Skip system messages (no colon body, encryption notices, etc.)
+    if (!text || !text.trim()) continue;
+
+    const rawPhone = rawSender.trim();
+    // If sender looks like a phone number, normalize it; otherwise use a hash-based placeholder
+    const isPhoneNumber = /^[+\d][\d\s\-().]{5,}$/.test(rawPhone);
+    const phone = isPhoneNumber
+      ? normalizePhone(rawPhone)
+      : `name:${crypto.createHash("sha256").update(rawPhone.toLowerCase()).digest("hex").slice(0, 12)}`;
     if (!phone) continue;
 
     // Parse timestamp — try M/D/YYYY first (iOS), then D/M/YYYY (Android)
@@ -618,23 +628,30 @@ function parseWhatsAppExport(rawText) {
  * Returns null if the input doesn't look like a real phone number.
  */
 function normalizePhone(raw) {
-  // Strip everything except digits and leading +
+  // Strip everything except digits and a leading +
   const digits = raw.replace(/[^\d+]/g, "");
   if (digits.length < 7) return null;
 
-  if (digits.startsWith("+")) return digits;
+  const hasPlus = digits.startsWith("+");
+  // E.164 max is 15 digits. WhatsApp JIDs sometimes append extra digits
+  // (e.g. "+110866309587147" where the real number is "+18066309587").
+  // Trim numeric portion to 15 digits max to strip JID artifacts.
+  const numeric = (hasPlus ? digits.slice(1) : digits).slice(0, 15);
 
-  // 10-digit US number → prepend +1
-  if (digits.length === 10) return `+1${digits}`;
+  // 10-digit US/CA number (no country code)
+  if (numeric.length === 10 && /^[2-9]/.test(numeric)) return `+1${numeric}`;
 
-  // 11-digit starting with 1 → +1XXXXXXXXXX
-  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  // 11-digit starting with 1 → US/CA with country code
+  if (numeric.length === 11 && numeric.startsWith("1")) return `+${numeric}`;
 
   // Indian numbers: 10-digit starting with 6-9
-  if (digits.length === 10 && /^[6-9]/.test(digits)) return `+91${digits}`;
-  if (digits.length === 12 && digits.startsWith("91")) return `+${digits}`;
+  if (numeric.length === 10 && /^[6-9]/.test(numeric)) return `+91${numeric}`;
+  if (numeric.length === 12 && numeric.startsWith("91")) return `+${numeric}`;
 
-  return `+${digits}`;
+  // Already has country code (11–15 digits)
+  if (numeric.length >= 11) return `+${numeric}`;
+
+  return null;
 }
 
 // ── 3. Timestamp parsing ──────────────────────────────────────────────────────
@@ -676,18 +693,22 @@ function parseMessageTimestamp(datePart, timePart) {
 
 // ── 4. Ride request classification & field extraction ─────────────────────────
 
-const RIDE_KEYWORDS = /\b(need\s+ride|need\s+a\s+ride|looking\s+for\s+(?:a\s+)?ride|anybody\s+(?:going|travelling|traveling)|anyone\s+(?:going|travelling|traveling)|travelling\s+by\s+road|traveling\s+by\s+road|shared\s+ride|carpool|ride\s+share|rideshare|ride\s+from|ride\s+to|going\s+from|going\s+to)\b/i;
+const RIDE_KEYWORDS = /\b(need\s+(?:a\s+)?ride|ride\s+needed|looking\s+for\s+(?:a\s+)?ride|anybody\s+(?:going|travelling|traveling)|anyone\s+(?:going|travelling|traveling)|travelling\s+by\s+road|traveling\s+by\s+road|shared\s+ride|carpool|ride\s+share|rideshare|ride\s+from|ride\s+to|going\s+from|going\s+to)\b/i;
 
 const DISCARD_KEYWORDS = /\b(accommodation|apartment|room\s+for|room\s+available|bed\s+available|sublet|looking\s+for\s+room|looking\s+for\s+accommodation|house|flat\s+available|roommate|room\s+mate)\b/i;
 
 // Patterns for "from X to Y"
+// Stop words that terminate a location name
+const LOC_STOP = `(?:\\s+(?:at|by|around|on|in|tomorrow|tonight|today|next|now|asap|right|please|pls|dm|message|msg|\\d)|[,.]|$)`;
+const LOC = `([A-Za-z0-9\\s,./]+?)`;
+
 const FROM_TO_PATTERNS = [
-  /\bfrom\s+([A-Za-z0-9\s,./]+?)\s+to\s+([A-Za-z0-9\s,./]+?)(?:\s+(?:at|by|around|on|tomorrow|tonight|today|next|\d)|[,.]|$)/i,
-  /\bfrom\s+([A-Za-z0-9\s,./]+?)\s+to\s+([A-Za-z0-9\s,./]+?)$/i,
+  new RegExp(`\\bfrom\\s+${LOC}\\s+to\\s+${LOC}${LOC_STOP}`, "i"),
+  new RegExp(`\\bfrom\\s+${LOC}\\s+to\\s+${LOC}$`, "i"),
 ];
 
 // "from X" with no destination
-const FROM_ONLY_PATTERN = /\bfrom\s+([A-Za-z0-9\s,./]+?)(?:\s+(?:at|by|around|on|tomorrow|tonight|today|\d)|[,.]|$)/i;
+const FROM_ONLY_PATTERN = new RegExp(`\\bfrom\\s+${LOC}${LOC_STOP}`, "i");
 
 // "in X at TIME" (no explicit from/to like "Need ride in Lowell at 8am")
 const IN_LOCATION_PATTERN = /\brides?\s+in\s+([A-Za-z0-9\s,./]+?)(?:\s+(?:at|by|around|on|tomorrow|tonight|today|\d)|[,.]|$)/i;
@@ -697,7 +718,8 @@ const TIME_PATTERN = /\b(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)|midnight
 
 // Urgency keywords for hotDuration inference
 const URGENCY_TONIGHT   = /\b(tonight|right now|asap|urgent|immediately|now)\b/i;
-const URGENCY_TODAY     = /\b(today|this\s+(?:morning|afternoon|evening)|in\s+\d+\s+(?:hour|min))\b/i;
+const URGENCY_INMINS    = /\bin\s+(\d+)\s*(min(?:ute)?s?|hrs?|hours?)\b/i;
+const URGENCY_TODAY     = /\b(today|this\s+(?:morning|afternoon|evening))\b/i;
 const URGENCY_TOMORROW  = /\b(tomorrow|tmrw|tmr)\b/i;
 const URGENCY_VAGUE     = /\b(next\s+(?:few\s+)?(?:days?|weeks?)|sometime|soon|whenever|flexible)\b/i;
 
@@ -817,6 +839,16 @@ function inferPickupDate(text, timeStr, msgTimestamp) {
 
   // 2. Relative urgency cues
   // Always anchor to NOW (not message timestamp) so older messages still resolve correctly
+
+  // "in 30 mins", "in 2 hours" — exact offset from now
+  const inMinsMatch = text.match(URGENCY_INMINS);
+  if (inMinsMatch) {
+    const amount = parseInt(inMinsMatch[1]);
+    const unit   = inMinsMatch[2].toLowerCase();
+    const ms     = unit.startsWith("h") ? amount * 60 * 60 * 1000 : amount * 60 * 1000;
+    return new Date(Date.now() + ms);
+  }
+
   if (URGENCY_TONIGHT.test(text)) {
     targetDate = new Date();
     // If a specific time is given, parseTimeString will override; otherwise default to 8pm
@@ -831,12 +863,16 @@ function inferPickupDate(text, timeStr, msgTimestamp) {
     targetDate = new Date();
     targetDate.setDate(targetDate.getDate() + 3);
   } else {
-    // No date cue at all — treat as needed now.
-    // Set pickup to current time + 30 minutes.
-    targetDate = new Date(Date.now() + 30 * 60 * 1000);
+    // No date cue at all — treat as needed now, return immediately.
+    // Don't fall through to the 8am default.
+    if (timeStr) {
+      const parsed = parseTimeString(timeStr, new Date());
+      if (parsed) return parsed;
+    }
+    return new Date(Date.now() + 30 * 60 * 1000);
   }
 
-  // Apply extracted time if present
+  // Apply extracted time if present (for today/tomorrow/vague)
   if (timeStr) {
     const parsed = parseTimeString(timeStr, targetDate);
     if (parsed) return parsed;
@@ -880,14 +916,15 @@ function parseTimeString(timeStr, baseDate) {
  *   vague / "next few weeks"     → 2880 min (48h)
  */
 function inferHotDuration(text, pickupDate, msgTimestamp) {
+  if (URGENCY_INMINS.test(text))   return 30;   // in X mins — very short window
   if (URGENCY_TONIGHT.test(text))  return 60;
   if (URGENCY_TODAY.test(text))    return 120;
   if (URGENCY_TOMORROW.test(text)) return 480;
   if (URGENCY_VAGUE.test(text))    return 2880;
   // Explicit date: stay hot until the pickup day arrives (max 48h cap)
   if (extractExplicitDate(text))   return 2880;
-  // No date cue — treat as immediate, short hot window
-  return 60;
+  // No date cue — rider needs a ride soon, keep visible for 24h
+  return 1440;
 
   // Fallback: compare pickup date to message date
   const msUntilPickup = pickupDate.getTime() - new Date(msgTimestamp).getTime();
@@ -994,7 +1031,110 @@ async function isDuplicate(phone, from, to, pickupDate) {
   return false;
 }
 
-// ── 7. HTTP endpoint ──────────────────────────────────────────────────────────
+// ── 7. Geocoding ──────────────────────────────────────────────────────────────
+
+// Common city/state abbreviations used in ride requests
+const LOCATION_ALIASES = {
+  "la":       "Los Angeles, CA",
+  "l.a":      "Los Angeles, CA",
+  "l.a.":     "Los Angeles, CA",
+  "nyc":      "New York City, NY",
+  "ny":       "New York City, NY",
+  "n.y.c":    "New York City, NY",
+  "sf":       "San Francisco, CA",
+  "s.f":      "San Francisco, CA",
+  "dc":       "Washington, DC",
+  "d.c":      "Washington, DC",
+  "atl":      "Atlanta, GA",
+  "chi":      "Chicago, IL",
+  "phx":      "Phoenix, AZ",
+  "philly":   "Philadelphia, PA",
+  "phl":      "Philadelphia, PA",
+  "lax":      "Los Angeles, CA",
+  "sfo":      "San Francisco, CA",
+  "bos":      "Boston, MA",
+  "sea":      "Seattle, WA",
+  "mia":      "Miami, FL",
+  "dfw":      "Dallas, TX",
+  "hou":      "Houston, TX",
+  "det":      "Detroit, MI",
+  "msp":      "Minneapolis, MN",
+  "pdx":      "Portland, OR",
+  "den":      "Denver, CO",
+  "slc":      "Salt Lake City, UT",
+  "sd":       "San Diego, CA",
+  "sb":       "Santa Barbara, CA",
+  "sj":       "San Jose, CA",
+  "oak":      "Oakland, CA",
+  "berk":     "Berkeley, CA",
+  "oc":       "Orange County, CA",
+  "ie":       "Inland Empire, CA",
+  "nola":     "New Orleans, LA",
+  "cbus":     "Columbus, OH",
+  "indy":     "Indianapolis, IN",
+  "kc":       "Kansas City, MO",
+  "stl":      "St. Louis, MO",
+  "pitt":     "Pittsburgh, PA",
+  "cincy":    "Cincinnati, OH",
+  "nash":     "Nashville, TN",
+  "htx":      "Houston, TX",
+  "rdu":      "Raleigh, NC",
+  "clt":      "Charlotte, NC",
+  "jax":      "Jacksonville, FL",
+  "tpa":      "Tampa, FL",
+  "mco":      "Orlando, FL",
+  "aus":      "Austin, TX",
+  "sat":      "San Antonio, TX",
+};
+
+function expandLocationAlias(address) {
+  const key = address.trim().toLowerCase().replace(/\.$/, "");
+  return LOCATION_ALIASES[key] || address;
+}
+
+/**
+ * Geocodes a location string to { lat, lng } using Nominatim (OpenStreetMap).
+ * Expands common abbreviations (LA, NYC, SF, etc.) before querying.
+ * Free, no API key required. Returns null on failure.
+ */
+function geocodeAddress(address) {
+  const expanded = expandLocationAlias(address);
+  return new Promise((resolve) => {
+    const encoded = encodeURIComponent(expanded);
+    const options = {
+      hostname: "nominatim.openstreetmap.org",
+      path:     `/search?q=${encoded}&format=json&limit=1`,
+      method:   "GET",
+      headers:  {
+        "User-Agent": "Vaahana/1.0 (ride-sharing-app)",
+        "Accept":     "application/json",
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          const results = JSON.parse(data);
+          if (results && results.length > 0) {
+            resolve({ lat: parseFloat(results[0].lat), lng: parseFloat(results[0].lon) });
+          } else {
+            resolve(null);
+          }
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+
+    req.on("error", () => resolve(null));
+    req.setTimeout(3000, () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
+// ── 8. HTTP endpoint ──────────────────────────────────────────────────────────
 
 exports.ingestWhatsAppMessages = onRequest(
   {
@@ -1030,6 +1170,7 @@ exports.ingestWhatsAppMessages = onRequest(
     } else if (Array.isArray(req.body?.messages)) {
       rawMessages = req.body.messages.map((m) => ({
         phone:     normalizePhone(String(m.phone ?? "")),
+        name:      m.name ? String(m.name).trim() : null,
         text:      String(m.text ?? "").trim(),
         timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
       })).filter((m) => m.phone);
@@ -1077,11 +1218,19 @@ exports.ingestWhatsAppMessages = onRequest(
           riderId   = vaahanaUser.uid;
           riderName = vaahanaUser.displayName;
         } else {
-          riderId   = await getOrCreatePlaceholderRider(msg.phone, null);
-          riderName = "WhatsApp Rider";
+          riderId   = await getOrCreatePlaceholderRider(msg.phone, msg.name || null);
+          riderName = msg.name || "WhatsApp Rider";
         }
 
-        // 5. Build ride document
+        // 5. Geocode pickup location (best-effort, non-blocking failure)
+        const geo = await geocodeAddress(rideData.from);
+        if (geo) {
+          console.log(`[ingest] geocoded "${rideData.from}" → ${geo.lat},${geo.lng}`);
+        } else {
+          console.log(`[ingest] geocode failed for "${rideData.from}" — ride saved without coords`);
+        }
+
+        // 6. Build ride document
         const rideId = crypto.randomUUID();
         const rideDoc = {
           id:                  rideId,
@@ -1101,9 +1250,9 @@ exports.ingestWhatsAppMessages = onRequest(
           // Route
           from:                rideData.from,
           to:                  rideData.to,
-          miles:               0,            // unknown until driver maps it
-          pickupLat:           null,
-          pickupLng:           null,
+          miles:               0,
+          pickupLat:           geo ? geo.lat : null,
+          pickupLng:           geo ? geo.lng : null,
 
           // Timing
           coins:               0,            // driver makes an offer via bid

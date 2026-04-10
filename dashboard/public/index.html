@@ -502,10 +502,13 @@
           ? `<div class="route">📍 ${d.parsedFrom} → ${d.parsedTo ?? "TBD"}</div>`
           : "";
 
+        const nameTag = d.name && d.name !== "WhatsApp Rider"
+          ? `<strong>${d.name}</strong> · ` : "";
+
         row.innerHTML = `
           <div class="time">${fmtRelative(d.createdAt)}</div>
           <div class="body">
-            <div><span class="phone">${d.phone || "—"}</span>${d.groupName || ""}</div>
+            <div>${nameTag}<span class="phone">${d.phone || "—"}</span> · ${d.groupName || ""}</div>
             ${routeHtml}
             <div class="raw">${(d.rawText || "").slice(0, 80)}</div>
           </div>
@@ -568,10 +571,14 @@
         ? d.pickupDate.toDate().toLocaleString(undefined, { month:"short", day:"numeric", hour:"2-digit", minute:"2-digit" })
         : "—";
 
+      const riderLabel = d.name && d.name !== "WhatsApp Rider"
+        ? `<strong>${d.name}</strong> · ${d.phone || d.whatsappPhone || "—"}`
+        : (d.phone || d.whatsappPhone || "—");
+
       row.innerHTML = `
         <div>
           <div class="route">${d.from || "?"} → ${d.to || "?"}</div>
-          <div class="meta">${d.phone || d.whatsappPhone || "—"} · ${d.groupName || ""} · pickup ${pickup}</div>
+          <div class="meta">${riderLabel} · ${d.groupName || ""} · pickup ${pickup}</div>
           <div class="meta" style="margin-top:3px;color:var(--muted);font-size:10px;">${(d.rawText||"").slice(0,70)}</div>
         </div>
         <span class="source-badge whatsapp">WhatsApp</span>

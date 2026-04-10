@@ -242,7 +242,15 @@ struct Ride: Identifiable, Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        id                     = try c.decode(UUID.self, forKey: .id)
+        // Try field "id" first; fall back to Firestore document ID injected as "_id" by the SDK
+        if let uuid = try? c.decodeIfPresent(UUID.self, forKey: .id) {
+            id = uuid
+        } else if let str = try? c.decodeIfPresent(String.self, forKey: .id),
+                  let uuid = UUID(uuidString: str) {
+            id = uuid
+        } else {
+            id = UUID()   // generate stable fallback so doc still appears
+        }
         riderId                = (try? c.decodeIfPresent(String.self, forKey: .riderId))              ?? ""
         status                 = (try? c.decodeIfPresent(RideStatus.self, forKey: .status))            ?? .posted
         createdAt              = (try? c.decodeIfPresent(Date.self, forKey: .createdAt))               ?? Date()
@@ -345,9 +353,24 @@ class RideStorage: ObservableObject {
             // Driver sees all posted (hot) rides
             let l = db.collection("rides")
                 .whereField("status", isEqualTo: "posted")
-                .addSnapshotListener { [weak self] snapshot, _ in
-                    guard let self, let snapshot else { return }
-                    self.postedRides = snapshot.documents.compactMap { try? $0.data(as: Ride.self) }
+                .addSnapshotListener { [weak self] snapshot, error in
+                    guard let self else { return }
+                    if let error {
+                        print("[RideStorage] snapshot error: \(error)")
+                        return
+                    }
+                    guard let snapshot else { return }
+                    var decoded: [Ride] = []
+                    for doc in snapshot.documents {
+                        do {
+                            let ride = try doc.data(as: Ride.self)
+                            decoded.append(ride)
+                        } catch {
+                            // Log which doc and why so we can fix the decoder
+                            print("[RideStorage] decode failed docID=\(doc.documentID) from=\(doc.data()["from"] ?? "?") error=\(error)")
+                        }
+                    }
+                    self.postedRides = decoded
                     self.isLoading = false
                 }
             listeners.append(l)
@@ -621,16 +644,32 @@ struct DriverView: View {
 
     var radiusMeters: CLLocationDistance { filterRadius * 1609.34 }
 
-    var filteredRides: [Ride] {
+    var filteredRides: [(ride: Ride, distanceMiles: Double?)] {
         guard isOnline else { return [] }
         let hot = storage.hotPostedRides
-        guard let center = effectiveCenter else { return hot }
-        let centerLoc = CLLocation(latitude: center.latitude, longitude: center.longitude)
-        return hot.filter { ride in
-            guard let lat = ride.pickupLat, let lng = ride.pickupLng else { return true }
-            let dist = centerLoc.distance(from: CLLocation(latitude: lat, longitude: lng)) / 1609.34
-            return dist <= filterRadius
+        guard let center = effectiveCenter else {
+            return hot.map { ($0, nil) }
         }
+        let centerLoc = CLLocation(latitude: center.latitude, longitude: center.longitude)
+        return hot
+            .compactMap { ride -> (ride: Ride, distanceMiles: Double?)? in
+                guard let lat = ride.pickupLat, let lng = ride.pickupLng else {
+                    // No coords yet (geocoding pending) — show in list without distance
+                    return (ride, nil)
+                }
+                let dist = centerLoc.distance(from: CLLocation(latitude: lat, longitude: lng)) / 1609.34
+                guard dist <= filterRadius else { return nil }
+                return (ride, dist)
+            }
+            .sorted {
+                // Rides with known coords come before unknown; among known, sort by distance
+                switch ($0.distanceMiles, $1.distanceMiles) {
+                case let (a?, b?): return a < b
+                case (_?, nil):   return true
+                case (nil, _?):   return false
+                default:          return $0.ride.hotUntil > $1.ride.hotUntil
+                }
+            }
     }
 
     var body: some View {
@@ -672,10 +711,10 @@ struct DriverView: View {
                         }
 
                         // Ride pins (using stored geocoded coords)
-                        ForEach(filteredRides) { ride in
-                            if let lat = ride.pickupLat, let lng = ride.pickupLng {
-                                Annotation(ride.from, coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lng)) {
-                                    rideAnnotationView(for: ride)
+                        ForEach(filteredRides, id: \.ride.id) { item in
+                            if let lat = item.ride.pickupLat, let lng = item.ride.pickupLng {
+                                Annotation(item.ride.from, coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lng)) {
+                                    rideAnnotationView(for: item.ride)
                                 }
                             }
                         }
@@ -879,7 +918,7 @@ struct DriverView: View {
                         .font(.title2).foregroundStyle(.secondary)
                     Text(storage.hotPostedRides.isEmpty
                          ? "No hot requests right now"
-                         : "No hot requests within \(Int(filterRadius)) mi")
+                         : "No hot requests within \(Int(filterRadius)) mi — expand radius or tap the map to move search area")
                         .font(.subheadline).foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                 }
@@ -887,8 +926,10 @@ struct DriverView: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 8) {
-                        ForEach(filteredRides.sorted { $0.hotUntil < $1.hotUntil }) { ride in
-                            CompactRideRow(ride: ride) { selectedRide = ride }
+                        ForEach(filteredRides, id: \.ride.id) { item in
+                            CompactRideRow(ride: item.ride, distanceMiles: item.distanceMiles) {
+                                selectedRide = item.ride
+                            }
                         }
                     }
                     .padding(.vertical, 4)
@@ -901,18 +942,33 @@ struct DriverView: View {
     // MARK: - Map Annotation
 
     private func rideAnnotationView(for ride: Ride) -> some View {
-        Button { selectedRide = ride } label: {
+        // Heat: 1.0 = just posted (bright), 0.0 = about to expire (dim)
+        let heat = max(0, min(1, ride.hotUntil.timeIntervalSinceNow / Double(ride.hotDuration * 60)))
+        // Interpolate: hot=red/orange → cool=gray/blue
+        let pinColor = Color(
+            hue:        Double(0.08 - 0.08 * (1 - heat)),   // orange (0.08) → red (0.0)
+            saturation: Double(0.9),
+            brightness: Double(0.5 + 0.5 * heat)             // dim when cold
+        )
+        let size: CGFloat = 36 + 10 * heat                   // bigger when hotter
+
+        return Button { selectedRide = ride } label: {
             ZStack {
-                Circle().fill(Color.orange).frame(width: 44, height: 44)
+                Circle()
+                    .fill(pinColor)
+                    .frame(width: size, height: size)
+                    .shadow(color: pinColor.opacity(heat > 0.6 ? 0.7 : 0.2), radius: heat > 0.6 ? 8 : 3)
                 VStack(spacing: 1) {
                     Image(systemName: "figure.wave")
-                        .font(.system(size: 13)).foregroundStyle(.white)
-                    Text("🪙\(ride.coins)")
-                        .font(.system(size: 9, weight: .bold)).foregroundStyle(.white)
+                        .font(.system(size: size * 0.3)).foregroundStyle(.white)
+                    if ride.coins > 0 {
+                        Text("🪙\(ride.coins)")
+                            .font(.system(size: 8, weight: .bold)).foregroundStyle(.white)
+                    }
                 }
             }
-            .shadow(color: .black.opacity(0.3), radius: 4, x: 0, y: 2)
         }
+        .buttonStyle(.plain)
     }
 
 }
@@ -957,11 +1013,24 @@ class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
 
 struct CompactRideRow: View {
     let ride: Ride
+    var distanceMiles: Double? = nil
     let onTap: () -> Void
-    
+
     var body: some View {
         Button(action: onTap) {
             HStack(spacing: 12) {
+                // Distance badge
+                if let dist = distanceMiles {
+                    VStack(spacing: 1) {
+                        Text(dist < 0.1 ? "<0.1" : String(format: dist < 10 ? "%.1f" : "%.0f", dist))
+                            .font(.system(size: 13, weight: .bold))
+                        Text("mi")
+                            .font(.system(size: 9))
+                    }
+                    .foregroundStyle(dist < 2 ? .green : dist < 10 ? .orange : .secondary)
+                    .frame(width: 36)
+                }
+
                 // From -> To
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 4) {
@@ -976,7 +1045,7 @@ struct CompactRideRow: View {
                             .font(.subheadline)
                             .lineLimit(1)
                     }
-                    
+
                     HStack(spacing: 8) {
                         Image(systemName: "calendar")
                             .font(.caption2)
@@ -985,11 +1054,13 @@ struct CompactRideRow: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                    
+
                     HStack(spacing: 8) {
-                        Text("\(String(format: "%.1f", ride.miles)) mi")
-                            .font(.caption).foregroundStyle(.secondary)
-                        Text("•").foregroundStyle(.secondary)
+                        if ride.miles > 0 {
+                            Text("\(String(format: "%.1f", ride.miles)) mi route")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Text("•").foregroundStyle(.secondary)
+                        }
                         Text("🪙 \(ride.coins)")
                             .font(.caption).fontWeight(.semibold).foregroundStyle(.orange)
                         Spacer()
