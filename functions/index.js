@@ -701,6 +701,44 @@ const URGENCY_TODAY     = /\b(today|this\s+(?:morning|afternoon|evening)|in\s+\d
 const URGENCY_TOMORROW  = /\b(tomorrow|tmrw|tmr)\b/i;
 const URGENCY_VAGUE     = /\b(next\s+(?:few\s+)?(?:days?|weeks?)|sometime|soon|whenever|flexible)\b/i;
 
+// Explicit calendar date: "April 15", "April 15th", "on the 15th", "15th of April"
+const MONTH_NAMES = {
+  january:1, february:2, march:3, april:4, may:5, june:6,
+  july:7, august:8, september:9, october:10, november:11, december:12,
+  jan:1, feb:2, mar:3, apr:4, jun:6, jul:7, aug:8, sep:9, oct:10, nov:11, dec:12,
+};
+const EXPLICIT_DATE_PATTERN = /\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\s+(\d{1,2})(?:st|nd|rd|th)?\b|\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b/i;
+
+/**
+ * Attempts to extract an explicit calendar date from message text.
+ * Returns a Date set to that date (current or next year if in the past), or null.
+ */
+function extractExplicitDate(text) {
+  const m = text.match(EXPLICIT_DATE_PATTERN);
+  if (!m) return null;
+
+  let month, day;
+  if (m[1] && m[2]) {
+    // "April 15"
+    month = MONTH_NAMES[m[1].toLowerCase()];
+    day   = parseInt(m[2]);
+  } else if (m[3] && m[4]) {
+    // "15th of April"
+    day   = parseInt(m[3]);
+    month = MONTH_NAMES[m[4].toLowerCase()];
+  }
+  if (!month || !day) return null;
+
+  const now = new Date();
+  let year  = now.getFullYear();
+  const candidate = new Date(year, month - 1, day, 8, 0, 0);
+  // If the date is in the past (more than 1 day ago), roll to next year
+  if (candidate < new Date(Date.now() - 24 * 60 * 60 * 1000)) {
+    candidate.setFullYear(year + 1);
+  }
+  return candidate;
+}
+
 /**
  * Attempts to classify and extract structured ride data from a message.
  * Returns null if the message is not a ride request.
@@ -763,20 +801,34 @@ function cleanLocation(str) {
  */
 function inferPickupDate(text, timeStr, msgTimestamp) {
   const base = new Date(msgTimestamp);
-
   let targetDate = new Date(base);
 
+  // 1. Explicit calendar date takes highest priority ("April 15", "15th of May")
+  const explicitDate = extractExplicitDate(text);
+  if (explicitDate) {
+    targetDate = explicitDate;
+    // Still apply extracted time on top of explicit date
+    if (timeStr) {
+      const parsed = parseTimeString(timeStr, targetDate);
+      if (parsed) return parsed;
+    }
+    return targetDate;
+  }
+
+  // 2. Relative urgency cues
+  // For same-day keywords, anchor to NOW (not message time) so older messages still resolve correctly
   if (URGENCY_TONIGHT.test(text)) {
-    // Keep same day
+    targetDate = new Date(); // use current time as base
   } else if (URGENCY_TOMORROW.test(text)) {
+    targetDate = new Date();
     targetDate.setDate(targetDate.getDate() + 1);
   } else if (URGENCY_TODAY.test(text)) {
-    // Keep same day
+    targetDate = new Date();
   } else if (URGENCY_VAGUE.test(text)) {
     // Use 3 days from now as a reasonable midpoint
     targetDate.setDate(targetDate.getDate() + 3);
   }
-  // else: ambiguous — use message date
+  // else: ambiguous — use message date + assume near-future
 
   // Apply extracted time if present
   if (timeStr) {
@@ -822,10 +874,12 @@ function parseTimeString(timeStr, baseDate) {
  *   vague / "next few weeks"     → 2880 min (48h)
  */
 function inferHotDuration(text, pickupDate, msgTimestamp) {
-  if (URGENCY_TONIGHT.test(text)) return 60;
-  if (URGENCY_TODAY.test(text))   return 120;
+  if (URGENCY_TONIGHT.test(text))  return 60;
+  if (URGENCY_TODAY.test(text))    return 120;
   if (URGENCY_TOMORROW.test(text)) return 480;
-  if (URGENCY_VAGUE.test(text))   return 2880;
+  if (URGENCY_VAGUE.test(text))    return 2880;
+  // Explicit date: stay hot until the pickup day arrives (max 48h cap)
+  if (extractExplicitDate(text))   return 2880;
 
   // Fallback: compare pickup date to message date
   const msUntilPickup = pickupDate.getTime() - new Date(msgTimestamp).getTime();
@@ -900,7 +954,7 @@ async function getOrCreatePlaceholderRider(phone, displayName) {
  * Returns true if we've already ingested a ride from this phone with the same
  * origin within the last 24 hours.
  */
-async function isDuplicate(phone, from, pickupDate) {
+async function isDuplicate(phone, from, to, pickupDate) {
   // Query only on whatsappPhone (single-field, no composite index needed).
   // Filter source, recency, and route match in-process.
   const snap = await db.collection("rides")
@@ -911,6 +965,7 @@ async function isDuplicate(phone, from, pickupDate) {
 
   const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
   const fromNorm  = from.toLowerCase().trim();
+  const toNorm    = to.toLowerCase().trim();
   const pickupDay = pickupDate.toDateString();
 
   for (const doc of snap.docs) {
@@ -922,9 +977,10 @@ async function isDuplicate(phone, from, pickupDate) {
     if (createdAt && createdAt < oneDayAgo) continue;
 
     const existingFrom   = (data.from || "").toLowerCase().trim();
+    const existingTo     = (data.to   || "").toLowerCase().trim();
     const existingPickup = data.pickupDate?.toDate?.()?.toDateString?.() ?? "";
 
-    if (existingFrom === fromNorm && existingPickup === pickupDay) return true;
+    if (existingFrom === fromNorm && existingTo === toNorm && existingPickup === pickupDay) return true;
   }
 
   return false;
@@ -996,7 +1052,7 @@ exports.ingestWhatsAppMessages = onRequest(
         if (rideData.pickupDate < oneHourAgo) { results.skipped++; continue; }
 
         // 3. Dedup
-        const dup = await isDuplicate(msg.phone, rideData.from, rideData.pickupDate);
+        const dup = await isDuplicate(msg.phone, rideData.from, rideData.to, rideData.pickupDate);
         if (dup) { results.duplicate++; continue; }
 
         // 4. Resolve rider identity
