@@ -63,7 +63,7 @@ struct RatingView: View {
                     // Rating label
                     Text(ratingLabel)
                         .font(.headline)
-                        .foregroundStyle(stars > 0 ? .primary : .clear)
+                        .foregroundStyle(stars > 0 ? Color.primary : Color.clear)
                         .animation(.easeIn(duration: 0.15), value: stars)
 
                     // Comment

@@ -3,7 +3,11 @@
 /**
  * Vaahana — Reconciliation & Integrity Layer
  *
- * Four Cloud Functions:
+ * Cloud Functions:
+ *
+ *  expireStaleRides           — scheduled every minute
+ *    Marks posted rides as expired when their hotUntil time has passed.
+ *    Server-side counterpart to the client-side expiry in RideStorage.
  *
  *  reconcileRecentRides       — scheduled every 5 min
  *    Scans non-final rides and recently-finalized rides (last 7 days).
@@ -25,8 +29,10 @@
 
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { onDocumentCreated, onDocumentUpdated } = require("firebase-functions/v2/firestore");
 const { initializeApp } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
+const { getMessaging } = require("firebase-admin/messaging");
 
 initializeApp();
 const db = getFirestore();
@@ -74,6 +80,33 @@ async function writeLog({ entityType, entityId, severity, issueCode, actionTaken
     });
   } catch (err) {
     console.error("[reconcile] Failed to write log:", err.message);
+  }
+}
+
+// ─── Push Notification Helper ─────────────────────────────────────────────────
+
+/**
+ * Looks up the user's FCM token from Firestore and sends a push notification.
+ * Never throws — a missing token or failed send is silently logged.
+ */
+async function sendToUser(uid, title, body, data = {}) {
+  if (!uid) return;
+  try {
+    const userDoc = await db.collection("users").doc(uid).get();
+    const token = userDoc.exists ? userDoc.data().fcmToken : null;
+    if (!token) return;
+    // FCM data values must all be strings
+    const stringData = Object.fromEntries(
+      Object.entries(data).map(([k, v]) => [k, String(v)])
+    );
+    await getMessaging().send({
+      token,
+      notification: { title, body },
+      data: stringData,
+      apns: { payload: { aps: { sound: "default" } } },
+    });
+  } catch (err) {
+    console.warn(`[notify] send to ${uid} failed:`, err.message);
   }
 }
 
@@ -512,5 +545,195 @@ exports.reconcileRide = onCall(
       issues:  issues.map((i) => ({ code: i.code, actionTaken: i.actionTaken })),
       clean:   issues.length === 0,
     };
+  }
+);
+
+// ─── Function 6: expireStaleRides ────────────────────────────────────────────
+
+/**
+ * Runs every minute. Finds all rides with status="posted" whose hotUntil time
+ * has passed (createdAt + hotDuration minutes <= now) and marks them "expired".
+ *
+ * This is the server-side counterpart to the client-side expiry in RideStorage.
+ * It ensures rides expire even when no rider has the app open.
+ */
+exports.expireStaleRides = onSchedule(
+  {
+    schedule:       "* * * * *",   // every minute
+    timeoutSeconds: 120,
+    memory:         "256MiB",
+  },
+  async () => {
+    const now = new Date();
+
+    // Fetch all posted rides. We must filter hotUntil in-process because
+    // Firestore can't query on a computed field — hotUntil = createdAt + hotDuration*60s.
+    const postedSnap = await db.collection("rides")
+      .where("status", "==", "posted")
+      .get();
+
+    if (postedSnap.empty) return;
+
+    const BATCH_SIZE = 450;
+    let batch    = db.batch();
+    let opCount  = 0;
+    let expired  = 0;
+
+    for (const doc of postedSnap.docs) {
+      const data        = doc.data();
+      const createdAt   = data.createdAt?.toDate?.() ?? null;
+      const hotDuration = typeof data.hotDuration === "number" ? data.hotDuration : 5;
+
+      if (!createdAt) continue;
+
+      const hotUntil = new Date(createdAt.getTime() + hotDuration * 60 * 1000);
+      if (now < hotUntil) continue; // still hot
+
+      batch.update(doc.ref, {
+        status:    "expired",
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      opCount++;
+      expired++;
+
+      if (opCount >= BATCH_SIZE) {
+        await batch.commit();
+        batch   = db.batch();
+        opCount = 0;
+      }
+    }
+
+    if (opCount > 0) await batch.commit();
+
+    if (expired > 0) {
+      console.log(`[expireStaleRides] Expired ${expired} stale posted rides`);
+    }
+  }
+);
+
+// ─── Function 7: onBidPlaced ──────────────────────────────────────────────────
+
+/**
+ * Fires when a driver places a new bid on a ride.
+ * Notifies the rider so they don't have to keep the app open.
+ */
+exports.onBidPlaced = onDocumentCreated(
+  { document: "rides/{rideId}/bids/{bidId}" },
+  async (event) => {
+    const bid    = event.data.data();
+    const rideId = event.params.rideId;
+
+    const rideDoc = await db.collection("rides").doc(rideId).get();
+    if (!rideDoc.exists) return;
+    const ride = rideDoc.data();
+    if (ride.status !== "posted") return;
+
+    const driverName = bid.driverName || "A driver";
+    const coins      = bid.bidCoins   || 0;
+
+    await sendToUser(
+      ride.riderId,
+      "New bid on your ride",
+      `${driverName} offered ${coins} coins for ${ride.from} → ${ride.to}`,
+      { type: "new_bid", rideId }
+    );
+  }
+);
+
+// ─── Function 7: onRideStatusChanged ─────────────────────────────────────────
+
+/**
+ * Fires whenever a ride document is updated.
+ * Sends targeted push notifications based on the status transition.
+ */
+exports.onRideStatusChanged = onDocumentUpdated(
+  { document: "rides/{rideId}" },
+  async (event) => {
+    const before   = event.data.before.data();
+    const after    = event.data.after.data();
+    const rideId   = event.params.rideId;
+
+    if (before.status === after.status) return; // no status change
+
+    const { riderId, driverId, from, to, driverName, name } = after;
+
+    switch (after.status) {
+      case "accepted":
+        // Rider selected a bid — notify the driver they've been chosen
+        if (driverId) {
+          await sendToUser(
+            driverId,
+            "Your bid was accepted!",
+            `Head to ${from} to pick up ${name || "your rider"}`,
+            { type: "bid_accepted", rideId }
+          );
+        }
+        break;
+
+      case "driver_enroute":
+        await sendToUser(
+          riderId,
+          "Driver is on the way",
+          `${driverName || "Your driver"} is heading to ${from}`,
+          { type: "driver_enroute", rideId }
+        );
+        break;
+
+      case "driver_arrived":
+        await sendToUser(
+          riderId,
+          "Driver has arrived",
+          `${driverName || "Your driver"} is waiting at ${from}`,
+          { type: "driver_arrived", rideId }
+        );
+        break;
+
+      case "ride_started":
+        await sendToUser(
+          riderId,
+          "Ride started",
+          `You're on your way to ${to}. Enjoy the ride!`,
+          { type: "ride_started", rideId }
+        );
+        break;
+
+      case "completed":
+        await sendToUser(
+          riderId,
+          "Ride completed",
+          "Hope you had a great ride! Rate your driver.",
+          { type: "ride_completed", rideId }
+        );
+        if (driverId) {
+          await sendToUser(
+            driverId,
+            "Ride completed",
+            "Coins have been transferred. Rate your rider!",
+            { type: "ride_completed", rideId }
+          );
+        }
+        break;
+
+      case "cancelled":
+        if (after.cancelledBy === riderId && driverId) {
+          await sendToUser(
+            driverId,
+            "Ride cancelled",
+            `${name || "The rider"} cancelled the ride (${from} → ${to})`,
+            { type: "cancelled", rideId }
+          );
+        } else if (after.cancelledBy !== riderId) {
+          await sendToUser(
+            riderId,
+            "Ride cancelled",
+            `${driverName || "Your driver"} cancelled the ride`,
+            { type: "cancelled", rideId }
+          );
+        }
+        break;
+
+      default:
+        break;
+    }
   }
 );

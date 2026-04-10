@@ -8,14 +8,81 @@ import Combine
 import FirebaseCore
 import FirebaseAuth
 import FirebaseFirestore
+import UserNotifications
+#if canImport(FirebaseMessaging)
+import FirebaseMessaging
+#endif
+
+// MARK: - App Delegate (notifications + FCM when available)
+
+#if canImport(FirebaseMessaging)
+final class AppDelegate: NSObject, UIApplicationDelegate, MessagingDelegate, UNUserNotificationCenterDelegate {
+
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        UNUserNotificationCenter.current().delegate = self
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { granted, _ in
+            guard granted else { return }
+            DispatchQueue.main.async { application.registerForRemoteNotifications() }
+        }
+        Messaging.messaging().delegate = self
+        return true
+    }
+
+    func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+        Messaging.messaging().apnsToken = deviceToken
+    }
+
+    func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
+        guard let fcmToken, let uid = Auth.auth().currentUser?.uid else { return }
+        Firestore.firestore().collection("users").document(uid)
+            .setData(["fcmToken": fcmToken], merge: true)
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .badge, .sound])
+    }
+}
+#else
+// FirebaseMessaging not yet added — basic notification delegate only
+final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        UNUserNotificationCenter.current().delegate = self
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { granted, _ in
+            guard granted else { return }
+            DispatchQueue.main.async { application.registerForRemoteNotifications() }
+        }
+        return true
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .badge, .sound])
+    }
+}
+#endif
 
 // MARK: - User State
 
 class UserState: ObservableObject {
-    @Published var isSignedIn      = false
-    @Published var role: UserRole? = nil
-    @Published var isLoadingRole   = true
+    @Published var isSignedIn       = false
+    @Published var role: UserRole?  = nil
+    @Published var isLoadingRole    = true
     @Published var showProfileSetup = false   // shown once per login if name/phone missing
+    @Published var isAdmin          = false
 
     // Cached profile fields — used to decide whether to show setup sheet
     var displayName: String = ""
@@ -61,6 +128,14 @@ class UserState: ObservableObject {
                 let profileComplete = !self.displayName.trimmingCharacters(in: .whitespaces).isEmpty
                                       && !self.phone.isEmpty
                 self.showProfileSetup = !profileComplete
+                self.isAdmin         = data?["isAdmin"] as? Bool ?? false
+
+                // Refresh FCM token binding after login (token may have changed)
+                #if canImport(FirebaseMessaging)
+                if let token = Messaging.messaging().fcmToken {
+                    self.db.collection("users").document(uid).setData(["fcmToken": token], merge: true)
+                }
+                #endif
 
                 // Daily coin grant: 100 coins per day to every user
                 let formatter = DateFormatter()
@@ -91,6 +166,7 @@ class UserState: ObservableObject {
 
 @main
 struct VaahanaApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var userState = UserState()
 
     init() {
@@ -107,6 +183,7 @@ struct VaahanaApp: App {
                     .background(Color(UIColor.systemGroupedBackground))
             } else if let role = userState.role {
                 ContentView(role: role)
+                    .environmentObject(userState)
                     .sheet(isPresented: $userState.showProfileSetup) {
                         ProfileSetupView(userState: userState)
                     }
