@@ -8,7 +8,7 @@ service cloud.firestore {
     }
 
     match /rides/{rideId} {
-      allow read: if request.auth != null;
+      allow read: if true;  // drivers browse rides; dashboard reads without auth
       allow create: if request.auth != null
                     && request.resource.data.riderId == request.auth.uid
                     && request.resource.data.status == 'posted';
@@ -46,6 +46,18 @@ service cloud.firestore {
       allow create: if request.auth != null
                     && request.auth.uid == request.resource.data.raterUid;
       allow update, delete: if false;
+    }
+
+    // Placeholder profiles for WhatsApp-sourced riders (no Vaahana account yet)
+    match /whatsappRiders/{docId} {
+      allow read: if true;   // dashboard reads without auth
+      allow write: if false; // server-only
+    }
+
+    // Ingestion audit trail — dashboard reads without auth
+    match /whatsappIngestionLogs/{logId} {
+      allow read: if true;   // dashboard reads without auth
+      allow write: if false; // server-only
     }
   }
 }

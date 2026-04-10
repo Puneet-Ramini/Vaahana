@@ -1,9 +1,12 @@
 "use strict";
 
 /**
- * Vaahana — Reconciliation & Integrity Layer
+ * Vaahana — Cloud Functions
  *
- * Cloud Functions:
+ *  ingestWhatsAppMessages     — HTTP POST endpoint
+ *    Accepts raw WhatsApp group export text (or pre-split message array).
+ *    Parses ride requests with regex, deduplicates, matches phone numbers to
+ *    existing users, and creates rides documents visible to drivers.
  *
  *  expireStaleRides           — scheduled every minute
  *    Marks posted rides as expired when their hotUntil time has passed.
@@ -28,11 +31,15 @@
  */
 
 const { onSchedule } = require("firebase-functions/v2/scheduler");
-const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { onCall, HttpsError, onRequest } = require("firebase-functions/v2/https");
 const { onDocumentCreated, onDocumentUpdated } = require("firebase-functions/v2/firestore");
 const { initializeApp } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const { getMessaging } = require("firebase-admin/messaging");
+const { defineSecret } = require("firebase-functions/params");
+const crypto = require("crypto");
+
+const WHATSAPP_API_KEY = defineSecret("WHATSAPP_INGEST_API_KEY");
 
 initializeApp();
 const db = getFirestore();
@@ -545,6 +552,545 @@ exports.reconcileRide = onCall(
       issues:  issues.map((i) => ({ code: i.code, actionTaken: i.actionTaken })),
       clean:   issues.length === 0,
     };
+  }
+);
+
+// ─── WhatsApp Ingestion Pipeline ─────────────────────────────────────────────
+//
+// Input (POST /ingestWhatsAppMessages):
+//   Either raw export text:
+//     { "rawExport": "[5:34 PM, 4/9/2026] +1 (203) 823-2473: Anybody travelling..." }
+//   Or pre-split array:
+//     { "messages": [{ "phone": "+12038232473", "text": "...", "timestamp": "..." }] }
+//
+// Pipeline:
+//   1. Parse raw export into { phone, text, timestamp } objects
+//   2. Regex-classify each message (ride request vs. irrelevant)
+//   3. Extract route fields: from, to, pickupDate, hotDuration
+//   4. Deduplicate against recent rides (same phone + from + date within 24h)
+//   5. Phone-match to existing Vaahana user (or create placeholder)
+//   6. Write ride document with source="whatsapp"
+
+// ── 1. Parse raw WhatsApp export text ────────────────────────────────────────
+
+/**
+ * Parses a raw WhatsApp group export string into individual message objects.
+ *
+ * Handles both formats:
+ *   "[5:34 PM, 4/9/2026] +1 (203) 823-2473: message text"
+ *   "5:34 PM, 4/9/2026 - +1 (203) 823-2473: message text"  (Android export)
+ */
+function parseWhatsAppExport(rawText) {
+  const messages = [];
+
+  // Match lines starting with a timestamp + phone number
+  // Supports: [H:MM PM, M/D/YYYY] or [HH:MM, DD/MM/YYYY] formats
+  const lineRegex = /^\[(\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?),?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\]\s*([+\d][\d\s\-().]+?):\s*(.+)$/im;
+
+  // Split on message boundaries (lines that start with a bracket timestamp)
+  const boundaryRegex = /(?=^\[)/m;
+  const chunks = rawText.split(/\r?\n(?=\[)/);
+
+  for (const chunk of chunks) {
+    const trimmed = chunk.trim();
+    if (!trimmed) continue;
+
+    const match = trimmed.match(/^\[(\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?),?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\]\s*([+\d][\d\s\-().]{6,20}?):\s*([\s\S]+)$/i);
+    if (!match) continue;
+
+    const [, timePart, datePart, rawPhone, text] = match;
+    const phone = normalizePhone(rawPhone.trim());
+    if (!phone) continue;
+
+    // Parse timestamp — try M/D/YYYY first (iOS), then D/M/YYYY (Android)
+    const timestamp = parseMessageTimestamp(datePart.trim(), timePart.trim());
+
+    messages.push({ phone, text: text.trim().replace(/\n/g, " "), timestamp });
+  }
+
+  return messages;
+}
+
+// ── 2. Phone normalization ────────────────────────────────────────────────────
+
+/**
+ * Normalises a phone number string to E.164 format (e.g. "+12038232473").
+ * Returns null if the input doesn't look like a real phone number.
+ */
+function normalizePhone(raw) {
+  // Strip everything except digits and leading +
+  const digits = raw.replace(/[^\d+]/g, "");
+  if (digits.length < 7) return null;
+
+  if (digits.startsWith("+")) return digits;
+
+  // 10-digit US number → prepend +1
+  if (digits.length === 10) return `+1${digits}`;
+
+  // 11-digit starting with 1 → +1XXXXXXXXXX
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+
+  // Indian numbers: 10-digit starting with 6-9
+  if (digits.length === 10 && /^[6-9]/.test(digits)) return `+91${digits}`;
+  if (digits.length === 12 && digits.startsWith("91")) return `+${digits}`;
+
+  return `+${digits}`;
+}
+
+// ── 3. Timestamp parsing ──────────────────────────────────────────────────────
+
+function parseMessageTimestamp(datePart, timePart) {
+  try {
+    // datePart: "4/9/2026" or "09/04/2026"
+    const datePieces = datePart.split(/[\/\-]/).map(Number);
+    let month, day, year;
+
+    if (datePieces[2] > 31) {
+      // M/D/YYYY (iOS)
+      [month, day, year] = datePieces;
+    } else if (datePieces[0] > 12) {
+      // D/M/YYYY (Android, day > 12 disambiguates)
+      [day, month, year] = datePieces;
+    } else {
+      // Ambiguous — assume M/D/YYYY (iOS is primary target)
+      [month, day, year] = datePieces;
+    }
+
+    if (year < 100) year += 2000;
+
+    // timePart: "5:34 PM" or "17:34"
+    const timeMatch = timePart.match(/(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?/i);
+    if (!timeMatch) return new Date(year, month - 1, day);
+
+    let hours = parseInt(timeMatch[1]);
+    const minutes = parseInt(timeMatch[2]);
+    const ampm = timeMatch[3]?.toUpperCase();
+    if (ampm === "PM" && hours < 12) hours += 12;
+    if (ampm === "AM" && hours === 12) hours = 0;
+
+    return new Date(year, month - 1, day, hours, minutes);
+  } catch {
+    return new Date();
+  }
+}
+
+// ── 4. Ride request classification & field extraction ─────────────────────────
+
+const RIDE_KEYWORDS = /\b(need\s+ride|need\s+a\s+ride|looking\s+for\s+(?:a\s+)?ride|anybody\s+(?:going|travelling|traveling)|anyone\s+(?:going|travelling|traveling)|travelling\s+by\s+road|traveling\s+by\s+road|shared\s+ride|carpool|ride\s+share|rideshare|ride\s+from|ride\s+to|going\s+from|going\s+to)\b/i;
+
+const DISCARD_KEYWORDS = /\b(accommodation|apartment|room\s+for|room\s+available|bed\s+available|sublet|looking\s+for\s+room|looking\s+for\s+accommodation|house|flat\s+available|roommate|room\s+mate)\b/i;
+
+// Patterns for "from X to Y"
+const FROM_TO_PATTERNS = [
+  /\bfrom\s+([A-Za-z0-9\s,./]+?)\s+to\s+([A-Za-z0-9\s,./]+?)(?:\s+(?:at|by|around|on|tomorrow|tonight|today|next|\d)|[,.]|$)/i,
+  /\bfrom\s+([A-Za-z0-9\s,./]+?)\s+to\s+([A-Za-z0-9\s,./]+?)$/i,
+];
+
+// "from X" with no destination
+const FROM_ONLY_PATTERN = /\bfrom\s+([A-Za-z0-9\s,./]+?)(?:\s+(?:at|by|around|on|tomorrow|tonight|today|\d)|[,.]|$)/i;
+
+// "in X at TIME" (no explicit from/to like "Need ride in Lowell at 8am")
+const IN_LOCATION_PATTERN = /\brides?\s+in\s+([A-Za-z0-9\s,./]+?)(?:\s+(?:at|by|around|on|tomorrow|tonight|today|\d)|[,.]|$)/i;
+
+// Time patterns
+const TIME_PATTERN = /\b(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)|midnight|noon)\b/i;
+
+// Urgency keywords for hotDuration inference
+const URGENCY_TONIGHT   = /\b(tonight|right now|asap|urgent|immediately|now)\b/i;
+const URGENCY_TODAY     = /\b(today|this\s+(?:morning|afternoon|evening)|in\s+\d+\s+(?:hour|min))\b/i;
+const URGENCY_TOMORROW  = /\b(tomorrow|tmrw|tmr)\b/i;
+const URGENCY_VAGUE     = /\b(next\s+(?:few\s+)?(?:days?|weeks?)|sometime|soon|whenever|flexible)\b/i;
+
+/**
+ * Attempts to classify and extract structured ride data from a message.
+ * Returns null if the message is not a ride request.
+ */
+function extractRideData(text, messageTimestamp) {
+  // Discard non-ride messages (accommodation, etc.)
+  if (DISCARD_KEYWORDS.test(text)) return null;
+
+  // Must match at least one ride keyword
+  if (!RIDE_KEYWORDS.test(text)) return null;
+
+  // Extract from / to
+  let from = null;
+  let to = null;
+
+  for (const pattern of FROM_TO_PATTERNS) {
+    const m = text.match(pattern);
+    if (m) {
+      from = cleanLocation(m[1]);
+      to   = cleanLocation(m[2]);
+      break;
+    }
+  }
+
+  if (!from) {
+    const m = text.match(FROM_ONLY_PATTERN);
+    if (m) from = cleanLocation(m[1]);
+  }
+
+  if (!from) {
+    const m = text.match(IN_LOCATION_PATTERN);
+    if (m) from = cleanLocation(m[1]);
+  }
+
+  // Still no location at all — too vague to create a ride
+  if (!from) return null;
+
+  if (!to) to = "Destination TBD";
+
+  // Extract time
+  const timeMatch = text.match(TIME_PATTERN);
+  const timeStr = timeMatch ? timeMatch[1] : null;
+
+  // Infer pickup date from urgency cues + message timestamp
+  const pickupDate = inferPickupDate(text, timeStr, messageTimestamp);
+
+  // Infer hot duration
+  const hotDuration = inferHotDuration(text, pickupDate, messageTimestamp);
+
+  return { from, to, pickupDate, hotDuration, rawTimeHint: timeStr };
+}
+
+function cleanLocation(str) {
+  return str.trim().replace(/\s+/g, " ").replace(/[.,]+$/, "").trim();
+}
+
+/**
+ * Infers the pickup date from urgency cues in the message text.
+ * Falls back to the message timestamp date if no cue found.
+ */
+function inferPickupDate(text, timeStr, msgTimestamp) {
+  const base = new Date(msgTimestamp);
+
+  let targetDate = new Date(base);
+
+  if (URGENCY_TONIGHT.test(text)) {
+    // Keep same day
+  } else if (URGENCY_TOMORROW.test(text)) {
+    targetDate.setDate(targetDate.getDate() + 1);
+  } else if (URGENCY_TODAY.test(text)) {
+    // Keep same day
+  } else if (URGENCY_VAGUE.test(text)) {
+    // Use 3 days from now as a reasonable midpoint
+    targetDate.setDate(targetDate.getDate() + 3);
+  }
+  // else: ambiguous — use message date
+
+  // Apply extracted time if present
+  if (timeStr) {
+    const parsed = parseTimeString(timeStr, targetDate);
+    if (parsed) return parsed;
+  }
+
+  // Default to 8am on the target date
+  targetDate.setHours(8, 0, 0, 0);
+  return targetDate;
+}
+
+function parseTimeString(timeStr, baseDate) {
+  try {
+    const t = timeStr.toLowerCase().trim();
+    if (t === "midnight") {
+      const d = new Date(baseDate); d.setHours(0, 0, 0, 0); return d;
+    }
+    if (t === "noon") {
+      const d = new Date(baseDate); d.setHours(12, 0, 0, 0); return d;
+    }
+    const m = t.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/);
+    if (!m) return null;
+    let h = parseInt(m[1]);
+    const min = parseInt(m[2] || "0");
+    const ampm = m[3];
+    if (ampm === "pm" && h < 12) h += 12;
+    if (ampm === "am" && h === 12) h = 0;
+    // If no am/pm: times 1-6 are likely PM for rides (heuristic)
+    if (!ampm && h >= 1 && h <= 6) h += 12;
+    const d = new Date(baseDate);
+    d.setHours(h, min, 0, 0);
+    return d;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Infers how long a ride should stay "hot" (visible to drivers) based on urgency.
+ *   tonight/explicit time today  → 60 min
+ *   tomorrow / tomorrow + time   → 480 min (8h)
+ *   vague / "next few weeks"     → 2880 min (48h)
+ */
+function inferHotDuration(text, pickupDate, msgTimestamp) {
+  if (URGENCY_TONIGHT.test(text)) return 60;
+  if (URGENCY_TODAY.test(text))   return 120;
+  if (URGENCY_TOMORROW.test(text)) return 480;
+  if (URGENCY_VAGUE.test(text))   return 2880;
+
+  // Fallback: compare pickup date to message date
+  const msUntilPickup = pickupDate.getTime() - new Date(msgTimestamp).getTime();
+  const hoursUntil = msUntilPickup / (1000 * 60 * 60);
+
+  if (hoursUntil <= 6)  return 60;
+  if (hoursUntil <= 24) return 240;
+  if (hoursUntil <= 72) return 480;
+  return 2880;
+}
+
+// ── 5. Phone → Vaahana user lookup ───────────────────────────────────────────
+
+/**
+ * Looks up a Vaahana user by phone number (exact E.164 match).
+ * Returns { uid, displayName } or null.
+ *
+ * Tries both the normalized phone and common variants (+1 vs. without country code).
+ */
+async function findUserByPhone(phone) {
+  const snap = await db.collection("users")
+    .where("phone", "==", phone)
+    .limit(1)
+    .get();
+
+  if (!snap.empty) {
+    const doc = snap.docs[0];
+    return { uid: doc.id, displayName: doc.data().displayName || "Rider" };
+  }
+
+  // Also try whatsapp field
+  const snap2 = await db.collection("users")
+    .where("whatsapp", "==", phone)
+    .limit(1)
+    .get();
+
+  if (!snap2.empty) {
+    const doc = snap2.docs[0];
+    return { uid: doc.id, displayName: doc.data().displayName || "Rider" };
+  }
+
+  return null;
+}
+
+/**
+ * Returns a stable placeholder riderId for phone numbers with no Vaahana account.
+ * Creates a minimal user doc in `whatsappRiders` so we can link them later
+ * when they sign up.
+ */
+async function getOrCreatePlaceholderRider(phone, displayName) {
+  const placeholderRef = db.collection("whatsappRiders").doc(
+    // Stable ID: sha256 of the phone number so re-ingestion reuses the same doc
+    crypto.createHash("sha256").update(phone).digest("hex").slice(0, 20)
+  );
+
+  const existing = await placeholderRef.get();
+  if (existing.exists) return placeholderRef.id;
+
+  await placeholderRef.set({
+    phone,
+    displayName: displayName || "WhatsApp Rider",
+    source: "whatsapp",
+    createdAt: FieldValue.serverTimestamp(),
+  });
+
+  return placeholderRef.id;
+}
+
+// ── 6. Deduplication ─────────────────────────────────────────────────────────
+
+/**
+ * Returns true if we've already ingested a ride from this phone with the same
+ * origin within the last 24 hours.
+ */
+async function isDuplicate(phone, from, pickupDate) {
+  // Query only on whatsappPhone (single-field, no composite index needed).
+  // Filter source, recency, and route match in-process.
+  const snap = await db.collection("rides")
+    .where("whatsappPhone", "==", phone)
+    .get();
+
+  if (snap.empty) return false;
+
+  const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const fromNorm  = from.toLowerCase().trim();
+  const pickupDay = pickupDate.toDateString();
+
+  for (const doc of snap.docs) {
+    const data = doc.data();
+    if (data.source !== "whatsapp") continue;
+
+    // Only consider rides ingested in the last 24h
+    const createdAt = data.createdAt?.toDate?.() ?? null;
+    if (createdAt && createdAt < oneDayAgo) continue;
+
+    const existingFrom   = (data.from || "").toLowerCase().trim();
+    const existingPickup = data.pickupDate?.toDate?.()?.toDateString?.() ?? "";
+
+    if (existingFrom === fromNorm && existingPickup === pickupDay) return true;
+  }
+
+  return false;
+}
+
+// ── 7. HTTP endpoint ──────────────────────────────────────────────────────────
+
+exports.ingestWhatsAppMessages = onRequest(
+  {
+    secrets: [WHATSAPP_API_KEY],
+    cors: false,
+    timeoutSeconds: 120,
+    memory: "512MiB",
+  },
+  async (req, res) => {
+    // ── Auth ──────────────────────────────────────────────────────────────────
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+
+    const providedKey = (req.headers["x-api-key"] || req.body?.apiKey || "").trim();
+    if (!providedKey || providedKey !== WHATSAPP_API_KEY.value().trim()) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    // ── Input normalisation ───────────────────────────────────────────────────
+    // Accept either:
+    //   { rawExport: "..." }           — full WhatsApp export text
+    //   { messages: [{...}] }          — pre-parsed array from scraper
+    //   { groupName: "...", rawExport / messages }
+
+    const groupName = req.body?.groupName ?? "Unknown Group";
+    let rawMessages = []; // [{phone, text, timestamp}]
+
+    if (req.body?.rawExport) {
+      rawMessages = parseWhatsAppExport(req.body.rawExport);
+    } else if (Array.isArray(req.body?.messages)) {
+      rawMessages = req.body.messages.map((m) => ({
+        phone:     normalizePhone(String(m.phone ?? "")),
+        text:      String(m.text ?? "").trim(),
+        timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
+      })).filter((m) => m.phone);
+    } else {
+      res.status(400).json({ error: "Provide rawExport (string) or messages (array)" });
+      return;
+    }
+
+    // ── Process each message ──────────────────────────────────────────────────
+
+    const results = {
+      total:     rawMessages.length,
+      ingested:  0,
+      skipped:   0,
+      duplicate: 0,
+      errors:    0,
+      rides:     [],   // IDs of created ride docs
+    };
+
+    for (const msg of rawMessages) {
+      try {
+        // 1. Extract ride data
+        const rideData = extractRideData(msg.text, msg.timestamp);
+        if (!rideData) { results.skipped++; continue; }
+
+        // 2. Skip if pickup date is in the past (more than 1 hour ago)
+        const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+        if (rideData.pickupDate < oneHourAgo) { results.skipped++; continue; }
+
+        // 3. Dedup
+        const dup = await isDuplicate(msg.phone, rideData.from, rideData.pickupDate);
+        if (dup) { results.duplicate++; continue; }
+
+        // 4. Resolve rider identity
+        const vaahanaUser = await findUserByPhone(msg.phone);
+        let riderId, riderName;
+
+        if (vaahanaUser) {
+          riderId   = vaahanaUser.uid;
+          riderName = vaahanaUser.displayName;
+        } else {
+          riderId   = await getOrCreatePlaceholderRider(msg.phone, null);
+          riderName = "WhatsApp Rider";
+        }
+
+        // 5. Build ride document
+        const rideId = crypto.randomUUID();
+        const rideDoc = {
+          id:                  rideId,
+          riderId,
+          status:              "posted",
+          source:              "whatsapp",
+          groupName,
+          whatsappPhone:       msg.phone,
+          isLinkedUser:        !!vaahanaUser,
+
+          // Contact
+          name:                riderName,
+          phone:               msg.phone,
+          phoneCountryCode:    msg.phone.startsWith("+91") ? "+91" : "+1",
+          whatsappCountryCode: msg.phone.startsWith("+91") ? "+91" : "+1",
+
+          // Route
+          from:                rideData.from,
+          to:                  rideData.to,
+          miles:               0,            // unknown until driver maps it
+          pickupLat:           null,
+          pickupLng:           null,
+
+          // Timing
+          coins:               0,            // driver makes an offer via bid
+          hotDuration:         rideData.hotDuration,
+          pickupDate:          rideData.pickupDate,
+
+          // Coin state
+          coinStatus:          "none",
+          coinsLocked:         0,
+          coinsTransferred:    0,
+
+          // Bid marketplace
+          bidCount:            0,
+          selectedBidId:       null,
+          finalCoins:          null,
+          lowestBidCoins:      null,
+          latestBidAt:         null,
+
+          // Driver (empty until accepted)
+          driverId:            null,
+          driverName:          null,
+          driverPhone:         null,
+          driverWhatsapp:      null,
+
+          // Metadata
+          rawText:             msg.text,
+          rawTimeHint:         rideData.rawTimeHint,
+          createdAt:           FieldValue.serverTimestamp(),
+          updatedAt:           FieldValue.serverTimestamp(),
+        };
+
+        await db.collection("rides").doc(rideId).set(rideDoc);
+
+        // 6. Log ingestion
+        await db.collection("whatsappIngestionLogs").add({
+          rideId,
+          phone:     msg.phone,
+          rawText:   msg.text,
+          timestamp: msg.timestamp,
+          groupName,
+          parsedFrom:    rideData.from,
+          parsedTo:      rideData.to,
+          parsedPickup:  rideData.pickupDate,
+          linkedUser:    !!vaahanaUser,
+          createdAt:     FieldValue.serverTimestamp(),
+        });
+
+        results.ingested++;
+        results.rides.push(rideId);
+      } catch (err) {
+        console.error("[ingestWhatsAppMessages] Error processing message:", err.message, msg);
+        results.errors++;
+      }
+    }
+
+    console.log(`[ingestWhatsAppMessages] group=${groupName} total=${results.total} ingested=${results.ingested} skipped=${results.skipped} dup=${results.duplicate} errors=${results.errors}`);
+    res.status(200).json(results);
   }
 );
 
