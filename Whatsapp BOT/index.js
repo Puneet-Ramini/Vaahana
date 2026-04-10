@@ -47,6 +47,8 @@ TARGET_GROUPS.forEach((g) => console.log(`  • "${g}"`))
 const allowedJids = new Map()
 // Groups already confirmed as NOT in the whitelist — skip without fetching
 const deniedJids = new Set()
+// Map: LID (no domain) -> real phone number e.g. "110866309587147" -> "+15551234567"
+const lidToPhone = new Map()
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -57,8 +59,15 @@ function getTimestamp(messageTimestamp) {
 }
 
 function extractPhone(senderJid) {
-  // 919876543210@s.whatsapp.net → +919876543210
-  return '+' + senderJid.split('@')[0]
+  const [local, domain] = senderJid.split('@')
+  const id = local.split(':')[0]
+
+  // LID is a privacy alias — resolve to real phone if we have it
+  if (domain === 'lid') {
+    return lidToPhone.get(id) ?? null
+  }
+
+  return '+' + id
 }
 
 function extractText(message) {
@@ -68,10 +77,10 @@ function extractText(message) {
   return null // images, video, stickers, polls etc. → ignored
 }
 
-async function sendToAPI(groupName, phone, text, timestamp) {
+async function sendToAPI(groupName, phone, name, text, timestamp) {
   const payload = {
     groupName,
-    messages: [{ phone, text, timestamp }],
+    messages: [{ phone, name, text, timestamp }],
   }
 
   try {
@@ -80,8 +89,8 @@ async function sendToAPI(groupName, phone, text, timestamp) {
       timeout: 10_000,
     })
     const r = res.data
-    console.log(`[API] ${res.status} — [${groupName}] ingested:${r.ingested} skipped:${r.skipped} dup:${r.duplicate} errors:${r.errors} | "${text.slice(0, 50)}"`)
-    if (r.ingested > 0) console.log(`[API] ✓ Ride created — IDs: ${r.rides?.join(', ')}`)
+    console.log(`[${groupName}] ${name || phone} | ingested:${r.ingested} skipped:${r.skipped} dup:${r.duplicate} | "${text.slice(0, 50)}"`)
+
   } catch (err) {
     const detail = err.response
       ? `HTTP ${err.response.status}: ${JSON.stringify(err.response.data)}`
@@ -103,6 +112,15 @@ async function discoverGroups(sock) {
       if (TARGET_GROUPS.includes(meta.subject)) {
         allowedJids.set(jid, meta.subject)
         console.log(`[Bot] ✓ Found "${meta.subject}"`)
+
+        // Build LID -> phone map from participants
+        for (const p of meta.participants ?? []) {
+          if (p.lid && p.jid) {
+            const lid = p.lid.split('@')[0].split(':')[0]
+            const phone = '+' + p.jid.split('@')[0].split(':')[0]
+            lidToPhone.set(lid, phone)
+          }
+        }
       }
     }
 
@@ -148,6 +166,7 @@ async function handleMessages(sock, messages) {
       if (!isJidGroup(jid)) continue
       if (deniedJids.has(jid)) continue
       if (!msg.message) continue
+      if (msg.key.fromMe) continue // ignore messages sent by this account
 
       if (!allowedJids.has(jid)) {
         await resolveJid(sock, jid)
@@ -160,9 +179,14 @@ async function handleMessages(sock, messages) {
       const groupName = allowedJids.get(jid)
       const senderJid = msg.key.participant || msg.key.remoteJid
       const phone = extractPhone(senderJid)
+      if (!phone) {
+        console.warn(`[Bot] Could not resolve phone for JID: ${senderJid} — skipping`)
+        continue
+      }
+      const name = msg.pushName || null
       const timestamp = getTimestamp(msg.messageTimestamp)
 
-      await sendToAPI(groupName, phone, text.trim(), timestamp)
+      await sendToAPI(groupName, phone, name, text.trim(), timestamp)
     } catch (err) {
       console.error('[Bot] Error processing message:', err.message)
     }
