@@ -816,9 +816,11 @@ function inferPickupDate(text, timeStr, msgTimestamp) {
   }
 
   // 2. Relative urgency cues
-  // For same-day keywords, anchor to NOW (not message time) so older messages still resolve correctly
+  // Always anchor to NOW (not message timestamp) so older messages still resolve correctly
   if (URGENCY_TONIGHT.test(text)) {
-    targetDate = new Date(); // use current time as base
+    targetDate = new Date();
+    // If a specific time is given, parseTimeString will override; otherwise default to 8pm
+    if (!timeStr) { targetDate.setHours(20, 0, 0, 0); return targetDate; }
   } else if (URGENCY_TOMORROW.test(text)) {
     targetDate = new Date();
     targetDate.setDate(targetDate.getDate() + 1);
@@ -826,9 +828,14 @@ function inferPickupDate(text, timeStr, msgTimestamp) {
     targetDate = new Date();
   } else if (URGENCY_VAGUE.test(text)) {
     // Use 3 days from now as a reasonable midpoint
+    targetDate = new Date();
     targetDate.setDate(targetDate.getDate() + 3);
+  } else {
+    // No date cue at all — assume they mean tomorrow morning.
+    // Never use the message timestamp as-is: it may be hours/days in the past.
+    targetDate = new Date();
+    targetDate.setDate(targetDate.getDate() + 1);
   }
-  // else: ambiguous — use message date + assume near-future
 
   // Apply extracted time if present
   if (timeStr) {
@@ -1045,11 +1052,17 @@ exports.ingestWhatsAppMessages = onRequest(
       try {
         // 1. Extract ride data
         const rideData = extractRideData(msg.text, msg.timestamp);
-        if (!rideData) { results.skipped++; continue; }
+        if (!rideData) {
+          console.log(`[ingest] SKIP not_ride_request | ${msg.phone} | "${msg.text.slice(0,80)}"`);
+          results.skipped++; continue;
+        }
 
         // 2. Skip if pickup date is in the past (more than 1 hour ago)
         const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-        if (rideData.pickupDate < oneHourAgo) { results.skipped++; continue; }
+        if (rideData.pickupDate < oneHourAgo) {
+          console.log(`[ingest] SKIP past_pickup | ${msg.phone} | pickup=${rideData.pickupDate.toISOString()} | "${msg.text.slice(0,80)}"`);
+          results.skipped++; continue;
+        }
 
         // 3. Dedup
         const dup = await isDuplicate(msg.phone, rideData.from, rideData.to, rideData.pickupDate);
