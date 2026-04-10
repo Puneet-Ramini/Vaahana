@@ -13,9 +13,16 @@ struct ProfileView: View {
     @State private var whatsapp = ""
     @State private var role: UserRole? = nil
     @State private var coins: Int = 0
+    @State private var ratingAverage: Double? = nil
     @State private var isSaving = false
     @State private var errorMessage: String?
     @State private var showingHistory = false
+
+    // Driver vehicle info
+    @State private var vehicleMake  = ""
+    @State private var vehicleModel = ""
+    @State private var vehicleColor = ""
+    @State private var vehiclePlate = ""
 
     private var currentUser: FirebaseAuth.User? { Auth.auth().currentUser }
     private let db = Firestore.firestore()
@@ -63,6 +70,19 @@ struct ProfileView: View {
                     Text("Account")
                 }
 
+                // Rating badge
+                if let avg = ratingAverage {
+                    Section {
+                        HStack {
+                            Image(systemName: "star.fill").foregroundStyle(.yellow)
+                            Text(String(format: "%.1f", avg))
+                                .fontWeight(.semibold)
+                            Text("avg rating")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
                 Section("Profile") {
                     TextField("Display Name", text: $displayName)
                         .autocorrectionDisabled()
@@ -77,6 +97,20 @@ struct ProfileView: View {
                     Text("Contact Numbers")
                 } footer: {
                     Text("These will auto-fill when you post a ride request.")
+                }
+
+                if role == .driver {
+                    Section {
+                        TextField("Make (e.g. Toyota)", text: $vehicleMake)
+                        TextField("Model (e.g. Camry)", text: $vehicleModel)
+                        TextField("Color", text: $vehicleColor)
+                        TextField("License Plate", text: $vehiclePlate)
+                            .autocapitalization(.allCharacters)
+                    } header: {
+                        Text("Vehicle")
+                    } footer: {
+                        Text("Shown to riders when you accept a ride.")
+                    }
                 }
 
                 if let error = errorMessage {
@@ -140,14 +174,23 @@ struct ProfileView: View {
 
     private func load() async {
         guard let uid = currentUser?.uid else { return }
-        displayName = currentUser?.displayName ?? ""
         if let data = try? await db.collection("users").document(uid).getDocument().data() {
-            phone = data["phone"] as? String ?? ""
-            whatsapp = data["whatsapp"] as? String ?? ""
-            coins = data["coins"] as? Int ?? 0
+            displayName  = data["displayName"] as? String ?? currentUser?.displayName ?? ""
+            phone        = data["phone"]       as? String ?? ""
+            whatsapp     = data["whatsapp"]    as? String ?? ""
+            coins        = data["coins"]       as? Int    ?? 0
+            vehicleMake  = data["vehicleMake"]  as? String ?? ""
+            vehicleModel = data["vehicleModel"] as? String ?? ""
+            vehicleColor = data["vehicleColor"] as? String ?? ""
+            vehiclePlate = data["vehiclePlate"] as? String ?? ""
             if let rawRole = data["role"] as? String {
                 role = UserRole(rawValue: rawRole)
             }
+            let rSum   = data["ratingSum"]   as? Int ?? 0
+            let rCount = data["ratingCount"] as? Int ?? 0
+            ratingAverage = rCount > 0 ? Double(rSum) / Double(rCount) : nil
+        } else {
+            displayName = currentUser?.displayName ?? ""
         }
     }
 
@@ -156,18 +199,25 @@ struct ProfileView: View {
         errorMessage = nil
         Task {
             do {
-                // Update display name in Firebase Auth
+                let trimmedName = displayName.trimmingCharacters(in: .whitespaces)
                 if let user = currentUser {
                     let req = user.createProfileChangeRequest()
-                    req.displayName = displayName.trimmingCharacters(in: .whitespaces)
+                    req.displayName = trimmedName
                     try await req.commitChanges()
                 }
-                // Save contact numbers to Firestore
                 if let uid = currentUser?.uid {
-                    try await db.collection("users").document(uid).setData(
-                        ["phone": phone, "whatsapp": whatsapp],
-                        merge: true
-                    )
+                    var payload: [String: Any] = [
+                        "displayName": trimmedName,
+                        "phone":       phone,
+                        "whatsapp":    whatsapp,
+                    ]
+                    if role == .driver {
+                        payload["vehicleMake"]  = vehicleMake
+                        payload["vehicleModel"] = vehicleModel
+                        payload["vehicleColor"] = vehicleColor
+                        payload["vehiclePlate"] = vehiclePlate
+                    }
+                    try await db.collection("users").document(uid).setData(payload, merge: true)
                 }
                 await MainActor.run {
                     isSaving = false

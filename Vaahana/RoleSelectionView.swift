@@ -73,9 +73,16 @@ struct RoleSelectionView: View {
         errorMessage = nil
         Task {
             do {
-                try await db.collection("users").document(uid).setData(
-                    ["role": role.rawValue], merge: true
-                )
+                var userData: [String: Any] = ["role": role.rawValue]
+                if role == .rider {
+                    // New riders start with 100 coins; don't overwrite if doc already has coins
+                    let existing = try? await db.collection("users").document(uid).getDocument()
+                    if existing?.data()?["coins"] == nil {
+                        userData["coins"] = 100
+                        userData["coinsLocked"] = 0
+                    }
+                }
+                try await db.collection("users").document(uid).setData(userData, merge: true)
                 await MainActor.run {
                     isSaving = false
                     onRoleSelected(role)
