@@ -12,6 +12,8 @@ import UserNotifications
 #if canImport(FirebaseMessaging)
 import FirebaseMessaging
 #endif
+import CoreLocation
+import UIKit
 
 // MARK: - App Delegate (notifications + FCM when available)
 
@@ -162,12 +164,206 @@ class UserState: ObservableObject {
     }
 }
 
+// MARK: - Location Service
+
+class LocationService: NSObject, ObservableObject, CLLocationManagerDelegate {
+    enum RequestError: Error {
+        case servicesDisabled
+        case permissionDenied
+        case timeout
+        case failed
+    }
+
+    @Published private(set) var location: CLLocation?
+    @Published private(set) var authorizationStatus: CLAuthorizationStatus
+
+    private let manager = CLLocationManager()
+    private var pendingLocationContinuation: CheckedContinuation<Result<CLLocationCoordinate2D, RequestError>, Never>?
+    private var pendingBestLocation: CLLocation?
+    private var pendingDesiredAccuracy: CLLocationAccuracy = 35
+    private var pendingAuthorizationContinuation: CheckedContinuation<CLAuthorizationStatus, Never>?
+    private var locationTimeoutTask: Task<Void, Never>?
+    private var authorizationTimeoutTask: Task<Void, Never>?
+
+    override init() {
+        authorizationStatus = CLLocationManager().authorizationStatus
+        super.init()
+        manager.delegate = self
+        manager.desiredAccuracy = kCLLocationAccuracyBest
+        authorizationStatus = manager.authorizationStatus
+
+        // Keep legacy app behavior: ask early so map-based screens can center quickly.
+        if authorizationStatus == .notDetermined {
+            manager.requestWhenInUseAuthorization()
+        } else if authorizationStatus == .authorizedWhenInUse || authorizationStatus == .authorizedAlways {
+            manager.startUpdatingLocation()
+        }
+    }
+
+    func requestCurrentLocation(timeout: TimeInterval = 5) async -> Result<CLLocationCoordinate2D, RequestError> {
+        if let cached = manager.location,
+           cached.timestamp.timeIntervalSinceNow > -15,
+           cached.horizontalAccuracy > 0,
+           cached.horizontalAccuracy <= 50 {
+            return .success(cached.coordinate)
+        }
+
+        guard CLLocationManager.locationServicesEnabled() else {
+            return .failure(.servicesDisabled)
+        }
+
+        let status = await ensureAuthorized(timeout: min(timeout, 6))
+        switch status {
+        case .authorizedWhenInUse, .authorizedAlways:
+            break
+        case .restricted, .denied:
+            return .failure(.permissionDenied)
+        case .notDetermined:
+            return .failure(.timeout)
+        @unknown default:
+            return .failure(.failed)
+        }
+
+        return await withCheckedContinuation { continuation in
+            if let pending = pendingLocationContinuation {
+                pending.resume(returning: .failure(.failed))
+            }
+            pendingBestLocation = nil
+            pendingDesiredAccuracy = 35
+            pendingLocationContinuation = continuation
+            manager.requestLocation()
+
+            locationTimeoutTask?.cancel()
+            locationTimeoutTask = Task { [weak self] in
+                guard let self else { return }
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                if let continuation = self.pendingLocationContinuation {
+                    if let best = self.pendingBestLocation {
+                        continuation.resume(returning: .success(best.coordinate))
+                    } else {
+                        continuation.resume(returning: .failure(.timeout))
+                    }
+                    self.pendingLocationContinuation = nil
+                    self.pendingBestLocation = nil
+                }
+            }
+        }
+    }
+
+    func requestWhenInUseAuthorization() {
+        manager.requestWhenInUseAuthorization()
+    }
+
+    func openAppSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
+    }
+
+    private func ensureAuthorized(timeout: TimeInterval) async -> CLAuthorizationStatus {
+        let current = manager.authorizationStatus
+        switch current {
+        case .authorizedWhenInUse, .authorizedAlways, .denied, .restricted:
+            return current
+        case .notDetermined:
+            break
+        @unknown default:
+            return current
+        }
+
+        return await withCheckedContinuation { continuation in
+            if let pending = pendingAuthorizationContinuation {
+                pending.resume(returning: manager.authorizationStatus)
+            }
+            pendingAuthorizationContinuation = continuation
+
+            manager.requestWhenInUseAuthorization()
+
+            authorizationTimeoutTask?.cancel()
+            authorizationTimeoutTask = Task { [weak self] in
+                guard let self else { return }
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                if let continuation = self.pendingAuthorizationContinuation {
+                    continuation.resume(returning: self.manager.authorizationStatus)
+                    self.pendingAuthorizationContinuation = nil
+                }
+            }
+        }
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        authorizationStatus = manager.authorizationStatus
+
+        if let continuation = pendingAuthorizationContinuation,
+           manager.authorizationStatus != .notDetermined {
+            authorizationTimeoutTask?.cancel()
+            continuation.resume(returning: manager.authorizationStatus)
+            pendingAuthorizationContinuation = nil
+        }
+
+        if manager.authorizationStatus == .authorizedWhenInUse || manager.authorizationStatus == .authorizedAlways {
+            manager.startUpdatingLocation()
+        }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let latest = locations.last else { return }
+        location = latest
+
+        guard let continuation = pendingLocationContinuation else { return }
+
+        let validLocations = locations.filter { $0.horizontalAccuracy > 0 }
+        guard let bestInBatch = validLocations.min(by: { $0.horizontalAccuracy < $1.horizontalAccuracy }) else {
+            return
+        }
+
+        if let currentBest = pendingBestLocation {
+            if bestInBatch.horizontalAccuracy < currentBest.horizontalAccuracy {
+                pendingBestLocation = bestInBatch
+            }
+        } else {
+            pendingBestLocation = bestInBatch
+        }
+
+        if let best = pendingBestLocation, best.horizontalAccuracy <= pendingDesiredAccuracy {
+            locationTimeoutTask?.cancel()
+            continuation.resume(returning: .success(best.coordinate))
+            pendingLocationContinuation = nil
+            pendingBestLocation = nil
+        }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        if let clError = error as? CLError, clError.code == .locationUnknown {
+            return
+        }
+
+        locationTimeoutTask?.cancel()
+        if let continuation = pendingLocationContinuation {
+            if let clError = error as? CLError, clError.code == .denied {
+                continuation.resume(returning: .failure(.permissionDenied))
+            } else {
+                if let best = pendingBestLocation {
+                    continuation.resume(returning: .success(best.coordinate))
+                } else {
+                    continuation.resume(returning: .failure(.failed))
+                }
+            }
+            pendingLocationContinuation = nil
+            pendingBestLocation = nil
+        }
+        print("Location manager failed: \(error.localizedDescription)")
+    }
+}
+
 // MARK: - App Entry Point
 
 @main
 struct VaahanaApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var userState = UserState()
+    @StateObject private var locationService = LocationService()
 
     init() {
         FirebaseApp.configure()
@@ -177,6 +373,7 @@ struct VaahanaApp: App {
         WindowGroup {
             if !userState.isSignedIn {
                 AuthView()
+                    .environmentObject(locationService)
             } else if userState.isLoadingRole {
                 ProgressView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -184,6 +381,7 @@ struct VaahanaApp: App {
             } else if let role = userState.role {
                 ContentView(role: role)
                     .environmentObject(userState)
+                    .environmentObject(locationService)
                     .sheet(isPresented: $userState.showProfileSetup) {
                         ProfileSetupView(userState: userState)
                     }

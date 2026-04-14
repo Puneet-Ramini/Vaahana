@@ -10,6 +10,7 @@ import Combine
 import MapKit
 import FirebaseFirestore
 import FirebaseAuth
+import CoreLocation
 
 // MARK: - Data Models
 
@@ -627,7 +628,7 @@ struct DriverView: View {
     @State private var showingMyBids = false
     @State private var ratingRide: Ride?
     @State private var cameraPosition: MapCameraPosition = .automatic
-    @StateObject private var locationManager = LocationManager()
+    @EnvironmentObject private var locationService: LocationService
 
     // Persisted filter settings
     @AppStorage("filterRadius") private var filterRadius = 5.0
@@ -639,7 +640,7 @@ struct DriverView: View {
         if driverCenterCustom {
             return CLLocationCoordinate2D(latitude: driverCenterLat, longitude: driverCenterLon)
         }
-        return locationManager.location?.coordinate
+        return locationService.location?.coordinate
     }
 
     var radiusMeters: CLLocationDistance { filterRadius * 1609.34 }
@@ -671,6 +672,13 @@ struct DriverView: View {
                 }
             }
     }
+    
+    private var locationKey: String {
+        if let loc = locationService.location {
+            return String(format: "%.6f,%.6f", loc.coordinate.latitude, loc.coordinate.longitude)
+        }
+        return ""
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -679,7 +687,7 @@ struct DriverView: View {
                 MapReader { proxy in
                     Map(position: $cameraPosition) {
                         // Live location dot
-                        if let loc = locationManager.location {
+                        if let loc = locationService.location {
                             Annotation("Me", coordinate: loc.coordinate) {
                                 ZStack {
                                     Circle().fill(Color.blue.opacity(0.25)).frame(width: 36, height: 36)
@@ -745,9 +753,8 @@ struct DriverView: View {
                 controlPanel
             }
         }
-        .onAppear { locationManager.requestLocation() }
-        .onChange(of: locationManager.location) { _, loc in
-            guard !driverCenterCustom, let loc else { return }
+        .onChange(of: locationKey) { _ in
+            guard !driverCenterCustom, let loc = locationService.location else { return }
             cameraPosition = .region(MKCoordinateRegion(
                 center: loc.coordinate,
                 latitudinalMeters: radiusMeters * 3,
@@ -865,7 +872,7 @@ struct DriverView: View {
                     if driverCenterCustom {
                         Button {
                             driverCenterCustom = false
-                            if let loc = locationManager.location {
+                            if let loc = locationService.location {
                                 withAnimation {
                                     cameraPosition = .region(MKCoordinateRegion(
                                         center: loc.coordinate,
@@ -971,42 +978,6 @@ struct DriverView: View {
         .buttonStyle(.plain)
     }
 
-}
-
-// MARK: - Location Manager
-
-class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
-    private let manager = CLLocationManager()
-    @Published var location: CLLocation?
-    @Published var authorizationStatus: CLAuthorizationStatus?
-    
-    override init() {
-        super.init()
-        manager.delegate = self
-        manager.desiredAccuracy = kCLLocationAccuracyBest
-        authorizationStatus = manager.authorizationStatus
-    }
-    
-    func requestLocation() {
-        manager.requestWhenInUseAuthorization()
-        manager.startUpdatingLocation()
-    }
-    
-    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        location = locations.first
-        manager.stopUpdatingLocation()
-    }
-    
-    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        print("Location error: \(error.localizedDescription)")
-    }
-    
-    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        authorizationStatus = manager.authorizationStatus
-        if manager.authorizationStatus == .authorizedWhenInUse || manager.authorizationStatus == .authorizedAlways {
-            manager.startUpdatingLocation()
-        }
-    }
 }
 
 // MARK: - Compact Ride Row
@@ -2235,4 +2206,6 @@ struct InfoChip: View {
 
 #Preview {
     ContentView(role: .rider)
+        .environmentObject(UserState())
+        .environmentObject(LocationService())
 }
