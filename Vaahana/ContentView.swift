@@ -110,6 +110,7 @@ struct Ride: Identifiable, Codable, Equatable {
     var miles: Double
     var pickupLat: Double?     // geocoded at post time
     var pickupLng: Double?
+    var source: String?
 
     // Details
     var coins: Int
@@ -193,6 +194,7 @@ struct Ride: Identifiable, Codable, Equatable {
         miles: Double,
         pickupLat: Double? = nil,
         pickupLng: Double? = nil,
+        source: String? = "app",
         coins: Int,
         hotDuration: Int = 5,
         pickupDate: Date,
@@ -214,6 +216,7 @@ struct Ride: Identifiable, Codable, Equatable {
         self.miles = miles
         self.pickupLat = pickupLat
         self.pickupLng = pickupLng
+        self.source = source
         self.coins = coins
         self.hotDuration = hotDuration
         self.pickupDate = pickupDate
@@ -266,6 +269,7 @@ struct Ride: Identifiable, Codable, Equatable {
         miles                  = (try? c.decodeIfPresent(Double.self, forKey: .miles))                 ?? 0
         pickupLat              = try? c.decodeIfPresent(Double.self, forKey: .pickupLat)
         pickupLng              = try? c.decodeIfPresent(Double.self, forKey: .pickupLng)
+        source                 = try? c.decodeIfPresent(String.self, forKey: .source)
         coins                  = (try? c.decodeIfPresent(Int.self, forKey: .coins))                    ?? 0
         hotDuration            = (try? c.decodeIfPresent(Int.self, forKey: .hotDuration))              ?? 5
         pickupDate             = (try? c.decodeIfPresent(Date.self, forKey: .pickupDate))              ?? Date()
@@ -290,6 +294,10 @@ struct Ride: Identifiable, Codable, Equatable {
         lowestBidCoins         = try? c.decodeIfPresent(Int.self, forKey: .lowestBidCoins)
         latestBidAt            = try? c.decodeIfPresent(Date.self, forKey: .latestBidAt)
     }
+
+    var isWhatsAppSource: Bool {
+        (source ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "whatsapp"
+    }
 }
 
 // MARK: - Storage Manager
@@ -310,6 +318,7 @@ class RideStorage: ObservableObject {
 
     private let db = Firestore.firestore()
     private var listeners: [ListenerRegistration] = []
+    private var distanceCalcInFlight: Set<UUID> = []
 
     let uid: String
     let role: UserRole
@@ -371,8 +380,9 @@ class RideStorage: ObservableObject {
                             print("[RideStorage] decode failed docID=\(doc.documentID) from=\(doc.data()["from"] ?? "?") error=\(error)")
                         }
                     }
-                    self.postedRides = decoded
+                    self.postedRides = self.deduplicatePostedRides(decoded)
                     self.isLoading = false
+                    self.backfillMissingMilesIfNeeded(in: self.postedRides)
                 }
             listeners.append(l)
 
@@ -411,6 +421,75 @@ class RideStorage: ObservableObject {
     /// Hot posted rides — used by driver discovery
     var hotPostedRides: [Ride] {
         postedRides.filter { $0.isHot }
+    }
+
+    private func deduplicatePostedRides(_ rides: [Ride]) -> [Ride] {
+        var unique: [String: Ride] = [:]
+        let calendar = Calendar.current
+
+        for ride in rides {
+            let key: String
+            if ride.isWhatsAppSource {
+                let pickupDay = calendar.startOfDay(for: ride.pickupDate).timeIntervalSince1970
+                let phone = "\(ride.whatsappCountryCode)\(ride.whatsappPhone)"
+                key = [
+                    "whatsapp",
+                    phone.lowercased(),
+                    ride.from.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                    ride.to.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                    String(Int(pickupDay))
+                ].joined(separator: "|")
+            } else {
+                key = ride.id.uuidString
+            }
+
+            if let existing = unique[key] {
+                let existingHasCoords = existing.pickupLat != nil && existing.pickupLng != nil
+                let incomingHasCoords = ride.pickupLat != nil && ride.pickupLng != nil
+
+                if ride.createdAt > existing.createdAt || (incomingHasCoords && !existingHasCoords) {
+                    unique[key] = ride
+                }
+            } else {
+                unique[key] = ride
+            }
+        }
+
+        return unique.values.sorted { $0.createdAt > $1.createdAt }
+    }
+
+    private func backfillMissingMilesIfNeeded(in rides: [Ride]) {
+        let candidates = rides.filter {
+            $0.miles <= 0 &&
+            !$0.from.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            !$0.to.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            !distanceCalcInFlight.contains($0.id)
+        }
+
+        for ride in candidates {
+            distanceCalcInFlight.insert(ride.id)
+            Task { [weak self] in
+                guard let self else { return }
+                defer { self.distanceCalcInFlight.remove(ride.id) }
+
+                do {
+                    let calc = DistanceCalculator()
+                    let computed = try await calc.calculateDistance(from: ride.from, to: ride.to)
+                    let miles = max(0, (computed * 10).rounded() / 10)
+
+                    await MainActor.run {
+                        if let index = self.postedRides.firstIndex(where: { $0.id == ride.id }) {
+                            self.postedRides[index].miles = miles
+                        }
+                    }
+
+                    try? await self.db.collection("rides").document(ride.id.uuidString)
+                        .setData(["miles": miles], merge: true)
+                } catch {
+                    // Keep feed responsive; we'll retry on a future snapshot.
+                }
+            }
+        }
     }
 }
 
@@ -620,6 +699,13 @@ struct RiderView: View {
 
 // MARK: - Driver View
 
+private enum DriverFeedTab: String, CaseIterable, Identifiable {
+    case all = "All"
+    case whatsApp = "WhatsApp"
+
+    var id: String { rawValue }
+}
+
 struct DriverView: View {
     @EnvironmentObject var storage: RideStorage
     @State private var selectedRide: Ride?
@@ -627,7 +713,10 @@ struct DriverView: View {
     @State private var showingActiveRide = false
     @State private var showingMyBids = false
     @State private var ratingRide: Ride?
+    @State private var selectedFeedTab: DriverFeedTab = .all
     @State private var cameraPosition: MapCameraPosition = .automatic
+    @State private var panelHeight: CGFloat = 0
+    @GestureState private var panelDragTranslation: CGFloat = 0
     @EnvironmentObject private var locationService: LocationService
 
     // Persisted filter settings
@@ -645,17 +734,41 @@ struct DriverView: View {
 
     var radiusMeters: CLLocationDistance { filterRadius * 1609.34 }
 
+    private var sourceFilteredRides: [Ride] {
+        let hot = storage.hotPostedRides
+        switch selectedFeedTab {
+        case .all:
+            return hot
+        case .whatsApp:
+            return hot.filter(\.isWhatsAppSource)
+        }
+    }
+
+    private var mapCenter: CLLocationCoordinate2D? {
+        if selectedFeedTab == .whatsApp {
+            return locationService.location?.coordinate
+        }
+        return effectiveCenter
+    }
+
     var filteredRides: [(ride: Ride, distanceMiles: Double?)] {
         guard isOnline else { return [] }
-        let hot = storage.hotPostedRides
-        guard let center = effectiveCenter else {
-            return hot.map { ($0, nil) }
+        guard let center = mapCenter else {
+            if selectedFeedTab == .whatsApp {
+                return []
+            }
+            return sourceFilteredRides.map { ($0, nil) }
         }
+
         let centerLoc = CLLocation(latitude: center.latitude, longitude: center.longitude)
-        return hot
+        return sourceFilteredRides
             .compactMap { ride -> (ride: Ride, distanceMiles: Double?)? in
                 guard let lat = ride.pickupLat, let lng = ride.pickupLng else {
-                    // No coords yet (geocoding pending) — show in list without distance
+                    // WhatsApp tab stays strictly location-based.
+                    if selectedFeedTab == .whatsApp {
+                        return nil
+                    }
+                    // No coords yet (geocoding pending) — show in list without distance.
                     return (ride, nil)
                 }
                 let dist = centerLoc.distance(from: CLLocation(latitude: lat, longitude: lng)) / 1609.34
@@ -680,10 +793,45 @@ struct DriverView: View {
         return ""
     }
 
+    private var emptyStateMessage: String {
+        if selectedFeedTab == .whatsApp {
+            if locationService.location == nil {
+                return "Enable location to view nearby WhatsApp requests."
+            }
+            if sourceFilteredRides.isEmpty {
+                return "No WhatsApp requests right now."
+            }
+            return "No WhatsApp requests within \(Int(filterRadius)) mi of your current location."
+        }
+
+        if sourceFilteredRides.isEmpty {
+            return "No hot requests right now"
+        }
+        return "No hot requests within \(Int(filterRadius)) mi — expand radius or tap the map to move search area"
+    }
+
+    private func snappedPanelHeight(_ proposed: CGFloat, snapHeights: [CGFloat]) -> CGFloat {
+        guard let minHeight = snapHeights.min(), let maxHeight = snapHeights.max() else {
+            return proposed
+        }
+        let clamped = min(max(proposed, minHeight), maxHeight)
+        return snapHeights.min(by: { abs($0 - clamped) < abs($1 - clamped) }) ?? clamped
+    }
+
     var body: some View {
         GeometryReader { geo in
-            VStack(spacing: 0) {
-                // ── Map ──
+            let snapHeights: [CGFloat] = [
+                geo.size.height * 0.38,
+                geo.size.height * 0.62,
+                geo.size.height * 0.86
+            ]
+            let minPanelHeight = snapHeights[0]
+            let maxPanelHeight = snapHeights[2]
+            let resolvedPanelHeight = panelHeight == 0 ? snapHeights[1] : panelHeight
+            let currentPanelHeight = min(max(resolvedPanelHeight + panelDragTranslation, minPanelHeight), maxPanelHeight)
+
+            ZStack(alignment: .bottom) {
+                // ── Map (fixed height for smooth sheet dragging) ──
                 MapReader { proxy in
                     Map(position: $cameraPosition) {
                         // Live location dot
@@ -699,13 +847,13 @@ struct DriverView: View {
                         }
 
                         // Drive-radius circle overlay
-                        if let center = effectiveCenter {
+                        if let center = mapCenter {
                             MapCircle(center: center, radius: radiusMeters)
                                 .foregroundStyle(Color.blue.opacity(0.1))
                                 .stroke(Color.blue, lineWidth: 2)
 
                             // Custom-center pin
-                            if driverCenterCustom {
+                            if driverCenterCustom && selectedFeedTab == .all {
                                 Annotation("Drive Area", coordinate: center) {
                                     ZStack {
                                         Circle().fill(Color.blue).frame(width: 34, height: 34)
@@ -733,6 +881,7 @@ struct DriverView: View {
                         MapCompass()
                     }
                     .onTapGesture { screenPoint in
+                        guard selectedFeedTab == .all else { return }
                         if let coord = proxy.convert(screenPoint, from: .local) {
                             driverCenterLat = coord.latitude
                             driverCenterLon = coord.longitude
@@ -747,19 +896,47 @@ struct DriverView: View {
                         }
                     }
                 }
-                .frame(height: geo.size.height * 0.52)
+                .frame(height: geo.size.height)
 
                 // ── Bottom control panel ──
-                controlPanel
+                controlPanel(minHeight: minPanelHeight, maxHeight: maxPanelHeight, snapHeights: snapHeights)
+                    .frame(height: maxPanelHeight)
+                    .offset(y: maxPanelHeight - currentPanelHeight)
+            }
+            .onAppear {
+                if panelHeight == 0 {
+                    panelHeight = snapHeights[1]
+                }
             }
         }
         .onChange(of: locationKey) { _ in
+            if selectedFeedTab == .whatsApp, let loc = locationService.location {
+                cameraPosition = .region(MKCoordinateRegion(
+                    center: loc.coordinate,
+                    latitudinalMeters: radiusMeters * 3,
+                    longitudinalMeters: radiusMeters * 3
+                ))
+                return
+            }
+
             guard !driverCenterCustom, let loc = locationService.location else { return }
             cameraPosition = .region(MKCoordinateRegion(
                 center: loc.coordinate,
                 latitudinalMeters: radiusMeters * 3,
                 longitudinalMeters: radiusMeters * 3
             ))
+        }
+        .onChange(of: selectedFeedTab) { _, tab in
+            if tab == .whatsApp {
+                driverCenterCustom = false
+                if let loc = locationService.location {
+                    cameraPosition = .region(MKCoordinateRegion(
+                        center: loc.coordinate,
+                        latitudinalMeters: radiusMeters * 3,
+                        longitudinalMeters: radiusMeters * 3
+                    ))
+                }
+            }
         }
         .sheet(item: $selectedRide) { ride in RideDetailSheet(ride: ride) }
         .sheet(isPresented: $showingActiveRide) {
@@ -786,7 +963,7 @@ struct DriverView: View {
 
     // MARK: - Control Panel
 
-    private var controlPanel: some View {
+    private func controlPanel(minHeight: CGFloat, maxHeight: CGFloat, snapHeights: [CGFloat]) -> some View {
         VStack(spacing: 0) {
             // Handle
             Capsule()
@@ -794,6 +971,21 @@ struct DriverView: View {
                 .frame(width: 36, height: 4)
                 .padding(.top, 10)
                 .padding(.bottom, 12)
+                .frame(maxWidth: .infinity, minHeight: 28)
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture()
+                        .updating($panelDragTranslation) { value, state, _ in
+                            state = -value.translation.height
+                        }
+                        .onEnded { value in
+                            let projectedHeight = panelHeight - value.translation.height
+                            let snapped = snappedPanelHeight(projectedHeight, snapHeights: snapHeights)
+                            withAnimation(.interactiveSpring(response: 0.24, dampingFraction: 0.88)) {
+                                panelHeight = snapped
+                            }
+                        }
+                )
 
             // Active ride banner
             if let active = storage.activeRide {
@@ -853,23 +1045,35 @@ struct DriverView: View {
 
             Divider()
 
+            Picker("Feed", selection: $selectedFeedTab) {
+                Text("All").tag(DriverFeedTab.all)
+                Text("WhatsApp").tag(DriverFeedTab.whatsApp)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+
+            Divider()
+
             // Location + radius
             VStack(spacing: 10) {
                 HStack(spacing: 10) {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 5) {
-                            Image(systemName: driverCenterCustom ? "mappin.circle.fill" : "location.fill")
-                                .foregroundStyle(driverCenterCustom ? .orange : .blue)
-                            Text(driverCenterCustom ? "Custom Location" : "Live Location")
+                            Image(systemName: (driverCenterCustom && selectedFeedTab == .all) ? "mappin.circle.fill" : "location.fill")
+                                .foregroundStyle((driverCenterCustom && selectedFeedTab == .all) ? .orange : .blue)
+                            Text((driverCenterCustom && selectedFeedTab == .all) ? "Custom Location" : "Live Location")
                                 .font(.subheadline).fontWeight(.semibold)
                         }
-                        Text(driverCenterCustom
-                             ? "Tap the map to move your search area"
-                             : "Tap anywhere on the map to pin a location")
+                        Text(selectedFeedTab == .whatsApp
+                             ? "WhatsApp rides are filtered strictly from your current location"
+                             : (driverCenterCustom
+                                ? "Tap the map to move your search area"
+                                : "Tap anywhere on the map to pin a location"))
                             .font(.caption2).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    if driverCenterCustom {
+                    if driverCenterCustom && selectedFeedTab == .all {
                         Button {
                             driverCenterCustom = false
                             if let loc = locationService.location {
@@ -909,7 +1113,8 @@ struct DriverView: View {
 
             // Rides header
             HStack {
-                Text("🔥 Hot Requests").font(.subheadline).fontWeight(.semibold)
+                Text(selectedFeedTab == .whatsApp ? "📲 WhatsApp Requests" : "🔥 Hot Requests")
+                    .font(.subheadline).fontWeight(.semibold)
                 Text("(\(filteredRides.count))").font(.caption).foregroundStyle(.secondary)
                 Spacer()
             }
@@ -921,11 +1126,9 @@ struct DriverView: View {
                 ProgressView().frame(maxWidth: .infinity).padding()
             } else if filteredRides.isEmpty {
                 VStack(spacing: 6) {
-                    Image(systemName: storage.hotPostedRides.isEmpty ? "flame.slash" : "map.circle")
+                    Image(systemName: sourceFilteredRides.isEmpty ? "flame.slash" : "map.circle")
                         .font(.title2).foregroundStyle(.secondary)
-                    Text(storage.hotPostedRides.isEmpty
-                         ? "No hot requests right now"
-                         : "No hot requests within \(Int(filterRadius)) mi — expand radius or tap the map to move search area")
+                    Text(emptyStateMessage)
                         .font(.subheadline).foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                 }
@@ -971,6 +1174,22 @@ struct DriverView: View {
                     if ride.coins > 0 {
                         Text("🪙\(ride.coins)")
                             .font(.system(size: 8, weight: .bold)).foregroundStyle(.white)
+                    }
+                }
+                if ride.isWhatsAppSource {
+                    VStack {
+                        HStack {
+                            Spacer()
+                            Text("WA")
+                                .font(.system(size: 7, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 2)
+                                .background(Color.green)
+                                .clipShape(Capsule())
+                                .offset(x: 6, y: -6)
+                        }
+                        Spacer()
                     }
                 }
             }
@@ -1027,10 +1246,27 @@ struct CompactRideRow: View {
                     }
 
                     HStack(spacing: 8) {
+                        if ride.isWhatsAppSource, let distanceMiles {
+                            Text("\(distanceMiles < 0.1 ? "<0.1" : String(format: "%.1f", distanceMiles)) mi away")
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                                .foregroundStyle(.blue)
+                            Text("•").foregroundStyle(.secondary)
+                        }
                         if ride.miles > 0 {
                             Text("\(String(format: "%.1f", ride.miles)) mi route")
                                 .font(.caption).foregroundStyle(.secondary)
                             Text("•").foregroundStyle(.secondary)
+                        }
+                        if ride.isWhatsAppSource {
+                            Text("WhatsApp")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundStyle(.green)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.green.opacity(0.12))
+                                .clipShape(Capsule())
                         }
                         Text("🪙 \(ride.coins)")
                             .font(.caption).fontWeight(.semibold).foregroundStyle(.orange)
