@@ -163,17 +163,20 @@ async function handleMessages(sock, messages) {
     try {
       const jid = msg.key.remoteJid
 
+      console.log(`[Debug] msg jid=${jid} isGroup=${isJidGroup(jid)} fromMe=${msg.key.fromMe} hasMsg=${!!msg.message}`)
       if (!isJidGroup(jid)) continue
       if (deniedJids.has(jid)) continue
       if (!msg.message) continue
-      if (msg.key.fromMe) continue // ignore messages sent by this account
+      // if (msg.key.fromMe) continue
 
       if (!allowedJids.has(jid)) {
+        console.log(`[Debug] JID not in allowedJids, resolving…`)
         await resolveJid(sock, jid)
       }
-      if (!allowedJids.has(jid)) continue
+      if (!allowedJids.has(jid)) { console.log(`[Debug] JID still not allowed, skipping`); continue }
 
       const text = extractText(msg.message)
+      console.log(`[Debug] text extracted: "${text}"`)
       if (!text || !text.trim()) continue
 
       const groupName = allowedJids.get(jid)
@@ -243,6 +246,7 @@ async function connectToWhatsApp() {
   })
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    console.log(`[Debug] messages.upsert type=${type} count=${messages.length}`)
     if (type !== 'notify') return
     await handleMessages(sock, messages)
   })

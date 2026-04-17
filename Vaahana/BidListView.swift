@@ -14,11 +14,14 @@ struct BidListView: View {
     let ride: Ride
 
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject var storage: RideStorage
     @State private var bids: [RideBid] = []
     @State private var isLoading = true
     @State private var isSelecting = false
     @State private var errorMessage: String?
     @State private var listenerReg: ListenerRegistration?
+    @State private var showingEditSheet = false
+    @State private var showingDeleteAlert = false
 
     private let db = Firestore.firestore()
 
@@ -44,9 +47,33 @@ struct BidListView: View {
             .navigationTitle("Driver Bids (\(activeBids.count))")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Menu {
+                        Button { showingEditSheet = true } label: {
+                            Label("Edit Request", systemImage: "pencil")
+                        }
+                        Button(role: .destructive) { showingDeleteAlert = true } label: {
+                            Label("Delete Request", systemImage: "trash")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
                 }
+            }
+            .sheet(isPresented: $showingEditSheet) {
+                PostRideSheet(editingRide: ride)
+            }
+            .alert("Delete Ride?", isPresented: $showingDeleteAlert) {
+                Button("Cancel", role: .cancel) { }
+                Button("Delete", role: .destructive) {
+                    storage.deleteRide(ride)
+                    dismiss()
+                }
+            } message: {
+                Text("This will permanently remove the ride request and all bids.")
             }
             .safeAreaInset(edge: .bottom) {
                 if let error = errorMessage {
