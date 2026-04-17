@@ -45,11 +45,14 @@
         <dict/>
     </dict>
 
-    <key>UIApplicationSupportsIndirectInputEvents</key>
-    <true/>
+	    <key>UIApplicationSupportsIndirectInputEvents</key>
+	    <true/>
 
-    <key>UILaunchScreen</key>
-    <dict/>
+	    <key>NSLocationWhenInUseUsageDescription</key>
+	    <string>Vaahana uses your location to set pickup points, show nearby rides, and help drivers navigate.</string>
+
+	    <key>UILaunchScreen</key>
+	    <dict/>
 
     <key>UISupportedInterfaceOrientations~iphone</key>
     <array>
