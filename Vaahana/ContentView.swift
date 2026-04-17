@@ -140,6 +140,9 @@ struct Ride: Identifiable, Codable, Equatable {
     var cancelledBy: String?
     var cancellationReasonCode: String?
 
+    // Optional notes from rider
+    var notes: String?
+
     // Bid marketplace summary (denormalized for quick display)
     var bidCount: Int
     var selectedBidId: String?
@@ -196,8 +199,9 @@ struct Ride: Identifiable, Codable, Equatable {
         pickupLng: Double? = nil,
         source: String? = "app",
         coins: Int,
-        hotDuration: Int = 5,
+        hotDuration: Int = 30,
         pickupDate: Date,
+        notes: String? = nil,
         status: RideStatus = .posted,
         createdAt: Date = Date()
     ) {
@@ -220,6 +224,7 @@ struct Ride: Identifiable, Codable, Equatable {
         self.coins = coins
         self.hotDuration = hotDuration
         self.pickupDate = pickupDate
+        self.notes = notes
         self.driverId = nil
         self.driverName = nil
         self.driverPhone = nil
@@ -273,6 +278,7 @@ struct Ride: Identifiable, Codable, Equatable {
         coins                  = (try? c.decodeIfPresent(Int.self, forKey: .coins))                    ?? 0
         hotDuration            = (try? c.decodeIfPresent(Int.self, forKey: .hotDuration))              ?? 5
         pickupDate             = (try? c.decodeIfPresent(Date.self, forKey: .pickupDate))              ?? Date()
+        notes                  = try? c.decodeIfPresent(String.self, forKey: .notes)
         driverId               = try? c.decodeIfPresent(String.self, forKey: .driverId)
         driverName             = try? c.decodeIfPresent(String.self, forKey: .driverName)
         driverPhone            = try? c.decodeIfPresent(String.self, forKey: .driverPhone)
@@ -493,14 +499,42 @@ class RideStorage: ObservableObject {
     }
 }
 
+// MARK: - Tab Selection
+
+enum MainTab: String, CaseIterable {
+    case rides = "Rides"
+    case map = "Map"
+    case switchRole = "Switch"
+    case settings = "Settings"
+
+    var icon: String {
+        switch self {
+        case .rides:      return "car.side.fill"
+        case .map:        return "map"
+        case .switchRole: return "arrow.triangle.2.circlepath"
+        case .settings:   return "gearshape"
+        }
+    }
+
+    var selectedIcon: String {
+        switch self {
+        case .rides:      return "car.side.fill"
+        case .map:        return "map.fill"
+        case .switchRole: return "arrow.triangle.2.circlepath"
+        case .settings:   return "gearshape.fill"
+        }
+    }
+}
+
 // MARK: - Main Content View
 
 struct ContentView: View {
     let role: UserRole
     @StateObject private var storage: RideStorage
     @EnvironmentObject var userState: UserState
-    @State private var showingProfile = false
-    @State private var showingAdmin   = false
+    @EnvironmentObject var locationService: LocationService
+    @State private var selectedTab: MainTab = .rides
+    @State private var showingAdmin = false
 
     init(role: UserRole) {
         self.role = role
@@ -508,49 +542,118 @@ struct ContentView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Header
-            HStack(alignment: .firstTextBaseline) {
-                Text("Vaahana")
-                    .font(.system(size: 48, weight: .black, design: .rounded))
-                Spacer()
-                if userState.isAdmin {
-                    Button { showingAdmin = true } label: {
-                        Image(systemName: "shield.lefthalf.filled")
-                            .font(.title2)
-                            .foregroundStyle(.orange)
-                    }
-                    .padding(.trailing, 6)
+        ZStack(alignment: .bottom) {
+            VStack(spacing: 0) {
+                // Header — hidden on map tab for full-screen experience
+                if selectedTab != .map {
+                    header
                 }
-                Button {
-                    showingProfile = true
-                } label: {
-                    Image(systemName: "person.circle.fill")
-                        .font(.title)
-                        .foregroundStyle(.primary)
-                }
-                .padding(.trailing)
-            }
-            .padding(.horizontal)
-            .padding(.top, 16)
-            .padding(.bottom, 8)
-            .background(Color(UIColor.systemBackground))
 
-            // Role-locked content
-            if role == .rider {
-                RiderView()
-            } else {
-                DriverView()
+                // Tab content
+                Group {
+                    switch selectedTab {
+                    case .rides:
+                        if role == .rider {
+                            RiderView()
+                        } else {
+                            DriverView()
+                        }
+                    case .map:
+                        MapTabView(role: role)
+                    case .switchRole:
+                        SwitchRoleTab()
+                    case .settings:
+                        SettingsTab()
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+
+            // Floating tab bar
+            floatingTabBar
+                .padding(.horizontal, 20)
+                .padding(.bottom, 6)
         }
         .background(Color(UIColor.systemGroupedBackground))
         .environmentObject(storage)
-        .sheet(isPresented: $showingProfile) {
-            ProfileView()
-        }
         .sheet(isPresented: $showingAdmin) {
             AdminView()
         }
+    }
+
+    private var header: some View {
+        HStack(alignment: .center) {
+            Text("Vaahana")
+                .font(.system(size: 28, weight: .bold, design: .rounded))
+            Spacer()
+            if userState.isAdmin {
+                Button { showingAdmin = true } label: {
+                    Image(systemName: "shield.lefthalf.filled")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.orange)
+                        .frame(width: 36, height: 36)
+                        .background(Color.orange.opacity(0.1))
+                        .clipShape(Circle())
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .padding(.bottom, 8)
+        .background(Color(UIColor.systemBackground))
+    }
+
+    // MARK: - Floating Tab Bar (Sixt-style)
+
+    private var visibleTabs: [MainTab] {
+        if role == .rider {
+            return MainTab.allCases.filter { $0 != .map }
+        }
+        return MainTab.allCases
+    }
+
+    private var floatingTabBar: some View {
+        HStack(spacing: 4) {
+            ForEach(visibleTabs, id: \.self) { tab in
+                let isSelected = selectedTab == tab
+                Button {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                        selectedTab = tab
+                    }
+                } label: {
+                    VStack(spacing: 3) {
+                        Image(systemName: isSelected ? tab.selectedIcon : tab.icon)
+                            .font(.system(size: 18, weight: isSelected ? .semibold : .regular))
+                            .symbolRenderingMode(.monochrome)
+                        Text(tab.rawValue)
+                            .font(.system(size: 10, weight: isSelected ? .bold : .medium))
+                    }
+                    .foregroundStyle(isSelected ? .white : Color(UIColor.secondaryLabel))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(
+                        Group {
+                            if isSelected {
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .fill(Color.blue)
+                            }
+                        }
+                    )
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(5)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(.ultraThinMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(Color(UIColor.separator).opacity(0.4), lineWidth: 0.5)
+        )
+        .shadow(color: .black.opacity(0.12), radius: 16, x: 0, y: 4)
     }
 }
 
@@ -573,66 +676,108 @@ struct RiderView: View {
     }
 
     var body: some View {
-        ZStack {
+        VStack(spacing: 0) {
             if storage.isLoading {
-                ProgressView("Loading...")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Spacer()
+                ProgressView()
+                Spacer()
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 12) {
-                        // Active ride banner (if any)
+                    LazyVStack(spacing: 10) {
+                        // Active ride banner
                         if let active = storage.activeRide {
                             activeRideBanner(active)
                         }
 
-                        // Posted (hot) requests
+                        // Posted rides
                         if postedRides.isEmpty && storage.activeRide == nil {
                             emptyState
                         } else {
+                            if !postedRides.isEmpty {
+                                HStack(alignment: .firstTextBaseline) {
+                                    Text("Active Requests")
+                                        .font(.title3).fontWeight(.bold)
+                                    Text("\(postedRides.count)")
+                                        .font(.subheadline).fontWeight(.semibold)
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                }
+                                .padding(.top, 4)
+                            }
+
                             ForEach(postedRides) { ride in
-                                RideCard(ride: ride, isDriverMode: false, onEdit: {
-                                    editingRide = ride
-                                }, onDelete: {
-                                    storage.deleteRide(ride)
-                                }, onViewBids: {
+                                CompactRideRow(ride: ride) {
                                     viewingBidsRide = ride
-                                })
+                                }
+                                .contextMenu {
+                                    Button { editingRide = ride } label: {
+                                        Label("Edit", systemImage: "pencil")
+                                    }
+                                    Button(role: .destructive) { storage.deleteRide(ride) } label: {
+                                        Label("Delete", systemImage: "trash")
+                                    }
+                                }
+                                .swipeActions(edge: .trailing) {
+                                    Button(role: .destructive) { storage.deleteRide(ride) } label: {
+                                        Label("Delete", systemImage: "trash")
+                                    }
+                                }
+                                .swipeActions(edge: .leading) {
+                                    Button { editingRide = ride } label: {
+                                        Label("Edit", systemImage: "pencil")
+                                    }
+                                    .tint(.blue)
+                                }
                             }
                         }
 
                         // Past rides section
                         if !pastRides.isEmpty {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Past Rides")
-                                    .font(.subheadline).fontWeight(.semibold)
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 4)
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack(alignment: .firstTextBaseline) {
+                                    Text("Past Rides")
+                                        .font(.title3).fontWeight(.bold)
+                                    Text("\(pastRides.count)")
+                                        .font(.subheadline).fontWeight(.semibold)
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                }
+                                .padding(.top, 8)
+
                                 ForEach(pastRides) { ride in
-                                    RideCard(ride: ride, isDriverMode: false, onEdit: nil, onDelete: nil)
+                                    CompactRideRow(ride: ride) {
+                                        // Past ride tap — no action needed
+                                    }
                                 }
                             }
                         }
                     }
-                    .padding()
-                    .padding(.bottom, 80)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    .padding(.bottom, 140)
                 }
             }
         }
-        .safeAreaInset(edge: .bottom) {
+        .background(Color(UIColor.systemGroupedBackground))
+        .overlay(alignment: .bottom) {
             if storage.activeRide == nil {
                 Button {
                     showingPostSheet = true
                 } label: {
-                    Text("+ Request a Ride")
-                        .font(.headline)
-                        .foregroundStyle(.white)
-                        .frame(maxWidth: .infinity)
-                        .padding()
-                        .background(Color.black)
-                        .cornerRadius(12)
+                    HStack(spacing: 8) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 15, weight: .bold))
+                        Text("Request a Ride")
+                            .font(.system(size: 16, weight: .semibold))
+                    }
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                    .background(Color.blue)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 }
-                .padding()
-                .background(Color(UIColor.systemGroupedBackground))
+                .padding(.horizontal, 20)
+                .padding(.bottom, 74)
             }
         }
         .sheet(isPresented: $showingPostSheet) { PostRideSheet() }
@@ -662,42 +807,49 @@ struct RiderView: View {
     private func activeRideBanner(_ ride: Ride) -> some View {
         Button { showingActiveRide = true } label: {
             HStack(spacing: 12) {
-                Image(systemName: "car.circle.fill")
-                    .font(.largeTitle)
-                    .foregroundStyle(.blue)
-                VStack(alignment: .leading, spacing: 4) {
+                ZStack {
+                    Circle().fill(Color.blue.opacity(0.12)).frame(width: 44, height: 44)
+                    Image(systemName: "car.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.blue)
+                }
+                VStack(alignment: .leading, spacing: 3) {
                     Text("Ride in Progress").font(.caption).foregroundStyle(.secondary)
                     Text(ride.status.riderDisplayText)
-                        .font(.headline).foregroundStyle(.blue)
+                        .font(.subheadline).fontWeight(.semibold).foregroundStyle(.blue)
                     Text("\(ride.from) → \(ride.to)")
                         .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer()
                 Image(systemName: "chevron.right")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.tertiary)
             }
-            .padding()
-            .background(Color.blue.opacity(0.08))
-            .cornerRadius(14)
-            .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.blue.opacity(0.3), lineWidth: 1))
+            .padding(14)
+            .background(Color.blue.opacity(0.06))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.blue.opacity(0.15)))
         }
         .buttonStyle(.plain)
     }
 
     private var emptyState: some View {
         VStack(spacing: 16) {
-            Text("🚗").font(.system(size: 72))
-            Text("No requests yet").font(.headline)
-            Text("Post your first ride request.\nDrivers nearby will reach out.")
+            Image(systemName: "car.2.fill")
+                .font(.system(size: 48))
+                .foregroundStyle(.quaternary)
+            Text("No ride requests yet")
+                .font(.headline)
+            Text("Post your first ride request and\nnearby drivers will reach out.")
                 .font(.subheadline).foregroundStyle(.secondary)
-                .multilineTextAlignment(.center).padding(.horizontal, 32)
+                .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 60)
     }
 }
 
-// MARK: - Driver View
+// MARK: - Driver Feed Tab
 
 private enum DriverFeedTab: String, CaseIterable, Identifiable {
     case all = "All"
@@ -706,42 +858,28 @@ private enum DriverFeedTab: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+// MARK: - Driver View (List-only)
+
 struct DriverView: View {
     @EnvironmentObject var storage: RideStorage
+    @EnvironmentObject private var locationService: LocationService
     @State private var selectedRide: Ride?
     @State private var isOnline = true
     @State private var showingActiveRide = false
     @State private var showingMyBids = false
     @State private var ratingRide: Ride?
     @State private var selectedFeedTab: DriverFeedTab = .all
-    @State private var cameraPosition: MapCameraPosition = .automatic
-    @State private var panelHeight: CGFloat = 0
-    @GestureState private var panelDragTranslation: CGFloat = 0
-    @EnvironmentObject private var locationService: LocationService
 
-    // Persisted filter settings
     @AppStorage("filterRadius") private var filterRadius = 5.0
     @AppStorage("driverCenterLat") private var driverCenterLat: Double = 0
     @AppStorage("driverCenterLon") private var driverCenterLon: Double = 0
     @AppStorage("driverCenterCustom") private var driverCenterCustom: Bool = false
 
-    var effectiveCenter: CLLocationCoordinate2D? {
+    private var effectiveCenter: CLLocationCoordinate2D? {
         if driverCenterCustom {
             return CLLocationCoordinate2D(latitude: driverCenterLat, longitude: driverCenterLon)
         }
         return locationService.location?.coordinate
-    }
-
-    var radiusMeters: CLLocationDistance { filterRadius * 1609.34 }
-
-    private var sourceFilteredRides: [Ride] {
-        let hot = storage.hotPostedRides
-        switch selectedFeedTab {
-        case .all:
-            return hot
-        case .whatsApp:
-            return hot.filter(\.isWhatsAppSource)
-        }
     }
 
     private var mapCenter: CLLocationCoordinate2D? {
@@ -751,24 +889,25 @@ struct DriverView: View {
         return effectiveCenter
     }
 
+    private var sourceFilteredRides: [Ride] {
+        let hot = storage.hotPostedRides
+        switch selectedFeedTab {
+        case .all:       return hot
+        case .whatsApp:  return hot.filter(\.isWhatsAppSource)
+        }
+    }
+
     var filteredRides: [(ride: Ride, distanceMiles: Double?)] {
         guard isOnline else { return [] }
         guard let center = mapCenter else {
-            if selectedFeedTab == .whatsApp {
-                return []
-            }
+            if selectedFeedTab == .whatsApp { return [] }
             return sourceFilteredRides.map { ($0, nil) }
         }
-
         let centerLoc = CLLocation(latitude: center.latitude, longitude: center.longitude)
         return sourceFilteredRides
             .compactMap { ride -> (ride: Ride, distanceMiles: Double?)? in
                 guard let lat = ride.pickupLat, let lng = ride.pickupLng else {
-                    // WhatsApp tab stays strictly location-based.
-                    if selectedFeedTab == .whatsApp {
-                        return nil
-                    }
-                    // No coords yet (geocoding pending) — show in list without distance.
+                    if selectedFeedTab == .whatsApp { return nil }
                     return (ride, nil)
                 }
                 let dist = centerLoc.distance(from: CLLocation(latitude: lat, longitude: lng)) / 1609.34
@@ -776,177 +915,158 @@ struct DriverView: View {
                 return (ride, dist)
             }
             .sorted {
-                // Rides with known coords come before unknown; among known, sort by distance
                 switch ($0.distanceMiles, $1.distanceMiles) {
                 case let (a?, b?): return a < b
-                case (_?, nil):   return true
-                case (nil, _?):   return false
-                default:          return $0.ride.hotUntil > $1.ride.hotUntil
+                case (_?, nil):    return true
+                case (nil, _?):    return false
+                default:           return $0.ride.hotUntil > $1.ride.hotUntil
                 }
             }
-    }
-    
-    private var locationKey: String {
-        if let loc = locationService.location {
-            return String(format: "%.6f,%.6f", loc.coordinate.latitude, loc.coordinate.longitude)
-        }
-        return ""
-    }
-
-    private var emptyStateMessage: String {
-        if selectedFeedTab == .whatsApp {
-            if locationService.location == nil {
-                return "Enable location to view nearby WhatsApp requests."
-            }
-            if sourceFilteredRides.isEmpty {
-                return "No WhatsApp requests right now."
-            }
-            return "No WhatsApp requests within \(Int(filterRadius)) mi of your current location."
-        }
-
-        if sourceFilteredRides.isEmpty {
-            return "No hot requests right now"
-        }
-        return "No hot requests within \(Int(filterRadius)) mi — expand radius or tap the map to move search area"
-    }
-
-    private func snappedPanelHeight(_ proposed: CGFloat, snapHeights: [CGFloat]) -> CGFloat {
-        guard let minHeight = snapHeights.min(), let maxHeight = snapHeights.max() else {
-            return proposed
-        }
-        let clamped = min(max(proposed, minHeight), maxHeight)
-        return snapHeights.min(by: { abs($0 - clamped) < abs($1 - clamped) }) ?? clamped
     }
 
     var body: some View {
-        GeometryReader { geo in
-            let snapHeights: [CGFloat] = [
-                geo.size.height * 0.38,
-                geo.size.height * 0.62,
-                geo.size.height * 0.86
-            ]
-            let minPanelHeight = snapHeights[0]
-            let maxPanelHeight = snapHeights[2]
-            let resolvedPanelHeight = panelHeight == 0 ? snapHeights[1] : panelHeight
-            let currentPanelHeight = min(max(resolvedPanelHeight + panelDragTranslation, minPanelHeight), maxPanelHeight)
-
-            ZStack(alignment: .bottom) {
-                // ── Map (fixed height for smooth sheet dragging) ──
-                MapReader { proxy in
-                    Map(position: $cameraPosition) {
-                        // Live location dot
-                        if let loc = locationService.location {
-                            Annotation("Me", coordinate: loc.coordinate) {
-                                ZStack {
-                                    Circle().fill(Color.blue.opacity(0.25)).frame(width: 36, height: 36)
-                                    Circle().fill(Color.blue).frame(width: 16, height: 16)
-                                    Circle().stroke(Color.white, lineWidth: 2.5).frame(width: 16, height: 16)
-                                }
-                                .shadow(color: .blue.opacity(0.4), radius: 6)
-                            }
+        VStack(spacing: 0) {
+            // Online toggle + feed picker
+            VStack(spacing: 0) {
+                HStack {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(isOnline ? Color.green : Color(UIColor.tertiaryLabel))
+                            .frame(width: 8, height: 8)
+                        Text(isOnline ? "Online" : "Offline")
+                            .font(.subheadline).fontWeight(.medium)
+                            .foregroundStyle(isOnline ? .primary : .secondary)
+                    }
+                    Spacer()
+                    Toggle("", isOn: $isOnline)
+                        .labelsHidden()
+                        .tint(.green)
+                        .onChange(of: isOnline) { _, online in
+                            guard let uid = Auth.auth().currentUser?.uid else { return }
+                            Firestore.firestore().collection("users").document(uid)
+                                .setData(["isAvailable": online], merge: true)
                         }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
 
-                        // Drive-radius circle overlay
-                        if let center = mapCenter {
-                            MapCircle(center: center, radius: radiusMeters)
-                                .foregroundStyle(Color.blue.opacity(0.1))
-                                .stroke(Color.blue, lineWidth: 2)
+                Picker("Feed", selection: $selectedFeedTab) {
+                    Text("All").tag(DriverFeedTab.all)
+                    Text("WhatsApp").tag(DriverFeedTab.whatsApp)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 12)
+            }
+            .background(Color(UIColor.systemBackground))
 
-                            // Custom-center pin
-                            if driverCenterCustom && selectedFeedTab == .all {
-                                Annotation("Drive Area", coordinate: center) {
+            // Content
+            if storage.isLoading {
+                Spacer()
+                ProgressView()
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 10) {
+                        // Active ride banner
+                        if let active = storage.activeRide {
+                            Button { showingActiveRide = true } label: {
+                                HStack(spacing: 12) {
                                     ZStack {
-                                        Circle().fill(Color.blue).frame(width: 34, height: 34)
-                                        Image(systemName: "scope")
-                                            .font(.system(size: 16, weight: .bold))
-                                            .foregroundStyle(.white)
+                                        Circle().fill(Color.blue.opacity(0.12)).frame(width: 44, height: 44)
+                                        Image(systemName: "car.fill")
+                                            .font(.system(size: 18, weight: .semibold))
+                                            .foregroundStyle(.blue)
                                     }
-                                    .shadow(radius: 4)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Active Ride").font(.caption).foregroundStyle(.secondary)
+                                        Text(active.status.driverDisplayText)
+                                            .font(.subheadline).fontWeight(.semibold).foregroundStyle(.blue)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundStyle(.tertiary)
+                                }
+                                .padding(14)
+                                .background(Color.blue.opacity(0.06))
+                                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.blue.opacity(0.15)))
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        // My Bids
+                        Button { showingMyBids = true } label: {
+                            HStack(spacing: 12) {
+                                ZStack {
+                                    Circle().fill(Color.purple.opacity(0.12)).frame(width: 44, height: 44)
+                                    Image(systemName: "list.bullet.rectangle.portrait")
+                                        .font(.system(size: 18, weight: .semibold))
+                                        .foregroundStyle(.purple)
+                                }
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("My Bids").font(.subheadline).fontWeight(.semibold)
+                                    Text("Track bids you've placed").font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .padding(14)
+                            .background(Color(UIColor.secondarySystemGroupedBackground))
+                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+
+                        // Section header
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(selectedFeedTab == .whatsApp ? "WhatsApp Requests" : "Hot Requests")
+                                .font(.title3).fontWeight(.bold)
+                            Text("\(filteredRides.count)")
+                                .font(.subheadline).fontWeight(.semibold)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                        .padding(.top, 4)
+
+                        // Rides
+                        if filteredRides.isEmpty {
+                            VStack(spacing: 12) {
+                                Image(systemName: sourceFilteredRides.isEmpty ? "car.2.fill" : "location.slash")
+                                    .font(.system(size: 36))
+                                    .foregroundStyle(.quaternary)
+                                Text(sourceFilteredRides.isEmpty
+                                     ? "No requests right now"
+                                     : "No requests within \(Int(filterRadius)) mi")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 48)
+                        } else {
+                            ForEach(filteredRides, id: \.ride.id) { item in
+                                CompactRideRow(ride: item.ride, distanceMiles: item.distanceMiles) {
+                                    selectedRide = item.ride
                                 }
                             }
                         }
-
-                        // Ride pins (using stored geocoded coords)
-                        ForEach(filteredRides, id: \.ride.id) { item in
-                            if let lat = item.ride.pickupLat, let lng = item.ride.pickupLng {
-                                Annotation(item.ride.from, coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lng)) {
-                                    rideAnnotationView(for: item.ride)
-                                }
-                            }
-                        }
                     }
-                    .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
-                    .mapControls {
-                        MapUserLocationButton()
-                        MapCompass()
-                    }
-                    .onTapGesture { screenPoint in
-                        guard selectedFeedTab == .all else { return }
-                        if let coord = proxy.convert(screenPoint, from: .local) {
-                            driverCenterLat = coord.latitude
-                            driverCenterLon = coord.longitude
-                            driverCenterCustom = true
-                            withAnimation {
-                                cameraPosition = .region(MKCoordinateRegion(
-                                    center: coord,
-                                    latitudinalMeters: radiusMeters * 3,
-                                    longitudinalMeters: radiusMeters * 3
-                                ))
-                            }
-                        }
-                    }
-                }
-                .frame(height: geo.size.height)
-
-                // ── Bottom control panel ──
-                controlPanel(minHeight: minPanelHeight, maxHeight: maxPanelHeight, snapHeights: snapHeights)
-                    .frame(height: maxPanelHeight)
-                    .offset(y: maxPanelHeight - currentPanelHeight)
-            }
-            .onAppear {
-                if panelHeight == 0 {
-                    panelHeight = snapHeights[1]
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    .padding(.bottom, 80)
                 }
             }
         }
-        .onChange(of: locationKey) { _ in
-            if selectedFeedTab == .whatsApp, let loc = locationService.location {
-                cameraPosition = .region(MKCoordinateRegion(
-                    center: loc.coordinate,
-                    latitudinalMeters: radiusMeters * 3,
-                    longitudinalMeters: radiusMeters * 3
-                ))
-                return
-            }
-
-            guard !driverCenterCustom, let loc = locationService.location else { return }
-            cameraPosition = .region(MKCoordinateRegion(
-                center: loc.coordinate,
-                latitudinalMeters: radiusMeters * 3,
-                longitudinalMeters: radiusMeters * 3
-            ))
-        }
-        .onChange(of: selectedFeedTab) { _, tab in
-            if tab == .whatsApp {
-                driverCenterCustom = false
-                if let loc = locationService.location {
-                    cameraPosition = .region(MKCoordinateRegion(
-                        center: loc.coordinate,
-                        latitudinalMeters: radiusMeters * 3,
-                        longitudinalMeters: radiusMeters * 3
-                    ))
-                }
-            }
-        }
+        .background(Color(UIColor.systemGroupedBackground))
         .sheet(item: $selectedRide) { ride in RideDetailSheet(ride: ride) }
         .sheet(isPresented: $showingActiveRide) {
             if let active = storage.activeRide {
                 ActiveRideView(ride: active, role: .driver)
             }
         }
-        .sheet(isPresented: $showingMyBids) {
-            DriverBidsView()
-        }
+        .sheet(isPresented: $showingMyBids) { DriverBidsView() }
         .sheet(item: $ratingRide) { ride in
             RatingView(ride: ride, raterRole: .driver, targetUid: ride.riderId)
                 .onDisappear {
@@ -960,243 +1080,6 @@ struct DriverView: View {
             if !UserDefaults.standard.bool(forKey: key) { ratingRide = ride }
         }
     }
-
-    // MARK: - Control Panel
-
-    private func controlPanel(minHeight: CGFloat, maxHeight: CGFloat, snapHeights: [CGFloat]) -> some View {
-        VStack(spacing: 0) {
-            // Handle
-            Capsule()
-                .fill(Color.secondary.opacity(0.4))
-                .frame(width: 36, height: 4)
-                .padding(.top, 10)
-                .padding(.bottom, 12)
-                .frame(maxWidth: .infinity, minHeight: 28)
-                .contentShape(Rectangle())
-                .gesture(
-                    DragGesture()
-                        .updating($panelDragTranslation) { value, state, _ in
-                            state = -value.translation.height
-                        }
-                        .onEnded { value in
-                            let projectedHeight = panelHeight - value.translation.height
-                            let snapped = snappedPanelHeight(projectedHeight, snapHeights: snapHeights)
-                            withAnimation(.interactiveSpring(response: 0.24, dampingFraction: 0.88)) {
-                                panelHeight = snapped
-                            }
-                        }
-                )
-
-            // Active ride banner
-            if let active = storage.activeRide {
-                Button { showingActiveRide = true } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: "car.circle.fill")
-                            .font(.title2).foregroundStyle(.blue)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Active Ride").font(.caption).foregroundStyle(.secondary)
-                            Text(active.status.driverDisplayText).font(.subheadline).fontWeight(.semibold).foregroundStyle(.blue)
-                        }
-                        Spacer()
-                        Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
-                    }
-                    .padding(.horizontal).padding(.vertical, 10)
-                    .background(Color.blue.opacity(0.08))
-                }
-                .buttonStyle(.plain)
-                Divider()
-            }
-
-            // My Bids shortcut
-            Button { showingMyBids = true } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: "list.bullet.rectangle.portrait.fill")
-                        .font(.title3).foregroundStyle(.purple)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("My Bids").font(.subheadline).fontWeight(.semibold)
-                        Text("Track bids you've placed").font(.caption2).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
-                }
-                .padding(.horizontal).padding(.vertical, 10)
-                .background(Color.purple.opacity(0.07))
-            }
-            .buttonStyle(.plain)
-            Divider()
-
-            // Online / Offline toggle
-            HStack {
-                Label(isOnline ? "Online" : "Offline", systemImage: isOnline ? "antenna.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash")
-                    .font(.subheadline).fontWeight(.semibold)
-                    .foregroundStyle(isOnline ? .green : .secondary)
-                Spacer()
-                Toggle("", isOn: $isOnline)
-                    .labelsHidden()
-                    .tint(.green)
-                    .onChange(of: isOnline) { _, online in
-                        guard let uid = Auth.auth().currentUser?.uid else { return }
-                        Firestore.firestore().collection("users").document(uid)
-                            .setData(["isAvailable": online], merge: true)
-                    }
-            }
-            .padding(.horizontal)
-            .padding(.vertical, 8)
-
-            Divider()
-
-            Picker("Feed", selection: $selectedFeedTab) {
-                Text("All").tag(DriverFeedTab.all)
-                Text("WhatsApp").tag(DriverFeedTab.whatsApp)
-            }
-            .pickerStyle(.segmented)
-            .padding(.horizontal)
-            .padding(.vertical, 8)
-
-            Divider()
-
-            // Location + radius
-            VStack(spacing: 10) {
-                HStack(spacing: 10) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 5) {
-                            Image(systemName: (driverCenterCustom && selectedFeedTab == .all) ? "mappin.circle.fill" : "location.fill")
-                                .foregroundStyle((driverCenterCustom && selectedFeedTab == .all) ? .orange : .blue)
-                            Text((driverCenterCustom && selectedFeedTab == .all) ? "Custom Location" : "Live Location")
-                                .font(.subheadline).fontWeight(.semibold)
-                        }
-                        Text(selectedFeedTab == .whatsApp
-                             ? "WhatsApp rides are filtered strictly from your current location"
-                             : (driverCenterCustom
-                                ? "Tap the map to move your search area"
-                                : "Tap anywhere on the map to pin a location"))
-                            .font(.caption2).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if driverCenterCustom && selectedFeedTab == .all {
-                        Button {
-                            driverCenterCustom = false
-                            if let loc = locationService.location {
-                                withAnimation {
-                                    cameraPosition = .region(MKCoordinateRegion(
-                                        center: loc.coordinate,
-                                        latitudinalMeters: radiusMeters * 3,
-                                        longitudinalMeters: radiusMeters * 3
-                                    ))
-                                }
-                            }
-                        } label: {
-                            Label("Live", systemImage: "location.fill")
-                                .font(.caption).fontWeight(.semibold)
-                                .padding(.horizontal, 10).padding(.vertical, 6)
-                                .background(Color.blue).foregroundStyle(.white)
-                                .cornerRadius(8)
-                        }
-                    }
-                }
-                .padding(.horizontal)
-
-                // Radius slider
-                VStack(spacing: 4) {
-                    HStack {
-                        Text("Search radius").font(.caption).foregroundStyle(.secondary)
-                        Spacer()
-                        Text("\(Int(filterRadius)) miles")
-                            .font(.caption).fontWeight(.semibold).foregroundStyle(.blue)
-                    }
-                    Slider(value: $filterRadius, in: 1...50, step: 1).tint(.blue)
-                }
-                .padding(.horizontal)
-            }
-
-            Divider().padding(.top, 8)
-
-            // Rides header
-            HStack {
-                Text(selectedFeedTab == .whatsApp ? "📲 WhatsApp Requests" : "🔥 Hot Requests")
-                    .font(.subheadline).fontWeight(.semibold)
-                Text("(\(filteredRides.count))").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-            }
-            .padding(.horizontal)
-            .padding(.vertical, 8)
-
-            // Rides list / empty state
-            if storage.isLoading {
-                ProgressView().frame(maxWidth: .infinity).padding()
-            } else if filteredRides.isEmpty {
-                VStack(spacing: 6) {
-                    Image(systemName: sourceFilteredRides.isEmpty ? "flame.slash" : "map.circle")
-                        .font(.title2).foregroundStyle(.secondary)
-                    Text(emptyStateMessage)
-                        .font(.subheadline).foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
-                .frame(maxWidth: .infinity).padding()
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 8) {
-                        ForEach(filteredRides, id: \.ride.id) { item in
-                            CompactRideRow(ride: item.ride, distanceMiles: item.distanceMiles) {
-                                selectedRide = item.ride
-                            }
-                        }
-                    }
-                    .padding(.vertical, 4)
-                }
-            }
-        }
-        .background(Color(UIColor.systemBackground))
-    }
-
-    // MARK: - Map Annotation
-
-    private func rideAnnotationView(for ride: Ride) -> some View {
-        // Heat: 1.0 = just posted (bright), 0.0 = about to expire (dim)
-        let heat = max(0, min(1, ride.hotUntil.timeIntervalSinceNow / Double(ride.hotDuration * 60)))
-        // Interpolate: hot=red/orange → cool=gray/blue
-        let pinColor = Color(
-            hue:        Double(0.08 - 0.08 * (1 - heat)),   // orange (0.08) → red (0.0)
-            saturation: Double(0.9),
-            brightness: Double(0.5 + 0.5 * heat)             // dim when cold
-        )
-        let size: CGFloat = 36 + 10 * heat                   // bigger when hotter
-
-        return Button { selectedRide = ride } label: {
-            ZStack {
-                Circle()
-                    .fill(pinColor)
-                    .frame(width: size, height: size)
-                    .shadow(color: pinColor.opacity(heat > 0.6 ? 0.7 : 0.2), radius: heat > 0.6 ? 8 : 3)
-                VStack(spacing: 1) {
-                    Image(systemName: "figure.wave")
-                        .font(.system(size: size * 0.3)).foregroundStyle(.white)
-                    if ride.coins > 0 {
-                        Text("🪙\(ride.coins)")
-                            .font(.system(size: 8, weight: .bold)).foregroundStyle(.white)
-                    }
-                }
-                if ride.isWhatsAppSource {
-                    VStack {
-                        HStack {
-                            Spacer()
-                            Text("WA")
-                                .font(.system(size: 7, weight: .bold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 4)
-                                .padding(.vertical, 2)
-                                .background(Color.green)
-                                .clipShape(Capsule())
-                                .offset(x: 6, y: -6)
-                        }
-                        Spacer()
-                    }
-                }
-            }
-        }
-        .buttonStyle(.plain)
-    }
-
 }
 
 // MARK: - Compact Ride Row
@@ -1211,94 +1094,85 @@ struct CompactRideRow: View {
             HStack(spacing: 12) {
                 // Distance badge
                 if let dist = distanceMiles {
-                    VStack(spacing: 1) {
+                    VStack(spacing: 2) {
                         Text(dist < 0.1 ? "<0.1" : String(format: dist < 10 ? "%.1f" : "%.0f", dist))
-                            .font(.system(size: 13, weight: .bold))
+                            .font(.system(size: 15, weight: .bold, design: .rounded))
                         Text("mi")
-                            .font(.system(size: 9))
+                            .font(.system(size: 9, weight: .medium))
                     }
                     .foregroundStyle(dist < 2 ? .green : dist < 10 ? .orange : .secondary)
-                    .frame(width: 36)
+                    .frame(width: 40, height: 40)
+                    .background((dist < 2 ? Color.green : dist < 10 ? Color.orange : Color.secondary).opacity(0.1))
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
 
-                // From -> To
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 4) {
+                // Content
+                VStack(alignment: .leading, spacing: 5) {
+                    // Route
+                    HStack(spacing: 5) {
                         Text(ride.from)
-                            .font(.subheadline)
-                            .fontWeight(.semibold)
+                            .font(.subheadline).fontWeight(.semibold)
                             .lineLimit(1)
                         Image(systemName: "arrow.right")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.tertiary)
                         Text(ride.to)
                             .font(.subheadline)
+                            .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
 
-                    HStack(spacing: 8) {
-                        Image(systemName: "calendar")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                        Text(ride.pickupDateShort)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    // Meta row
+                    HStack(spacing: 6) {
+                        Label(ride.pickupDateShort, systemImage: "calendar")
+                            .font(.caption).foregroundStyle(.secondary)
+
+                        if ride.miles > 0 {
+                            Text("·").foregroundStyle(.quaternary)
+                            Text(String(format: "%.1f mi", ride.miles))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }
 
-                    HStack(spacing: 8) {
-                        if ride.isWhatsAppSource, let distanceMiles {
-                            Text("\(distanceMiles < 0.1 ? "<0.1" : String(format: "%.1f", distanceMiles)) mi away")
-                                .font(.caption)
-                                .fontWeight(.semibold)
-                                .foregroundStyle(.blue)
-                            Text("•").foregroundStyle(.secondary)
-                        }
-                        if ride.miles > 0 {
-                            Text("\(String(format: "%.1f", ride.miles)) mi route")
-                                .font(.caption).foregroundStyle(.secondary)
-                            Text("•").foregroundStyle(.secondary)
-                        }
+                    // Tags row
+                    HStack(spacing: 6) {
                         if ride.isWhatsAppSource {
                             Text("WhatsApp")
-                                .font(.caption2)
-                                .fontWeight(.semibold)
+                                .font(.system(size: 9, weight: .bold))
                                 .foregroundStyle(.green)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.green.opacity(0.12))
+                                .padding(.horizontal, 6).padding(.vertical, 2.5)
+                                .background(Color.green.opacity(0.1))
                                 .clipShape(Capsule())
                         }
+
                         Text("🪙 \(ride.coins)")
-                            .font(.caption).fontWeight(.semibold).foregroundStyle(.orange)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.orange)
+
                         Spacer()
+
                         TimelineView(.periodic(from: .now, by: 1)) { ctx in
                             let rem = ride.hotUntil.timeIntervalSince(ctx.date)
                             if rem > 0 {
-                                Text("🔥 \(Int(rem/60)):\(String(format:"%02d", Int(rem)%60))")
-                                    .font(.caption2).foregroundStyle(.orange)
+                                Text("\(Int(rem/60)):\(String(format: "%02d", Int(rem) % 60))")
+                                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(.orange)
                             } else {
-                                Text("Expired").font(.caption2).foregroundStyle(.secondary)
+                                Text("Expired")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(.secondary)
                             }
                         }
                     }
                 }
-                
-                Spacer()
-                
-                // Status indicator
-                Circle()
-                    .fill(ride.status == .posted ? Color.black : Color.green)
-                    .frame(width: 8, height: 8)
-                
+
                 Image(systemName: "chevron.right")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.quaternary)
             }
-            .padding(.horizontal)
-            .padding(.vertical, 12)
+            .padding(12)
             .background(Color(UIColor.secondarySystemGroupedBackground))
-            .cornerRadius(10)
-            .padding(.horizontal)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .buttonStyle(.plain)
     }
@@ -1673,8 +1547,11 @@ struct PostRideSheet: View {
     @State private var showingDropoffPicker = false
 
     // Schedule
-    @State private var hotDuration = 5
+    @State private var hotDuration = 30
     @State private var pickupDate = Date()
+
+    // Notes
+    @State private var notes = ""
 
     // Contact
     @State private var name = ""
@@ -1799,11 +1676,25 @@ struct PostRideSheet: View {
 
                 // MARK: Hot duration
                 Section {
-                    Stepper("\(hotDuration) minutes", value: $hotDuration, in: 5...60, step: 5)
+                    Picker("Duration", selection: $hotDuration) {
+                        Text("30 minutes").tag(30)
+                        Text("1 hour").tag(60)
+                        Text("5 hours").tag(300)
+                        Text("1 day").tag(1440)
+                    }
+                    .pickerStyle(.menu)
                 } header: {
                     Text("Keep Request Active For")
                 } footer: {
-                    Text("Your request disappears from drivers after this time. Default is 5 minutes.")
+                    Text("Your request disappears from drivers after this time.")
+                }
+
+                // MARK: Notes
+                Section {
+                    TextField("Any special instructions for the driver…", text: $notes, axis: .vertical)
+                        .lineLimit(2...4)
+                } header: {
+                    Text("Notes (Optional)")
                 }
 
                 // MARK: Contact
@@ -1947,6 +1838,7 @@ struct PostRideSheet: View {
         coinsText = "\(ride.coins)"
         hotDuration = ride.hotDuration
         pickupDate = ride.pickupDate
+        notes = ride.notes ?? ""
         name = ride.name
         phoneCountryCode = ride.phoneCountryCode
         phone = ride.phone
@@ -1996,6 +1888,7 @@ struct PostRideSheet: View {
             updated.coins                = coins
             updated.hotDuration          = hotDuration
             updated.pickupDate           = pickupDate
+            updated.notes                = notes.isEmpty ? nil : notes
             if let coord = pickupResult?.coordinate {
                 updated.pickupLat = coord.latitude
                 updated.pickupLng = coord.longitude
@@ -2020,6 +1913,7 @@ struct PostRideSheet: View {
                 coins: coins,
                 hotDuration: hotDuration,
                 pickupDate: pickupDate,
+                notes: notes.isEmpty ? nil : notes,
                 status: .posted
             )
             storage.addRide(ride)
@@ -2435,6 +2329,697 @@ struct InfoChip: View {
             .padding(.vertical, 4)
             .background(color.opacity(0.15))
             .cornerRadius(12)
+    }
+}
+
+// MARK: - Map Tab View
+
+struct MapTabView: View {
+    let role: UserRole
+    @EnvironmentObject var storage: RideStorage
+    @EnvironmentObject var locationService: LocationService
+    @State private var cameraPosition: MapCameraPosition = .automatic
+    @State private var selectedRide: Ride?
+    @State private var showControls = true
+    @State private var selectedFeedTab: DriverFeedTab = .all
+
+    @AppStorage("filterRadius") private var filterRadius = 5.0
+    @AppStorage("driverCenterLat") private var driverCenterLat: Double = 0
+    @AppStorage("driverCenterLon") private var driverCenterLon: Double = 0
+    @AppStorage("driverCenterCustom") private var driverCenterCustom: Bool = false
+
+    private var radiusMeters: CLLocationDistance { filterRadius * 1609.34 }
+
+    private var mapCenter: CLLocationCoordinate2D? {
+        if role == .driver {
+            if selectedFeedTab == .whatsApp { return locationService.location?.coordinate }
+            if driverCenterCustom {
+                return CLLocationCoordinate2D(latitude: driverCenterLat, longitude: driverCenterLon)
+            }
+        }
+        return locationService.location?.coordinate
+    }
+
+    private var ridesForMap: [Ride] {
+        if role == .rider {
+            return storage.myRides.filter { !$0.status.isFinal && $0.pickupLat != nil && $0.pickupLng != nil }
+        }
+        let hot = selectedFeedTab == .whatsApp
+            ? storage.hotPostedRides.filter(\.isWhatsAppSource)
+            : storage.hotPostedRides
+        guard let center = mapCenter else { return hot }
+        let centerLoc = CLLocation(latitude: center.latitude, longitude: center.longitude)
+        return hot.filter { ride in
+            guard let lat = ride.pickupLat, let lng = ride.pickupLng else { return selectedFeedTab != .whatsApp }
+            return centerLoc.distance(from: CLLocation(latitude: lat, longitude: lng)) / 1609.34 <= filterRadius
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            // Full-screen map
+            MapReader { proxy in
+                Map(position: $cameraPosition) {
+                    // Live location
+                    if let loc = locationService.location {
+                        Annotation("Me", coordinate: loc.coordinate) {
+                            ZStack {
+                                Circle().fill(Color.blue.opacity(0.2)).frame(width: 40, height: 40)
+                                Circle().fill(Color.blue).frame(width: 14, height: 14)
+                                Circle().stroke(Color.white, lineWidth: 2.5).frame(width: 14, height: 14)
+                            }
+                            .shadow(color: .blue.opacity(0.35), radius: 8)
+                        }
+                    }
+
+                    // Radius circle (driver only)
+                    if role == .driver, let center = mapCenter {
+                        MapCircle(center: center, radius: radiusMeters)
+                            .foregroundStyle(Color.blue.opacity(0.08))
+                            .stroke(Color.blue.opacity(0.4), lineWidth: 1.5)
+
+                        if driverCenterCustom && selectedFeedTab == .all {
+                            Annotation("Search Center", coordinate: center) {
+                                ZStack {
+                                    Circle().fill(Color.blue).frame(width: 32, height: 32)
+                                    Image(systemName: "scope")
+                                        .font(.system(size: 14, weight: .bold))
+                                        .foregroundStyle(.white)
+                                }
+                                .shadow(color: .black.opacity(0.2), radius: 4)
+                            }
+                        }
+                    }
+
+                    // Ride pins
+                    ForEach(ridesForMap) { ride in
+                        if let lat = ride.pickupLat, let lng = ride.pickupLng {
+                            Annotation(ride.from, coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lng)) {
+                                mapPin(for: ride)
+                            }
+                        }
+                    }
+                }
+                .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
+                .mapControls {
+                    MapCompass()
+                }
+                .onTapGesture { screenPoint in
+                    guard role == .driver, selectedFeedTab == .all else { return }
+                    if let coord = proxy.convert(screenPoint, from: .local) {
+                        withAnimation(.spring(response: 0.3)) {
+                            driverCenterLat = coord.latitude
+                            driverCenterLon = coord.longitude
+                            driverCenterCustom = true
+                            cameraPosition = .region(MKCoordinateRegion(
+                                center: coord,
+                                latitudinalMeters: radiusMeters * 3,
+                                longitudinalMeters: radiusMeters * 3
+                            ))
+                        }
+                    }
+                }
+            }
+
+            // Overlays
+            VStack(spacing: 0) {
+                Spacer()
+
+                // Bottom control card
+                if role == .driver {
+                    driverControlCard
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                } else {
+                    riderInfoCard
+                }
+            }
+            .padding(.bottom, 8)
+
+            // Top-right buttons
+            VStack(spacing: 10) {
+                HStack {
+                    Spacer()
+                    VStack(spacing: 8) {
+                        // Re-center button
+                        Button {
+                            if let loc = locationService.location {
+                                driverCenterCustom = false
+                                withAnimation(.spring(response: 0.3)) {
+                                    cameraPosition = .region(MKCoordinateRegion(
+                                        center: loc.coordinate,
+                                        latitudinalMeters: role == .driver ? radiusMeters * 3 : 5000,
+                                        longitudinalMeters: role == .driver ? radiusMeters * 3 : 5000
+                                    ))
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "location.fill")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(.blue)
+                                .frame(width: 40, height: 40)
+                                .background(.ultraThickMaterial)
+                                .clipShape(Circle())
+                                .shadow(color: .black.opacity(0.1), radius: 4)
+                        }
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                Spacer()
+            }
+        }
+        .onAppear {
+            if let loc = locationService.location {
+                let center = (role == .driver && driverCenterCustom)
+                    ? CLLocationCoordinate2D(latitude: driverCenterLat, longitude: driverCenterLon)
+                    : loc.coordinate
+                cameraPosition = .region(MKCoordinateRegion(
+                    center: center,
+                    latitudinalMeters: role == .driver ? radiusMeters * 3 : 5000,
+                    longitudinalMeters: role == .driver ? radiusMeters * 3 : 5000
+                ))
+            }
+        }
+        .sheet(item: $selectedRide) { ride in
+            RideDetailSheet(ride: ride)
+        }
+    }
+
+    // MARK: - Driver Control Card
+
+    private var driverControlCard: some View {
+        VStack(spacing: 12) {
+            // Feed tabs
+            Picker("Feed", selection: $selectedFeedTab) {
+                Text("All").tag(DriverFeedTab.all)
+                Text("WhatsApp").tag(DriverFeedTab.whatsApp)
+            }
+            .pickerStyle(.segmented)
+
+            // Tap hint
+            if selectedFeedTab == .all {
+                HStack(spacing: 8) {
+                    Image(systemName: "hand.tap")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(.blue)
+                    Text("Tap anywhere on Map to select location")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            // Rides count
+            Text("\(ridesForMap.count) ride\(ridesForMap.count == 1 ? "" : "s") nearby")
+                .font(.caption).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            // Radius slider
+            VStack(spacing: 8) {
+                HStack {
+                    Text("Search Radius")
+                        .font(.subheadline).fontWeight(.medium)
+                    Spacer()
+                    Text("\(Int(filterRadius)) mi")
+                        .font(.system(.subheadline, design: .rounded)).fontWeight(.bold)
+                        .foregroundStyle(.blue)
+                        .padding(.horizontal, 10).padding(.vertical, 4)
+                        .background(Color.blue.opacity(0.1))
+                        .clipShape(Capsule())
+                }
+                Slider(value: $filterRadius, in: 1...50, step: 1)
+                    .tint(.blue)
+                    .onChange(of: filterRadius) { _, _ in
+                        if let center = mapCenter {
+                            withAnimation(.spring(response: 0.3)) {
+                                cameraPosition = .region(MKCoordinateRegion(
+                                    center: center,
+                                    latitudinalMeters: radiusMeters * 3,
+                                    longitudinalMeters: radiusMeters * 3
+                                ))
+                            }
+                        }
+                    }
+            }
+        }
+        .padding(16)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .shadow(color: .black.opacity(0.08), radius: 12, y: 4)
+        .padding(.horizontal, 12)
+    }
+
+    // MARK: - Rider Info Card
+
+    @ViewBuilder
+    private var riderInfoCard: some View {
+        let activeRides = storage.myRides.filter { !$0.status.isFinal }
+        if !activeRides.isEmpty {
+            VStack(spacing: 8) {
+                ForEach(activeRides) { ride in
+                    HStack(spacing: 12) {
+                        ZStack {
+                            Circle().fill(Color.blue.opacity(0.12)).frame(width: 36, height: 36)
+                            Image(systemName: "car.fill")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(.blue)
+                        }
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(ride.status.riderDisplayText)
+                                .font(.subheadline).fontWeight(.semibold)
+                            Text("\(ride.from) → \(ride.to)")
+                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        Spacer()
+                        StatusChip(status: ride.status)
+                    }
+                }
+            }
+            .padding(14)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .shadow(color: .black.opacity(0.08), radius: 8, y: 2)
+            .padding(.horizontal, 12)
+        }
+    }
+
+    // MARK: - Map Pin
+
+    private func mapPin(for ride: Ride) -> some View {
+        let heat = max(0, min(1, ride.hotUntil.timeIntervalSinceNow / Double(ride.hotDuration * 60)))
+        let pinColor = Color(
+            hue: Double(0.08 - 0.08 * (1 - heat)),
+            saturation: 0.9,
+            brightness: 0.5 + 0.5 * heat
+        )
+        let size: CGFloat = 34 + 10 * heat
+
+        return Button { selectedRide = ride } label: {
+            ZStack {
+                Circle()
+                    .fill(pinColor)
+                    .frame(width: size, height: size)
+                    .shadow(color: pinColor.opacity(heat > 0.6 ? 0.6 : 0.15), radius: heat > 0.6 ? 8 : 3)
+                VStack(spacing: 1) {
+                    Image(systemName: "figure.wave")
+                        .font(.system(size: size * 0.28)).foregroundStyle(.white)
+                    if ride.coins > 0 {
+                        Text("🪙\(ride.coins)")
+                            .font(.system(size: 7, weight: .bold)).foregroundStyle(.white)
+                    }
+                }
+                if ride.isWhatsAppSource {
+                    VStack {
+                        HStack {
+                            Spacer()
+                            Text("WA")
+                                .font(.system(size: 6, weight: .heavy))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 3)
+                                .padding(.vertical, 1.5)
+                                .background(Color.green)
+                                .clipShape(Capsule())
+                                .offset(x: 6, y: -6)
+                        }
+                        Spacer()
+                    }
+                }
+            }
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Switch Role Tab
+
+struct SwitchRoleTab: View {
+    @EnvironmentObject var userState: UserState
+    @State private var isSwitching = false
+    @State private var errorMessage: String?
+
+    private let db = Firestore.firestore()
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 32) {
+                Spacer().frame(height: 24)
+
+                // Current role badge
+                VStack(spacing: 16) {
+                    ZStack {
+                        Circle()
+                            .fill(userState.role == .driver
+                                  ? Color.black.opacity(0.08)
+                                  : Color.blue.opacity(0.1))
+                            .frame(width: 100, height: 100)
+                        Image(systemName: userState.role == .driver ? "car.fill" : "figure.wave")
+                            .font(.system(size: 40, weight: .medium))
+                            .foregroundStyle(userState.role == .driver ? Color.primary : Color.blue)
+                    }
+
+                    VStack(spacing: 4) {
+                        Text("Currently")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        Text(userState.role == .driver ? "Driver" : "Rider")
+                            .font(.system(size: 28, weight: .bold, design: .rounded))
+                    }
+                }
+
+                // Role options
+                VStack(spacing: 12) {
+                    roleOption(
+                        icon: "figure.wave",
+                        title: "Rider",
+                        description: "Post ride requests and let drivers bid to help you.",
+                        isActive: userState.role == .rider,
+                        color: .blue,
+                        onSelect: { switchRole(to: .rider) }
+                    )
+                    roleOption(
+                        icon: "car.fill",
+                        title: "Driver",
+                        description: "Browse nearby requests, place bids, and earn coins.",
+                        isActive: userState.role == .driver,
+                        color: .primary,
+                        onSelect: { switchRole(to: .driver) }
+                    )
+                }
+                .padding(.horizontal, 20)
+
+                if isSwitching {
+                    ProgressView()
+                }
+
+                if let error = errorMessage {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .padding(.horizontal)
+                }
+            }
+        }
+        .background(Color(UIColor.systemGroupedBackground))
+    }
+
+    private func roleOption(icon: String, title: String, description: String, isActive: Bool, color: Color, onSelect: @escaping () -> Void) -> some View {
+        Button(action: { if !isActive { onSelect() } }) {
+            HStack(spacing: 14) {
+                Image(systemName: icon)
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(isActive ? .white : color)
+                    .frame(width: 44, height: 44)
+                    .background(isActive ? Color.blue : Color.blue.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(title)
+                            .font(.body).fontWeight(.semibold)
+                            .foregroundStyle(.primary)
+                        if isActive {
+                            Text("Active")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 7).padding(.vertical, 2)
+                                .background(Color.green)
+                                .clipShape(Capsule())
+                        }
+                    }
+                    Text(description)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer()
+
+                if isActive {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.title3)
+                        .foregroundStyle(.blue)
+                } else {
+                    Image(systemName: "circle")
+                        .font(.title3)
+                        .foregroundStyle(.quaternary)
+                }
+            }
+            .padding(16)
+            .background(Color(UIColor.secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(isActive ? Color.blue.opacity(0.3) : Color.clear, lineWidth: 1.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(isSwitching)
+    }
+
+    private func switchRole(to newRole: UserRole) {
+        guard let uid = Auth.auth().currentUser?.uid else { return }
+        isSwitching = true
+        errorMessage = nil
+        Task {
+            do {
+                try await db.collection("users").document(uid).setData(["role": newRole.rawValue], merge: true)
+                await MainActor.run {
+                    userState.role = newRole
+                    isSwitching = false
+                }
+            } catch {
+                await MainActor.run {
+                    errorMessage = error.localizedDescription
+                    isSwitching = false
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Settings Tab
+
+struct SettingsTab: View {
+    @EnvironmentObject var userState: UserState
+    @State private var displayName = ""
+    @State private var phone = ""
+    @State private var whatsapp = ""
+    @State private var coins: Int = 0
+    @State private var ratingAverage: Double? = nil
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    // Driver vehicle info
+    @State private var vehicleMake  = ""
+    @State private var vehicleModel = ""
+    @State private var vehicleColor = ""
+    @State private var vehiclePlate = ""
+
+    @State private var showingHistory = false
+
+    private var currentUser: FirebaseAuth.User? { Auth.auth().currentUser }
+    private let db = Firestore.firestore()
+
+    private var initials: String {
+        let name = displayName.trimmingCharacters(in: .whitespaces)
+        if name.isEmpty {
+            return String(currentUser?.email?.prefix(2) ?? "?").uppercased()
+        }
+        let parts = name.split(separator: " ")
+        if parts.count >= 2 {
+            return String(parts[0].prefix(1) + parts[1].prefix(1)).uppercased()
+        }
+        return String(name.prefix(2)).uppercased()
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                // Avatar + email
+                Section {
+                    HStack {
+                        Spacer()
+                        VStack(spacing: 10) {
+                            Circle()
+                                .fill(Color.black)
+                                .frame(width: 72, height: 72)
+                                .overlay(
+                                    Text(initials)
+                                        .font(.system(size: 26, weight: .semibold))
+                                        .foregroundStyle(.white)
+                                )
+                            Text(currentUser?.email ?? "")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                    }
+                    .padding(.vertical, 8)
+                    .listRowBackground(Color.clear)
+                }
+
+                // Role + Coins
+                Section {
+                    HStack {
+                        Label(userState.role == .driver ? "Driver" : "Rider",
+                              systemImage: userState.role == .driver ? "car.fill" : "figure.wave")
+                        Spacer()
+                        Text("Role").font(.caption).foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Text("🪙 \(coins) coins")
+                        Spacer()
+                        Text("Balance").font(.caption).foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Account")
+                }
+
+                if let avg = ratingAverage {
+                    Section {
+                        HStack {
+                            Image(systemName: "star.fill").foregroundStyle(.yellow)
+                            Text(String(format: "%.1f", avg))
+                                .fontWeight(.semibold)
+                            Text("avg rating")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                Section("Profile") {
+                    TextField("Display Name", text: $displayName)
+                        .autocorrectionDisabled()
+                }
+
+                Section {
+                    TextField("Phone number", text: $phone)
+                        .keyboardType(.phonePad)
+                    TextField("WhatsApp number", text: $whatsapp)
+                        .keyboardType(.phonePad)
+                } header: {
+                    Text("Contact Numbers")
+                } footer: {
+                    Text("These will auto-fill when you post a ride request.")
+                }
+
+                if userState.role == .driver {
+                    Section {
+                        TextField("Make (e.g. Toyota)", text: $vehicleMake)
+                        TextField("Model (e.g. Camry)", text: $vehicleModel)
+                        TextField("Color", text: $vehicleColor)
+                        TextField("License Plate", text: $vehiclePlate)
+                            .autocapitalization(.allCharacters)
+                    } header: {
+                        Text("Vehicle")
+                    } footer: {
+                        Text("Shown to riders when you accept a ride.")
+                    }
+                }
+
+                if let error = errorMessage {
+                    Section {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                }
+
+                Section {
+                    NavigationLink {
+                        RideHistoryView(role: userState.role ?? .rider)
+                    } label: {
+                        Label("Ride History", systemImage: "clock.arrow.circlepath")
+                    }
+                }
+
+                Section {
+                    Button {
+                        save()
+                    } label: {
+                        HStack {
+                            Spacer()
+                            if isSaving {
+                                ProgressView()
+                            } else {
+                                Text("Save Changes")
+                                    .fontWeight(.semibold)
+                            }
+                            Spacer()
+                        }
+                    }
+                    .disabled(isSaving)
+                }
+
+                Section {
+                    Button(role: .destructive) {
+                        try? Auth.auth().signOut()
+                    } label: {
+                        Text("Sign Out")
+                            .frame(maxWidth: .infinity, alignment: .center)
+                    }
+                }
+            }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .task { await load() }
+    }
+
+    private func load() async {
+        guard let uid = currentUser?.uid else { return }
+        if let data = try? await db.collection("users").document(uid).getDocument().data() {
+            displayName  = data["displayName"] as? String ?? currentUser?.displayName ?? ""
+            phone        = data["phone"]       as? String ?? ""
+            whatsapp     = data["whatsapp"]    as? String ?? ""
+            coins        = data["coins"]       as? Int    ?? 0
+            vehicleMake  = data["vehicleMake"]  as? String ?? ""
+            vehicleModel = data["vehicleModel"] as? String ?? ""
+            vehicleColor = data["vehicleColor"] as? String ?? ""
+            vehiclePlate = data["vehiclePlate"] as? String ?? ""
+            let rSum   = data["ratingSum"]   as? Int ?? 0
+            let rCount = data["ratingCount"] as? Int ?? 0
+            ratingAverage = rCount > 0 ? Double(rSum) / Double(rCount) : nil
+        } else {
+            displayName = currentUser?.displayName ?? ""
+        }
+    }
+
+    private func save() {
+        isSaving = true
+        errorMessage = nil
+        Task {
+            do {
+                let trimmedName = displayName.trimmingCharacters(in: .whitespaces)
+                if let user = currentUser {
+                    let req = user.createProfileChangeRequest()
+                    req.displayName = trimmedName
+                    try await req.commitChanges()
+                }
+                if let uid = currentUser?.uid {
+                    var payload: [String: Any] = [
+                        "displayName": trimmedName,
+                        "phone":       phone,
+                        "whatsapp":    whatsapp,
+                    ]
+                    if userState.role == .driver {
+                        payload["vehicleMake"]  = vehicleMake
+                        payload["vehicleModel"] = vehicleModel
+                        payload["vehicleColor"] = vehicleColor
+                        payload["vehiclePlate"] = vehiclePlate
+                    }
+                    try await db.collection("users").document(uid).setData(payload, merge: true)
+                }
+                await MainActor.run {
+                    isSaving = false
+                }
+            } catch {
+                await MainActor.run {
+                    isSaving = false
+                    errorMessage = error.localizedDescription
+                }
+            }
+        }
     }
 }
 

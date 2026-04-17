@@ -380,6 +380,7 @@ struct VaahanaApp: App {
                     .background(Color(UIColor.systemGroupedBackground))
             } else if let role = userState.role {
                 ContentView(role: role)
+                    .id(role)
                     .environmentObject(userState)
                     .environmentObject(locationService)
                     .sheet(isPresented: $userState.showProfileSetup) {
