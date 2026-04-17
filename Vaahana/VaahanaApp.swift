@@ -364,6 +364,7 @@ struct VaahanaApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var userState = UserState()
     @StateObject private var locationService = LocationService()
+    @State private var showSplash = true
 
     init() {
         FirebaseApp.configure()
@@ -371,26 +372,64 @@ struct VaahanaApp: App {
 
     var body: some Scene {
         WindowGroup {
-            if !userState.isSignedIn {
-                AuthView()
-                    .environmentObject(locationService)
-            } else if userState.isLoadingRole {
-                ProgressView()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color(UIColor.systemGroupedBackground))
-            } else if let role = userState.role {
-                ContentView(role: role)
-                    .id(role)
-                    .environmentObject(userState)
-                    .environmentObject(locationService)
-                    .sheet(isPresented: $userState.showProfileSetup) {
-                        ProfileSetupView(userState: userState)
-                    }
-            } else {
-                RoleSelectionView { selectedRole in
-                    userState.role = selectedRole
+            ZStack {
+                mainContent
+                    .opacity(showSplash ? 0 : 1)
+
+                if showSplash {
+                    SplashScreenView()
+                        .transition(.opacity.combined(with: .scale(scale: 1.04)))
+                        .zIndex(1)
                 }
             }
+            .animation(.easeOut(duration: 0.5), value: showSplash)
+            .onAppear {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.85) {
+                    withAnimation(.easeOut(duration: 0.5)) {
+                        showSplash = false
+                    }
+                }
+            }
+        }
+    }
+    
+    @ViewBuilder
+    private var mainContent: some View {
+        if !userState.isSignedIn {
+            AuthView()
+                .environmentObject(locationService)
+        } else if userState.isLoadingRole {
+            ProgressView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(UIColor.systemGroupedBackground))
+        } else if let role = userState.role {
+            ContentView(role: role)
+                .id(role)
+                .environmentObject(userState)
+                .environmentObject(locationService)
+                .sheet(isPresented: $userState.showProfileSetup) {
+                    ProfileSetupView(userState: userState)
+                }
+        } else {
+            RoleSelectionView { selectedRole in
+                userState.role = selectedRole
+            }
+        }
+    }
+}
+
+// MARK: - Splash Screen
+
+struct SplashScreenView: View {
+    var body: some View {
+        ZStack {
+            Color.white
+                .ignoresSafeArea()
+            
+            Image("Vaahana Logo")
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: 300)
         }
     }
 }

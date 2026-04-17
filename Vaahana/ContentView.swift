@@ -509,7 +509,7 @@ enum MainTab: String, CaseIterable {
 
     var icon: String {
         switch self {
-        case .rides:      return "car.side.fill"
+        case .rides:      return "car.fill"
         case .map:        return "map"
         case .switchRole: return "arrow.triangle.2.circlepath"
         case .settings:   return "gearshape"
@@ -518,7 +518,7 @@ enum MainTab: String, CaseIterable {
 
     var selectedIcon: String {
         switch self {
-        case .rides:      return "car.side.fill"
+        case .rides:      return "car.fill"
         case .map:        return "map.fill"
         case .switchRole: return "arrow.triangle.2.circlepath"
         case .settings:   return "gearshape.fill"
@@ -571,8 +571,8 @@ struct ContentView: View {
 
             // Floating tab bar
             floatingTabBar
-                .padding(.horizontal, 20)
-                .padding(.bottom, 6)
+                .padding(.horizontal, 16)
+                .padding(.bottom, -10)
         }
         .background(Color(UIColor.systemGroupedBackground))
         .environmentObject(storage)
@@ -583,8 +583,10 @@ struct ContentView: View {
 
     private var header: some View {
         HStack(alignment: .center) {
-            Text("Vaahana")
-                .font(.system(size: 28, weight: .bold, design: .rounded))
+            Image("Vaahana Logo")
+                .resizable()
+                .scaledToFit()
+                .frame(height: 36)
             Spacer()
             if userState.isAdmin {
                 Button { showingAdmin = true } label: {
@@ -613,29 +615,29 @@ struct ContentView: View {
     }
 
     private var floatingTabBar: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 0) {
             ForEach(visibleTabs, id: \.self) { tab in
                 let isSelected = selectedTab == tab
                 Button {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
                         selectedTab = tab
                     }
                 } label: {
                     VStack(spacing: 3) {
                         Image(systemName: isSelected ? tab.selectedIcon : tab.icon)
-                            .font(.system(size: 18, weight: isSelected ? .semibold : .regular))
+                            .font(.system(size: 20, weight: .medium))
                             .symbolRenderingMode(.monochrome)
                         Text(tab.rawValue)
                             .font(.system(size: 10, weight: isSelected ? .bold : .medium))
                     }
-                    .foregroundStyle(isSelected ? .white : Color(UIColor.secondaryLabel))
+                    .foregroundStyle(isSelected ? Color.red : Color(UIColor.label))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 8)
                     .background(
                         Group {
                             if isSelected {
                                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                    .fill(Color.blue)
+                                    .fill(.white.opacity(0.6))
                             }
                         }
                     )
@@ -644,16 +646,8 @@ struct ContentView: View {
                 .buttonStyle(.plain)
             }
         }
-        .padding(5)
-        .background(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .fill(.ultraThinMaterial)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .stroke(Color(UIColor.separator).opacity(0.4), lineWidth: 0.5)
-        )
-        .shadow(color: .black.opacity(0.12), radius: 16, x: 0, y: 4)
+        .padding(4)
+        .glassEffect(in: .capsule)
     }
 }
 
@@ -667,8 +661,12 @@ struct RiderView: View {
     @State private var viewingBidsRide: Ride?
     @State private var ratingRide: Ride?
 
+    var expiredRides: [Ride] {
+        storage.myRides.filter { $0.status == .expired }
+    }
+
     var pastRides: [Ride] {
-        storage.myRides.filter { $0.status.isFinal }
+        storage.myRides.filter { $0.status == .completed || $0.status == .cancelled }
     }
 
     var postedRides: [Ride] {
@@ -731,6 +729,44 @@ struct RiderView: View {
                             }
                         }
 
+                        // Expired rides — re-post option
+                        if !expiredRides.isEmpty {
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack(alignment: .firstTextBaseline) {
+                                    Text("Expired")
+                                        .font(.title3).fontWeight(.bold)
+                                    Text("\(expiredRides.count)")
+                                        .font(.subheadline).fontWeight(.semibold)
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                }
+                                .padding(.top, 8)
+
+                                ForEach(expiredRides) { ride in
+                                    HStack(spacing: 0) {
+                                        CompactRideRow(ride: ride) { }
+                                        Button {
+                                            repostRide(ride)
+                                        } label: {
+                                            VStack(spacing: 3) {
+                                                Image(systemName: "arrow.clockwise")
+                                                    .font(.system(size: 14, weight: .semibold))
+                                                Text("Re-post")
+                                                    .font(.system(size: 10, weight: .medium))
+                                            }
+                                            .foregroundStyle(.blue)
+                                            .frame(width: 60)
+                                            .frame(maxHeight: .infinity)
+                                            .background(Color.blue.opacity(0.08))
+                                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                        }
+                                        .buttonStyle(.plain)
+                                        .padding(.leading, 6)
+                                    }
+                                }
+                            }
+                        }
+
                         // Past rides section
                         if !pastRides.isEmpty {
                             VStack(alignment: .leading, spacing: 10) {
@@ -754,7 +790,7 @@ struct RiderView: View {
                     }
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
-                    .padding(.bottom, 140)
+                    .padding(.bottom, 100)  // More space for floating tab bar
                 }
             }
         }
@@ -777,7 +813,7 @@ struct RiderView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 }
                 .padding(.horizontal, 20)
-                .padding(.bottom, 74)
+                .padding(.bottom, 84)  // More space for floating tab bar
             }
         }
         .sheet(isPresented: $showingPostSheet) { PostRideSheet() }
@@ -847,6 +883,23 @@ struct RiderView: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 60)
     }
+
+    private func repostRide(_ ride: Ride) {
+        var newRide = ride
+        newRide.id = UUID()
+        newRide.status = .posted
+        newRide.createdAt = Date()
+        newRide.hotDuration = ride.hotDuration
+        newRide.bidCount = 0
+        newRide.selectedBidId = nil
+        newRide.lowestBidCoins = nil
+        newRide.latestBidAt = nil
+        newRide.driverId = nil
+        newRide.driverName = nil
+        newRide.driverPhone = nil
+        newRide.driverWhatsapp = nil
+        storage.addRide(newRide)
+    }
 }
 
 // MARK: - Driver Feed Tab
@@ -864,50 +917,31 @@ struct DriverView: View {
     @EnvironmentObject var storage: RideStorage
     @EnvironmentObject private var locationService: LocationService
     @State private var selectedRide: Ride?
-    @State private var isOnline = true
     @State private var showingActiveRide = false
     @State private var showingMyBids = false
     @State private var ratingRide: Ride?
-    @State private var selectedFeedTab: DriverFeedTab = .all
 
     @AppStorage("filterRadius") private var filterRadius = 5.0
     @AppStorage("driverCenterLat") private var driverCenterLat: Double = 0
     @AppStorage("driverCenterLon") private var driverCenterLon: Double = 0
     @AppStorage("driverCenterCustom") private var driverCenterCustom: Bool = false
 
-    private var effectiveCenter: CLLocationCoordinate2D? {
+    private var mapCenter: CLLocationCoordinate2D? {
         if driverCenterCustom {
             return CLLocationCoordinate2D(latitude: driverCenterLat, longitude: driverCenterLon)
         }
         return locationService.location?.coordinate
     }
 
-    private var mapCenter: CLLocationCoordinate2D? {
-        if selectedFeedTab == .whatsApp {
-            return locationService.location?.coordinate
-        }
-        return effectiveCenter
-    }
-
-    private var sourceFilteredRides: [Ride] {
-        let hot = storage.hotPostedRides
-        switch selectedFeedTab {
-        case .all:       return hot
-        case .whatsApp:  return hot.filter(\.isWhatsAppSource)
-        }
-    }
-
     var filteredRides: [(ride: Ride, distanceMiles: Double?)] {
-        guard isOnline else { return [] }
+        let hot = storage.hotPostedRides
         guard let center = mapCenter else {
-            if selectedFeedTab == .whatsApp { return [] }
-            return sourceFilteredRides.map { ($0, nil) }
+            return hot.map { ($0, nil) }
         }
         let centerLoc = CLLocation(latitude: center.latitude, longitude: center.longitude)
-        return sourceFilteredRides
+        return hot
             .compactMap { ride -> (ride: Ride, distanceMiles: Double?)? in
                 guard let lat = ride.pickupLat, let lng = ride.pickupLng else {
-                    if selectedFeedTab == .whatsApp { return nil }
                     return (ride, nil)
                 }
                 let dist = centerLoc.distance(from: CLLocation(latitude: lat, longitude: lng)) / 1609.34
@@ -926,40 +960,6 @@ struct DriverView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Online toggle + feed picker
-            VStack(spacing: 0) {
-                HStack {
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(isOnline ? Color.green : Color(UIColor.tertiaryLabel))
-                            .frame(width: 8, height: 8)
-                        Text(isOnline ? "Online" : "Offline")
-                            .font(.subheadline).fontWeight(.medium)
-                            .foregroundStyle(isOnline ? .primary : .secondary)
-                    }
-                    Spacer()
-                    Toggle("", isOn: $isOnline)
-                        .labelsHidden()
-                        .tint(.green)
-                        .onChange(of: isOnline) { _, online in
-                            guard let uid = Auth.auth().currentUser?.uid else { return }
-                            Firestore.firestore().collection("users").document(uid)
-                                .setData(["isAvailable": online], merge: true)
-                        }
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-
-                Picker("Feed", selection: $selectedFeedTab) {
-                    Text("All").tag(DriverFeedTab.all)
-                    Text("WhatsApp").tag(DriverFeedTab.whatsApp)
-                }
-                .pickerStyle(.segmented)
-                .padding(.horizontal, 16)
-                .padding(.bottom, 12)
-            }
-            .background(Color(UIColor.systemBackground))
-
             // Content
             if storage.isLoading {
                 Spacer()
@@ -1022,7 +1022,7 @@ struct DriverView: View {
 
                         // Section header
                         HStack(alignment: .firstTextBaseline) {
-                            Text(selectedFeedTab == .whatsApp ? "WhatsApp Requests" : "Hot Requests")
+                            Text("Hot Requests")
                                 .font(.title3).fontWeight(.bold)
                             Text("\(filteredRides.count)")
                                 .font(.subheadline).fontWeight(.semibold)
@@ -1034,10 +1034,10 @@ struct DriverView: View {
                         // Rides
                         if filteredRides.isEmpty {
                             VStack(spacing: 12) {
-                                Image(systemName: sourceFilteredRides.isEmpty ? "car.2.fill" : "location.slash")
+                                Image(systemName: storage.hotPostedRides.isEmpty ? "car.2.fill" : "location.slash")
                                     .font(.system(size: 36))
                                     .foregroundStyle(.quaternary)
-                                Text(sourceFilteredRides.isEmpty
+                                Text(storage.hotPostedRides.isEmpty
                                      ? "No requests right now"
                                      : "No requests within \(Int(filterRadius)) mi")
                                     .font(.subheadline)
@@ -1055,7 +1055,7 @@ struct DriverView: View {
                     }
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
-                    .padding(.bottom, 80)
+                    .padding(.bottom, 100)  // More space for floating tab bar
                 }
             }
         }
@@ -2341,8 +2341,6 @@ struct MapTabView: View {
     @State private var cameraPosition: MapCameraPosition = .automatic
     @State private var selectedRide: Ride?
     @State private var showControls = true
-    @State private var selectedFeedTab: DriverFeedTab = .all
-
     @AppStorage("filterRadius") private var filterRadius = 5.0
     @AppStorage("driverCenterLat") private var driverCenterLat: Double = 0
     @AppStorage("driverCenterLon") private var driverCenterLon: Double = 0
@@ -2351,11 +2349,8 @@ struct MapTabView: View {
     private var radiusMeters: CLLocationDistance { filterRadius * 1609.34 }
 
     private var mapCenter: CLLocationCoordinate2D? {
-        if role == .driver {
-            if selectedFeedTab == .whatsApp { return locationService.location?.coordinate }
-            if driverCenterCustom {
-                return CLLocationCoordinate2D(latitude: driverCenterLat, longitude: driverCenterLon)
-            }
+        if role == .driver && driverCenterCustom {
+            return CLLocationCoordinate2D(latitude: driverCenterLat, longitude: driverCenterLon)
         }
         return locationService.location?.coordinate
     }
@@ -2364,13 +2359,11 @@ struct MapTabView: View {
         if role == .rider {
             return storage.myRides.filter { !$0.status.isFinal && $0.pickupLat != nil && $0.pickupLng != nil }
         }
-        let hot = selectedFeedTab == .whatsApp
-            ? storage.hotPostedRides.filter(\.isWhatsAppSource)
-            : storage.hotPostedRides
+        let hot = storage.hotPostedRides
         guard let center = mapCenter else { return hot }
         let centerLoc = CLLocation(latitude: center.latitude, longitude: center.longitude)
         return hot.filter { ride in
-            guard let lat = ride.pickupLat, let lng = ride.pickupLng else { return selectedFeedTab != .whatsApp }
+            guard let lat = ride.pickupLat, let lng = ride.pickupLng else { return true }
             return centerLoc.distance(from: CLLocation(latitude: lat, longitude: lng)) / 1609.34 <= filterRadius
         }
     }
@@ -2398,7 +2391,7 @@ struct MapTabView: View {
                             .foregroundStyle(Color.blue.opacity(0.08))
                             .stroke(Color.blue.opacity(0.4), lineWidth: 1.5)
 
-                        if driverCenterCustom && selectedFeedTab == .all {
+                        if driverCenterCustom {
                             Annotation("Search Center", coordinate: center) {
                                 ZStack {
                                     Circle().fill(Color.blue).frame(width: 32, height: 32)
@@ -2425,7 +2418,7 @@ struct MapTabView: View {
                     MapCompass()
                 }
                 .onTapGesture { screenPoint in
-                    guard role == .driver, selectedFeedTab == .all else { return }
+                    guard role == .driver else { return }
                     if let coord = proxy.convert(screenPoint, from: .local) {
                         withAnimation(.spring(response: 0.3)) {
                             driverCenterLat = coord.latitude
@@ -2462,16 +2455,7 @@ struct MapTabView: View {
                     VStack(spacing: 8) {
                         // Re-center button
                         Button {
-                            if let loc = locationService.location {
-                                driverCenterCustom = false
-                                withAnimation(.spring(response: 0.3)) {
-                                    cameraPosition = .region(MKCoordinateRegion(
-                                        center: loc.coordinate,
-                                        latitudinalMeters: role == .driver ? radiusMeters * 3 : 5000,
-                                        longitudinalMeters: role == .driver ? radiusMeters * 3 : 5000
-                                    ))
-                                }
-                            }
+                            recenterMap()
                         } label: {
                             Image(systemName: "location.fill")
                                 .font(.system(size: 16, weight: .semibold))
@@ -2489,64 +2473,62 @@ struct MapTabView: View {
             }
         }
         .onAppear {
-            if let loc = locationService.location {
-                let center = (role == .driver && driverCenterCustom)
-                    ? CLLocationCoordinate2D(latitude: driverCenterLat, longitude: driverCenterLon)
-                    : loc.coordinate
-                cameraPosition = .region(MKCoordinateRegion(
-                    center: center,
-                    latitudinalMeters: role == .driver ? radiusMeters * 3 : 5000,
-                    longitudinalMeters: role == .driver ? radiusMeters * 3 : 5000
-                ))
-            }
+            recenterMapOnAppear()
         }
         .sheet(item: $selectedRide) { ride in
             RideDetailSheet(ride: ride)
+        }
+    }
+    
+    // MARK: - Helper Methods
+    
+    private func recenterMap() {
+        if let loc = locationService.location {
+            driverCenterCustom = false
+            withAnimation(.spring(response: 0.3)) {
+                let meters = role == .driver ? radiusMeters * 3 : 5000.0
+                cameraPosition = .region(MKCoordinateRegion(
+                    center: loc.coordinate,
+                    latitudinalMeters: meters,
+                    longitudinalMeters: meters
+                ))
+            }
+        }
+    }
+    
+    private func recenterMapOnAppear() {
+        if let loc = locationService.location {
+            let center = (role == .driver && driverCenterCustom)
+                ? CLLocationCoordinate2D(latitude: driverCenterLat, longitude: driverCenterLon)
+                : loc.coordinate
+            let meters = role == .driver ? radiusMeters * 3 : 5000.0
+            cameraPosition = .region(MKCoordinateRegion(
+                center: center,
+                latitudinalMeters: meters,
+                longitudinalMeters: meters
+            ))
         }
     }
 
     // MARK: - Driver Control Card
 
     private var driverControlCard: some View {
-        VStack(spacing: 12) {
-            // Feed tabs
-            Picker("Feed", selection: $selectedFeedTab) {
-                Text("All").tag(DriverFeedTab.all)
-                Text("WhatsApp").tag(DriverFeedTab.whatsApp)
-            }
-            .pickerStyle(.segmented)
-
-            // Tap hint
-            if selectedFeedTab == .all {
-                HStack(spacing: 8) {
-                    Image(systemName: "hand.tap")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(.blue)
-                    Text("Tap anywhere on Map to select location")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "hand.tap")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.blue)
+                Text("Tap map to set location")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(ridesForMap.count) ride\(ridesForMap.count == 1 ? "" : "s")")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
-            // Rides count
-            Text("\(ridesForMap.count) ride\(ridesForMap.count == 1 ? "" : "s") nearby")
-                .font(.caption).foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            // Radius slider
-            VStack(spacing: 8) {
-                HStack {
-                    Text("Search Radius")
-                        .font(.subheadline).fontWeight(.medium)
-                    Spacer()
-                    Text("\(Int(filterRadius)) mi")
-                        .font(.system(.subheadline, design: .rounded)).fontWeight(.bold)
-                        .foregroundStyle(.blue)
-                        .padding(.horizontal, 10).padding(.vertical, 4)
-                        .background(Color.blue.opacity(0.1))
-                        .clipShape(Capsule())
-                }
+            HStack(spacing: 10) {
+                Text("Radius")
+                    .font(.caption).foregroundStyle(.secondary)
                 Slider(value: $filterRadius, in: 1...50, step: 1)
                     .tint(.blue)
                     .onChange(of: filterRadius) { _, _ in
@@ -2560,13 +2542,17 @@ struct MapTabView: View {
                             }
                         }
                     }
+                Text("\(Int(filterRadius)) mi")
+                    .font(.system(.caption, design: .rounded)).fontWeight(.bold)
+                    .foregroundStyle(.blue)
+                    .frame(width: 36, alignment: .trailing)
             }
         }
-        .padding(16)
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .shadow(color: .black.opacity(0.08), radius: 12, y: 4)
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .glassEffect(in: .rect(cornerRadius: 16))
+        .padding(.horizontal, 16)
+        .padding(.bottom, 56)
     }
 
     // MARK: - Rider Info Card
@@ -2600,6 +2586,7 @@ struct MapTabView: View {
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             .shadow(color: .black.opacity(0.08), radius: 8, y: 2)
             .padding(.horizontal, 12)
+            .padding(.bottom, 80)  // Space for floating tab bar
         }
     }
 
@@ -2816,6 +2803,8 @@ struct SettingsTab: View {
     @State private var vehiclePlate = ""
 
     @State private var showingHistory = false
+    @State private var showingSaveConfirmation = false
+    @State private var isOnline = true
 
     private var currentUser: FirebaseAuth.User? { Auth.auth().currentUser }
     private let db = Firestore.firestore()
@@ -2831,108 +2820,168 @@ struct SettingsTab: View {
         }
         return String(name.prefix(2)).uppercased()
     }
+    
+    private var hasChanges: Bool {
+        // Compare with initial values loaded from Firestore
+        return !isSaving
+    }
 
     var body: some View {
         NavigationStack {
-            Form {
-                // Avatar + email
+            List {
+                // MARK: - Profile Header
                 Section {
-                    HStack {
-                        Spacer()
-                        VStack(spacing: 10) {
-                            Circle()
-                                .fill(Color.black)
-                                .frame(width: 72, height: 72)
-                                .overlay(
-                                    Text(initials)
-                                        .font(.system(size: 26, weight: .semibold))
-                                        .foregroundStyle(.white)
-                                )
+                    HStack(spacing: 14) {
+                        Circle()
+                            .fill(Color.blue.gradient)
+                            .frame(width: 56, height: 56)
+                            .overlay(
+                                Text(initials)
+                                    .font(.system(size: 20, weight: .semibold))
+                                    .foregroundStyle(.white)
+                            )
+
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(displayName.isEmpty ? "User" : displayName)
+                                .font(.headline)
                             Text(currentUser?.email ?? "")
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
+                            HStack(spacing: 12) {
+                                Label(userState.role == .driver ? "Driver" : "Rider",
+                                      systemImage: userState.role == .driver ? "car.fill" : "figure.wave")
+                                    .font(.caption).foregroundStyle(.blue)
+                                Label("🪙 \(coins)", systemImage: "")
+                                    .font(.caption).fontWeight(.semibold).foregroundStyle(.orange)
+                                if let avg = ratingAverage {
+                                    HStack(spacing: 2) {
+                                        Image(systemName: "star.fill")
+                                            .font(.system(size: 10)).foregroundStyle(.yellow)
+                                        Text(String(format: "%.1f", avg))
+                                            .font(.caption).fontWeight(.semibold)
+                                    }
+                                }
+                            }
+                            .padding(.top, 2)
                         }
                         Spacer()
                     }
-                    .padding(.vertical, 8)
-                    .listRowBackground(Color.clear)
                 }
-
-                // Role + Coins
+                
+                // MARK: - Personal Information
                 Section {
                     HStack {
-                        Label(userState.role == .driver ? "Driver" : "Rider",
-                              systemImage: userState.role == .driver ? "car.fill" : "figure.wave")
-                        Spacer()
-                        Text("Role").font(.caption).foregroundStyle(.secondary)
+                        Label("Name", systemImage: "person.fill")
+                            .frame(width: 100, alignment: .leading)
+                        TextField("Full Name", text: $displayName)
+                            .multilineTextAlignment(.trailing)
                     }
+                    
                     HStack {
-                        Text("🪙 \(coins) coins")
-                        Spacer()
-                        Text("Balance").font(.caption).foregroundStyle(.secondary)
+                        Label("Phone", systemImage: "phone.fill")
+                            .frame(width: 100, alignment: .leading)
+                        TextField("Phone Number", text: $phone)
+                            .keyboardType(.phonePad)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    
+                    HStack {
+                        Label("WhatsApp", systemImage: "message.fill")
+                            .frame(width: 100, alignment: .leading)
+                        TextField("WhatsApp Number", text: $whatsapp)
+                            .keyboardType(.phonePad)
+                            .multilineTextAlignment(.trailing)
                     }
                 } header: {
-                    Text("Account")
-                }
-
-                if let avg = ratingAverage {
-                    Section {
-                        HStack {
-                            Image(systemName: "star.fill").foregroundStyle(.yellow)
-                            Text(String(format: "%.1f", avg))
-                                .fontWeight(.semibold)
-                            Text("avg rating")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-
-                Section("Profile") {
-                    TextField("Display Name", text: $displayName)
-                        .autocorrectionDisabled()
-                }
-
-                Section {
-                    TextField("Phone number", text: $phone)
-                        .keyboardType(.phonePad)
-                    TextField("WhatsApp number", text: $whatsapp)
-                        .keyboardType(.phonePad)
-                } header: {
-                    Text("Contact Numbers")
+                    Text("Personal Information")
                 } footer: {
-                    Text("These will auto-fill when you post a ride request.")
+                    Text("These details will be used to auto-fill ride requests")
                 }
-
+                
+                // MARK: - Online Status (Driver only)
                 if userState.role == .driver {
                     Section {
-                        TextField("Make (e.g. Toyota)", text: $vehicleMake)
-                        TextField("Model (e.g. Camry)", text: $vehicleModel)
-                        TextField("Color", text: $vehicleColor)
-                        TextField("License Plate", text: $vehiclePlate)
-                            .autocapitalization(.allCharacters)
+                        Toggle(isOn: $isOnline) {
+                            Label {
+                                Text(isOnline ? "Online" : "Offline")
+                            } icon: {
+                                Circle()
+                                    .fill(isOnline ? Color.green : Color(UIColor.tertiaryLabel))
+                                    .frame(width: 10, height: 10)
+                            }
+                        }
+                        .tint(.green)
+                        .onChange(of: isOnline) { _, online in
+                            guard let uid = Auth.auth().currentUser?.uid else { return }
+                            Firestore.firestore().collection("users").document(uid)
+                                .setData(["isAvailable": online], merge: true)
+                        }
                     } header: {
-                        Text("Vehicle")
+                        Text("Availability")
                     } footer: {
-                        Text("Shown to riders when you accept a ride.")
+                        Text("When offline, you won't see new ride requests")
                     }
                 }
 
-                if let error = errorMessage {
+                // MARK: - Vehicle Information (Driver only)
+                if userState.role == .driver {
                     Section {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundStyle(.red)
+                        HStack {
+                            Label("Make", systemImage: "car.fill")
+                                .frame(width: 100, alignment: .leading)
+                            TextField("e.g. Toyota", text: $vehicleMake)
+                                .multilineTextAlignment(.trailing)
+                        }
+                        
+                        HStack {
+                            Label("Model", systemImage: "car.fill")
+                                .frame(width: 100, alignment: .leading)
+                            TextField("e.g. Camry", text: $vehicleModel)
+                                .multilineTextAlignment(.trailing)
+                        }
+                        
+                        HStack {
+                            Label("Color", systemImage: "paintpalette.fill")
+                                .frame(width: 100, alignment: .leading)
+                            TextField("Vehicle Color", text: $vehicleColor)
+                                .multilineTextAlignment(.trailing)
+                        }
+                        
+                        HStack {
+                            Label("Plate", systemImage: "number.circle.fill")
+                                .frame(width: 100, alignment: .leading)
+                            TextField("License Plate", text: $vehiclePlate)
+                                .autocapitalization(.allCharacters)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    } header: {
+                        Text("Vehicle Information")
+                    } footer: {
+                        Text("Shown to riders when you accept a ride")
                     }
                 }
-
+                
+                // MARK: - History
                 Section {
                     NavigationLink {
                         RideHistoryView(role: userState.role ?? .rider)
                     } label: {
                         Label("Ride History", systemImage: "clock.arrow.circlepath")
                     }
+                } header: {
+                    Text("Activity")
                 }
-
+                
+                // MARK: - Error Message
+                if let error = errorMessage {
+                    Section {
+                        Text(error)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                }
+                
+                // MARK: - Save Button
                 Section {
                     Button {
                         save()
@@ -2950,18 +2999,28 @@ struct SettingsTab: View {
                     }
                     .disabled(isSaving)
                 }
-
+                
+                // MARK: - Sign Out
                 Section {
                     Button(role: .destructive) {
                         try? Auth.auth().signOut()
                     } label: {
-                        Text("Sign Out")
-                            .frame(maxWidth: .infinity, alignment: .center)
+                        HStack {
+                            Spacer()
+                            Text("Sign Out")
+                            Spacer()
+                        }
                     }
                 }
             }
+            .contentMargins(.bottom, 80)
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
+            .alert("Changes Saved", isPresented: $showingSaveConfirmation) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text("Your profile has been updated successfully")
+            }
         }
         .task { await load() }
     }
@@ -2969,19 +3028,24 @@ struct SettingsTab: View {
     private func load() async {
         guard let uid = currentUser?.uid else { return }
         if let data = try? await db.collection("users").document(uid).getDocument().data() {
-            displayName  = data["displayName"] as? String ?? currentUser?.displayName ?? ""
-            phone        = data["phone"]       as? String ?? ""
-            whatsapp     = data["whatsapp"]    as? String ?? ""
-            coins        = data["coins"]       as? Int    ?? 0
-            vehicleMake  = data["vehicleMake"]  as? String ?? ""
-            vehicleModel = data["vehicleModel"] as? String ?? ""
-            vehicleColor = data["vehicleColor"] as? String ?? ""
-            vehiclePlate = data["vehiclePlate"] as? String ?? ""
-            let rSum   = data["ratingSum"]   as? Int ?? 0
-            let rCount = data["ratingCount"] as? Int ?? 0
-            ratingAverage = rCount > 0 ? Double(rSum) / Double(rCount) : nil
+            await MainActor.run {
+                displayName  = data["displayName"] as? String ?? currentUser?.displayName ?? ""
+                phone        = data["phone"]       as? String ?? ""
+                whatsapp     = data["whatsapp"]    as? String ?? ""
+                coins        = data["coins"]       as? Int    ?? 0
+                vehicleMake  = data["vehicleMake"]  as? String ?? ""
+                vehicleModel = data["vehicleModel"] as? String ?? ""
+                vehicleColor = data["vehicleColor"] as? String ?? ""
+                vehiclePlate = data["vehiclePlate"] as? String ?? ""
+                isOnline     = data["isAvailable"] as? Bool ?? true
+                let rSum   = data["ratingSum"]   as? Int ?? 0
+                let rCount = data["ratingCount"] as? Int ?? 0
+                ratingAverage = rCount > 0 ? Double(rSum) / Double(rCount) : nil
+            }
         } else {
-            displayName = currentUser?.displayName ?? ""
+            await MainActor.run {
+                displayName = currentUser?.displayName ?? ""
+            }
         }
     }
 
@@ -3012,6 +3076,7 @@ struct SettingsTab: View {
                 }
                 await MainActor.run {
                     isSaving = false
+                    showingSaveConfirmation = true
                 }
             } catch {
                 await MainActor.run {
