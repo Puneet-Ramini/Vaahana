@@ -114,12 +114,13 @@ class UserState: ObservableObject {
                 guard let self else { return }
                 let data = doc?.data()
 
-                // Resolve role
+                // Resolve role — default to rider for V1
                 if let rawRole = data?["role"] as? String,
                    let role = UserRole(rawValue: rawRole) {
                     self.role = role
                 } else {
-                    self.role = nil
+                    self.role = .rider
+                    self.db.collection("users").document(uid).setData(["role": "rider"], merge: true)
                 }
 
                 // Cache profile fields and decide if setup sheet is needed
@@ -192,9 +193,11 @@ class LocationService: NSObject, ObservableObject, CLLocationManagerDelegate {
         manager.desiredAccuracy = kCLLocationAccuracyBest
         authorizationStatus = manager.authorizationStatus
 
-        // Keep legacy app behavior: ask early so map-based screens can center quickly.
+        // Request Always authorization so iOS shows all three options:
+        // "Allow Always" / "Allow While Using App" / "Don't Allow"
+        // Requires NSLocationAlwaysAndWhenInUseUsageDescription in Info.plist.
         if authorizationStatus == .notDetermined {
-            manager.requestWhenInUseAuthorization()
+            manager.requestAlwaysAuthorization()
         } else if authorizationStatus == .authorizedWhenInUse || authorizationStatus == .authorizedAlways {
             manager.startUpdatingLocation()
         }
@@ -255,6 +258,16 @@ class LocationService: NSObject, ObservableObject, CLLocationManagerDelegate {
         manager.requestWhenInUseAuthorization()
     }
 
+    /// Ensure location updates are running (safe to call multiple times)
+    func startUpdatingIfAuthorized() {
+        let status = manager.authorizationStatus
+        if status == .authorizedWhenInUse || status == .authorizedAlways {
+            manager.startUpdatingLocation()
+        } else if status == .notDetermined {
+            manager.requestAlwaysAuthorization()
+        }
+    }
+
     func openAppSettings() {
         guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
         UIApplication.shared.open(url)
@@ -277,7 +290,7 @@ class LocationService: NSObject, ObservableObject, CLLocationManagerDelegate {
             }
             pendingAuthorizationContinuation = continuation
 
-            manager.requestWhenInUseAuthorization()
+            manager.requestAlwaysAuthorization()
 
             authorizationTimeoutTask?.cancel()
             authorizationTimeoutTask = Task { [weak self] in
@@ -402,7 +415,9 @@ struct VaahanaApp: App {
             ProgressView()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color(UIColor.systemGroupedBackground))
-        } else if let role = userState.role {
+        } else {
+            // Always use rider role for V1
+            let role = userState.role ?? .rider
             ContentView(role: role)
                 .id(role)
                 .environmentObject(userState)
@@ -410,10 +425,6 @@ struct VaahanaApp: App {
                 .sheet(isPresented: $userState.showProfileSetup) {
                     ProfileSetupView(userState: userState)
                 }
-        } else {
-            RoleSelectionView { selectedRole in
-                userState.role = selectedRole
-            }
         }
     }
 }

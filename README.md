@@ -1,36 +1,44 @@
 # Vaahana
 
-A community ride-sharing platform for the South Asian diaspora. Riders post requests with a coin offer, drivers browse and bid, and riders pick a driver. Coins transfer on completion.
+A community ride-sharing platform for the South Asian diaspora. Riders post requests via the app or WhatsApp community groups, drivers browse and contact riders, and the community self-organizes rides.
+
+> **Current status: V1 — Rider-only mode.** The app is in early access for riders. The driver-side (bidding, assignment, coin transfers) is built but disabled pending driver onboarding. All users are assigned the `rider` role on sign-up.
 
 ---
 
-## What It Does
+## What It Does (V1)
 
-### For Riders
-- Post a ride request (pickup, drop-off, time, coin offer)
-- See live driver bids on your request, sorted lowest-coin first
-- Select a driver — coins are locked immediately
-- Track the driver in real-time through enroute → arrived → started → completed
-- Rate the driver after the ride
-- Earn 100 coins every day just for having an account
+### Rides Tab
+- Community feed of all active ride requests posted via the app or ingested from WhatsApp
+- Search bar to filter by pickup location
+- Rides sorted by distance to the user's current location, then newest-first
+- Collapsible "My Requests" section showing your own active posts
+- Collapsible "Expired" section showing past/expired ride requests
+- Swipe to cancel or delete your own rides
+- Post a new ride request: pickup, destination, date/time, seat count, notes, and a coin offer
 
-### For Drivers
-- See all hot ride requests on a live map
-- Filter by radius (1–50 miles) around your location or a custom pin
-- Place bids on rides, edit or withdraw before acceptance
-- Track your bids across "Pending / Selected / Closed" tabs
-- Advance the ride through statuses and complete it to receive coins
-- Go online/offline with one toggle
+### Ride Detail Sheet
+- Tappable map showing the pickup pin and destination, with a drawn route
+- Distance and estimated drive time
+- Contact the rider directly via WhatsApp deep link
+- Mark as expired or cancel your own rides
 
-### Coins
-Coins are community currency — no real money involved. Every user gets 100 coins/day. Coins are locked from the rider on acceptance and transferred to the driver on completion. If the ride is cancelled, coins are refunded.
+### Map Tab
+- Live map showing all active ride request pickup locations as pins
+- Tap a pin to preview the ride; tap the card to open the full detail sheet
+- Current location button — requests Always location permission, centers the map, and shows an alert with a Settings deeplink if permission was denied
+- Ride count badge showing how many active requests are on the map
+
+### Settings Tab
+- Sign out
+- (Driver controls are scaffolded but hidden in V1)
 
 ---
 
 ## Architecture
 
 ```
-iOS App (SwiftUI)
+iOS App (SwiftUI, iOS 17+)
     ↕ real-time Firestore listeners
 Firebase Firestore
     ↕ Cloud Functions (Node.js 22)
@@ -43,6 +51,10 @@ Firebase Firestore
         ├── Callable:  reconcileRide (admin)
         ├── Trigger:   onBidPlaced → FCM push to rider
         └── Trigger:   onRideStatusChanged → FCM push to both parties
+
+WhatsApp Bot (Baileys)
+    → forwards messages → ingestWhatsAppMessages Cloud Function
+    → rides appear in the app feed in real time
 ```
 
 ### Firestore Collections
@@ -74,8 +86,8 @@ Coin flow: `posted (none)` → `accepted (locked)` → `completed (transferred)`
 
 | File | Role |
 |---|---|
-| `VaahanaApp.swift` | Entry point, auth state, daily coin grant, FCM setup |
-| `ContentView.swift` | Main router, `Ride` model, `RideStorage` real-time listener, `PostRideSheet`, driver map view |
+| `VaahanaApp.swift` | Entry point, auth state, `LocationService` (Always permission), daily coin grant, FCM setup |
+| `ContentView.swift` | Main router, `Ride` model, `RideStorage` (Firestore listener + disk cache + geocoding), `RiderView`, `MapTabView`, `PostRideSheet`, `RideDetailSheet` |
 | `RideService.swift` | All atomic Firestore transactions (accept, bid, cancel, complete) |
 | `LocationPickerView.swift` | MKLocalSearchCompleter address picker with current-location support |
 | `DriverBidsStore.swift` | Collection-group query for driver's bids across all rides |
@@ -83,11 +95,29 @@ Coin flow: `posted (none)` → `accepted (locked)` → `completed (transferred)`
 | `RatingView.swift` | Post-ride star rating — writes to `ratings` and increments user aggregate |
 | `AdminView.swift` | Reconciliation logs, user/ride inspector, manual reconcile trigger |
 
+### RideStorage — offline-first data layer
+
+`RideStorage` is the central `ObservableObject` that owns all ride data:
+
+- **Disk cache**: on first launch, cached rides from the previous session are loaded instantly from `Caches/vaahana_posted_rides.json` so the feed appears before Firestore responds.
+- **Firestore listener**: real-time updates are merged in. Empty snapshots from Firestore's local cache are ignored to prevent the feed from flickering to empty on re-open.
+- **Geocoding**: pickup coordinates are resolved once per ride (using stored `pickupLat`/`pickupLng` if available, falling back to `MKLocalSearch`). Results are shared between the Rides tab (distance sorting) and the Map tab (pin placement) — no duplicate lookups.
+- **Deduplication**: rides with the same Firestore document ID are deduplicated before display.
+
+### Location
+
+`LocationService` requests `requestAlwaysAuthorization()` on first launch. The Map tab's re-center button checks the current authorization status and:
+- If authorized: starts location updates and flies to the user's position
+- If denied/restricted: shows an alert with a direct link to Settings
+- If not determined: triggers the system permission dialog
+
+`UIBackgroundModes: location` is declared in `Info.plist` so iOS offers the "Always" option in the permission sheet.
+
 ---
 
 ## WhatsApp Ingestion API
 
-Vaahana ingests ride requests posted in WhatsApp community groups. A scraper forwards messages to this endpoint, which parses them into live ride documents visible to drivers.
+Vaahana ingests ride requests posted in WhatsApp community groups. A Baileys-based bot forwards messages to this endpoint, which parses them into live ride documents visible in the app.
 
 ### Endpoint
 
@@ -182,29 +212,38 @@ Shared room available in Nashua downtown           → accommodation keyword
 DM me if any leads                                 → no ride keyword or route
 ```
 
-**Hot duration inference:**
+**Time parsing:**
 
-| Urgency cue | Hot duration |
+| Input | Parsed as |
 |---|---|
-| "tonight", "now", "asap" | 60 minutes |
-| "today", "this morning" | 120 minutes |
-| "tomorrow", "tmrw" | 480 minutes (8 hours) |
-| "next few weeks", "soon" | 2,880 minutes (48 hours) |
-| No cue (time-based fallback) | 60–480 minutes based on how far away pickup is |
+| `7pm`, `7:30 AM` | Exact time on inferred date |
+| `morning` | 9:00 AM |
+| `afternoon` | 2:00 PM |
+| `evening` | 6:00 PM |
+| `night` | 8:00 PM |
+| `noon` | 12:00 PM |
+| `midnight` | 12:00 AM |
+| No time mentioned | Time of message (i.e., "now") |
+
+**Date inference:** "today", "tonight", "tomorrow", "tmrw", "next week", or bare weekday names ("Monday") are resolved relative to the message timestamp (in US/Eastern). If no date cue is present, the message date is used.
+
+**Hot duration inference (time until ride expires from the feed):**
+
+| Time until pickup | Hot duration |
+|---|---|
+| ≤ 1 hour | 60 minutes |
+| ≤ 6 hours | 2 hours |
+| ≤ 24 hours | 8 hours |
+| ≤ 72 hours | 24 hours |
+| > 72 hours | 48 hours |
 
 **Phone matching:**
 
 If the sender's phone matches an existing Vaahana user's `phone` or `whatsapp` field, the ride is linked to their account. Otherwise, a placeholder entry is created in `whatsappRiders` keyed by a hash of the phone number — so when they sign up, rides can be claimed retroactively.
 
-### Monitoring Dashboard
+### Known Limitations
 
-A live monitoring dashboard is available at:
-
-```
-https://vaahana-fb9b8.web.app/dashboard
-```
-
-Shows real-time ingestion stats, recent messages, parse results, and system health.
+- **Offline messages are permanently missed.** The Baileys bot uses `syncFullHistory: false`. Messages sent while the bot is offline are not replayed when it reconnects. This is a Baileys design constraint; the only workaround is manual re-ingestion via the raw export endpoint.
 
 ---
 
@@ -214,7 +253,7 @@ Shows real-time ingestion stats, recent messages, parse results, and system heal
 Parses WhatsApp group messages into ride documents. See [WhatsApp Ingestion API](#whatsapp-ingestion-api) above.
 
 ### `expireStaleRides` — every 1 minute
-Marks `posted` rides as `expired` when `createdAt + hotDuration` has passed. Server-side counterpart to the client-side expiry in `RideStorage`.
+Marks `posted` rides as `expired` when `createdAt + hotDuration` has passed. Expired rides remain visible in the rider's "Expired" section in the app.
 
 ### `reconcileRecentRides` — every 5 minutes
 Scans all live rides and recently-finalized rides (last 7 days). Auto-repairs:

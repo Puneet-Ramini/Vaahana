@@ -713,8 +713,8 @@ const FROM_ONLY_PATTERN = new RegExp(`\\bfrom\\s+${LOC}${LOC_STOP}`, "i");
 // "in X at TIME" (no explicit from/to like "Need ride in Lowell at 8am")
 const IN_LOCATION_PATTERN = /\brides?\s+in\s+([A-Za-z0-9\s,./]+?)(?:\s+(?:at|by|around|on|tomorrow|tonight|today|\d)|[,.]|$)/i;
 
-// Time patterns
-const TIME_PATTERN = /\b(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)|midnight|noon)\b/i;
+// Time patterns — numeric + named periods
+const TIME_PATTERN = /\b(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)|midnight|noon|morning|afternoon|evening|night)\b/i;
 
 // Urgency keywords for hotDuration inference
 const URGENCY_TONIGHT   = /\b(tonight|right now|asap|urgent|immediately|now)\b/i;
@@ -886,12 +886,14 @@ function inferPickupDate(text, timeStr, msgTimestamp) {
 function parseTimeString(timeStr, baseDate) {
   try {
     const t = timeStr.toLowerCase().trim();
-    if (t === "midnight") {
-      const d = new Date(baseDate); d.setHours(0, 0, 0, 0); return d;
-    }
-    if (t === "noon") {
-      const d = new Date(baseDate); d.setHours(12, 0, 0, 0); return d;
-    }
+    // Named time periods
+    if (t === "midnight")   { const d = new Date(baseDate); d.setHours(0,  0, 0, 0); return d; }
+    if (t === "noon")       { const d = new Date(baseDate); d.setHours(12, 0, 0, 0); return d; }
+    if (t === "morning")    { const d = new Date(baseDate); d.setHours(9,  0, 0, 0); return d; }
+    if (t === "afternoon")  { const d = new Date(baseDate); d.setHours(14, 0, 0, 0); return d; }
+    if (t === "evening")    { const d = new Date(baseDate); d.setHours(18, 0, 0, 0); return d; }
+    if (t === "night")      { const d = new Date(baseDate); d.setHours(20, 0, 0, 0); return d; }
+
     const m = t.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/);
     if (!m) return null;
     let h = parseInt(m[1]);
@@ -923,16 +925,14 @@ function inferHotDuration(text, pickupDate, msgTimestamp) {
   if (URGENCY_VAGUE.test(text))    return 2880;
   // Explicit date: stay hot until the pickup day arrives (max 48h cap)
   if (extractExplicitDate(text))   return 2880;
-  // No date cue — rider needs a ride soon, keep visible for 24h
-  return 1440;
-
-  // Fallback: compare pickup date to message date
+  // No date cue — use time-until-pickup as a guide
   const msUntilPickup = pickupDate.getTime() - new Date(msgTimestamp).getTime();
   const hoursUntil = msUntilPickup / (1000 * 60 * 60);
 
-  if (hoursUntil <= 6)  return 60;
-  if (hoursUntil <= 24) return 240;
-  if (hoursUntil <= 72) return 480;
+  if (hoursUntil <= 1)  return 60;
+  if (hoursUntil <= 6)  return 120;
+  if (hoursUntil <= 24) return 480;
+  if (hoursUntil <= 72) return 1440;
   return 2880;
 }
 
