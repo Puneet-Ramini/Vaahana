@@ -39,7 +39,6 @@ const { getMessaging } = require("firebase-admin/messaging");
 const { defineSecret } = require("firebase-functions/params");
 const crypto = require("crypto");
 const https  = require("https");
-
 const WHATSAPP_API_KEY = defineSecret("WHATSAPP_INGEST_API_KEY");
 
 initializeApp();
@@ -1502,3 +1501,22 @@ exports.onRideStatusChanged = onDocumentUpdated(
     }
   }
 );
+
+// ─── checkPhoneUnique ─────────────────────────────────────────────────────────
+// Callable: returns whether a phone number is already registered.
+// Called before account creation so the client gets a clear error early.
+
+exports.checkPhoneUnique = onCall(async (request) => {
+  const { phone } = request.data || {};
+  if (!phone) throw new HttpsError("invalid-argument", "Phone is required.");
+
+  const snap = await db.collection("users")
+    .where("phone", "==", phone.trim())
+    .limit(1)
+    .get();
+
+  if (!snap.empty) {
+    throw new HttpsError("already-exists", "An account with this phone number already exists.");
+  }
+  return { unique: true };
+});

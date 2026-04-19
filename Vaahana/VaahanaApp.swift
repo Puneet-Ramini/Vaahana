@@ -96,8 +96,9 @@ class UserState: ObservableObject {
     init() {
         handle = Auth.auth().addStateDidChangeListener { [weak self] _, user in
             DispatchQueue.main.async {
-                self?.isSignedIn = user != nil
-                if let uid = user?.uid {
+                // Only treat as signed in if email is verified
+                self?.isSignedIn = user?.isEmailVerified == true
+                if let uid = user?.uid, user?.isEmailVerified == true {
                     self?.fetchRole(uid: uid)
                 } else {
                     self?.role              = nil
@@ -114,13 +115,13 @@ class UserState: ObservableObject {
                 guard let self else { return }
                 let data = doc?.data()
 
-                // Resolve role — default to rider for V1
+                // Resolve role — new accounts created via OTP flow already have role set
                 if let rawRole = data?["role"] as? String,
                    let role = UserRole(rawValue: rawRole) {
                     self.role = role
                 } else {
                     self.role = .rider
-                    self.db.collection("users").document(uid).setData(["role": "rider"], merge: true)
+                    self.db.collection("users").document(uid).setData(["role": "rider", "coins": 100, "coinsLocked": 0], merge: true)
                 }
 
                 // Cache profile fields and decide if setup sheet is needed
@@ -409,7 +410,7 @@ struct VaahanaApp: App {
     @ViewBuilder
     private var mainContent: some View {
         if !userState.isSignedIn {
-            AuthView()
+            AuthFlowView()
                 .environmentObject(locationService)
         } else if userState.isLoadingRole {
             ProgressView()

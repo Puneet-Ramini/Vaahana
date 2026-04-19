@@ -13,15 +13,29 @@
 		DD36B27B2F899A2100F441AF /* FirebaseCore in Frameworks */ = {isa = PBXBuildFile; productRef = DD36B27A2F899A2100F441AF /* FirebaseCore */; };
 		DD36B27D2F899A2100F441AF /* FirebaseFirestore in Frameworks */ = {isa = PBXBuildFile; productRef = DD36B27C2F899A2100F441AF /* FirebaseFirestore */; };
 		DD36B27F2F899A2100F441AF /* FirebaseStorage in Frameworks */ = {isa = PBXBuildFile; productRef = DD36B27E2F899A2100F441AF /* FirebaseStorage */; };
+		DD36B2812F899A2100F441AF /* FirebaseFunctions in Frameworks */ = {isa = PBXBuildFile; productRef = DD36B2802F899A2100F441AF /* FirebaseFunctions */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		DD46C86F2F84711F00A45A36 /* Vaahana.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Vaahana.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		8151FA072F9440D700A2D370 /* Exceptions for "Vaahana" folder in "Vaahana" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = DD46C86E2F84711F00A45A36 /* Vaahana */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		DD46C8712F84711F00A45A36 /* Vaahana */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				8151FA072F9440D700A2D370 /* Exceptions for "Vaahana" folder in "Vaahana" target */,
+			);
 			path = Vaahana;
 			sourceTree = "<group>";
 		};
@@ -38,6 +52,7 @@
 				DD36B27D2F899A2100F441AF /* FirebaseFirestore in Frameworks */,
 				DD36B2752F899A2100F441AF /* FirebaseAnalyticsCore in Frameworks */,
 				DD36B27F2F899A2100F441AF /* FirebaseStorage in Frameworks */,
+				DD36B2812F899A2100F441AF /* FirebaseFunctions in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -86,6 +101,7 @@
 				DD36B27A2F899A2100F441AF /* FirebaseCore */,
 				DD36B27C2F899A2100F441AF /* FirebaseFirestore */,
 				DD36B27E2F899A2100F441AF /* FirebaseStorage */,
+				DD36B2802F899A2100F441AF /* FirebaseFunctions */,
 			);
 			productName = Vaahana;
 			productReference = DD46C86F2F84711F00A45A36 /* Vaahana.app */;
@@ -277,9 +293,10 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = F2538Z8565;
+				DEVELOPMENT_TEAM = 5M4BYU4RBF;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Vaahana/Info.plist;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -299,6 +316,7 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
+				s = "";
 			};
 			name = Debug;
 		};
@@ -309,9 +327,10 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = F2538Z8565;
+				DEVELOPMENT_TEAM = 5M4BYU4RBF;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Vaahana/Info.plist;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -331,6 +350,7 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
+				s = "";
 			};
 			name = Release;
 		};
@@ -398,6 +418,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = DD36B2732F899A2100F441AF /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
 			productName = FirebaseStorage;
+		};
+		DD36B2802F899A2100F441AF /* FirebaseFunctions */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = DD36B2732F899A2100F441AF /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
+			productName = FirebaseFunctions;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

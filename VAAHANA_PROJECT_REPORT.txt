@@ -1,0 +1,267 @@
+VAAHANA — PROJECT REPORT
+========================
+Generated: April 18, 2026
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHAT THE APP IS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Vaahana is a community ride-sharing platform for the South Asian diaspora in
+the US. People post ride requests (e.g., "need a ride from Nashua to Boston
+this Sunday") and drivers contact them directly. It's not Uber — there's no
+dynamic pricing, no payment processing. It runs on community coins (virtual
+currency) and WhatsApp-style direct contact.
+
+Current status: V1, rider-only. The driver side is fully built but disabled.
+All users are assigned the "rider" role on signup. The priority right now is
+getting riders to post requests and building the feed.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW RIDES ENTER THE SYSTEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+There are two paths:
+
+1. IN-APP POSTING
+   A rider opens the app, taps "+", fills in pickup / destination / date /
+   time / seat count / notes / coin offer, and posts. The ride appears in
+   everyone's feed instantly.
+
+2. WHATSAPP INGESTION
+   A Baileys-based WhatsApp bot watches community group chats. When someone
+   types something like:
+
+     "Need ride from Somerville to Logan Airport tomorrow at 6am"
+
+   The bot forwards it to a Firebase Cloud Function (ingestWhatsAppMessages).
+   The function:
+     a) Classifies the message (ride request vs. accommodation vs. noise)
+     b) Extracts from, to, pickup time, and urgency
+     c) Creates a Firestore "rides" document
+     d) The ride appears in the app feed within seconds
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+APP STRUCTURE (TABS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RIDES TAB
+  - Community feed of all active posted rides
+  - Search bar to filter by pickup location
+  - Rides sorted by distance to user (nearest pickup first), then newest first
+  - "My Requests" — collapsible section showing your own active posts
+    with swipe-to-cancel
+  - "Expired" — collapsible section showing your past/expired rides (dimmed)
+  - Tap any ride to open the detail sheet
+
+MAP TAB
+  - Live map with a pin for every active ride's pickup location
+  - Tap a pin → preview card → tap card → full detail sheet
+  - Ride count badge
+  - Re-center button: checks location permission, flies to user, or shows
+    a Settings alert if denied
+
+RIDE DETAIL SHEET
+  - Drawn route on a map (pickup pin + destination)
+  - Distance and estimated drive time via MKDirections
+  - Rider name, phone, seat count, notes, coin offer
+  - "Contact on WhatsApp" button — opens WhatsApp with a pre-filled message
+  - Rider can cancel/expire their own ride from here
+
+SETTINGS TAB
+  - Sign out
+  - Driver controls scaffolded but hidden
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ENGINEERING — iOS APP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STACK
+  - SwiftUI (iOS 17+), no UIKit
+  - Firebase (Firestore, Auth, FCM)
+  - MapKit (iOS 17 Map API with Annotation, MKDirections, MKLocalSearch)
+  - CoreLocation (CLLocationManager, Always permission)
+
+KEY FILES
+  ContentView.swift      Everything: Ride model, RideStorage, RiderView,
+                         MapTabView, PostRideSheet, RideDetailSheet,
+                         CompactRideRow
+  VaahanaApp.swift       Entry point, LocationService, auth state, FCM,
+                         daily coin grant
+  RideService.swift      Atomic Firestore transactions (accept, bid, cancel,
+                         complete)
+  LocationPickerView.swift  Address autocomplete with current-location support
+  PhoneAuthView.swift    Firebase phone number auth + OTP
+  ProfileView.swift      Account dashboard
+  AdminView.swift        Reconciliation logs, manual repair triggers
+
+RIDESTORAGE — OFFLINE-FIRST DATA LAYER
+  The central ObservableObject that all views read from:
+
+  - Disk cache: on launch, reads Caches/vaahana_posted_rides.json instantly
+    — the feed is populated before Firestore even responds
+  - Firestore listener: merges real-time updates in; empty snapshots from
+    Firestore's local cache are IGNORED (prevents the feed from flickering
+    to empty on re-open — this was a bug we fixed)
+  - Shared geocoding: pickup coordinates are resolved once per ride and
+    stored in geocodedCoordinates[ride.id]. Both the Rides tab (distance
+    sorting) and Map tab (pin placement) read from this — no duplicate
+    API calls
+  - Deduplication: rides with the same document ID are collapsed before
+    display
+  - Sorting: newest-first baseline, overridden by distance-to-user when
+    location is available
+
+LOCATION
+  LocationService wraps CLLocationManager:
+  - Calls requestAlwaysAuthorization() on first launch
+  - Info.plist declares NSLocationAlwaysAndWhenInUseUsageDescription +
+    UIBackgroundModes:location — required for iOS to show the "Always" option
+  - Map tab re-center button checks current auth status and either flies
+    the map, starts the permission dialog, or shows a Settings deeplink alert
+
+MAP PINS
+  Used MapRidePin (an Identifiable struct wrapping Ride +
+  CLLocationCoordinate2D) to make SwiftUI's Map content ForEach work
+  correctly. Raw Ride UUIDs were causing annotation rendering failures —
+  this fixed it.
+
+WHATSAPP CONTACT
+  The "Contact on WhatsApp" URL is constructed as:
+    https://wa.me/{fullNumber}?text={encoded message}
+  A bug was fixed where the country code was being double-prefixed
+  (e.g., +1+16176206435). Now it checks if whatsappPhone already contains
+  the country code digits before prepending.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ENGINEERING — BACKEND (Cloud Functions, Node.js 22)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WHATSAPP INGESTION PIPELINE (ingestWhatsAppMessages)
+  Accepts either a raw WhatsApp export string or a pre-parsed JSON array.
+  For each message:
+
+  1. Classification: checks for ride keywords (need ride, looking for ride,
+     anyone travelling, etc.) and rejects accommodation/noise messages
+  2. Route extraction: regex pulls "from X to Y" patterns
+  3. Time parsing: handles 7pm, 7:30 AM, and named periods:
+       morning   → 9:00 AM
+       afternoon → 2:00 PM
+       evening   → 6:00 PM
+       night     → 8:00 PM
+       noon      → 12:00 PM
+       midnight  → 12:00 AM
+  4. Date inference: "today/tonight/tomorrow/tmrw/next week" + bare weekday
+     names resolved relative to message timestamp in US/Eastern. If no date
+     cue present, uses message date (i.e., "now").
+  5. Hot duration (how long ride stays active in feed):
+       ≤ 1 hour until pickup  → 60 minutes
+       ≤ 6 hours              → 2 hours
+       ≤ 24 hours             → 8 hours
+       ≤ 72 hours             → 24 hours
+       > 72 hours             → 48 hours
+  6. Phone matching: links to existing Vaahana user if phone matches;
+     otherwise creates whatsappRiders placeholder for later claim
+  7. Deduplication: same phone + route + date within 24h is rejected
+
+SCHEDULED FUNCTIONS
+  expireStaleRides          Every 1 min   Marks rides as expired when
+                                          createdAt + hotDuration passes
+  reconcileRecentRides      Every 5 min   Auto-repairs coin locks, bid
+                                          states, driver assignments
+  reconcileUserLocks        Every 5 min   Validates coinsLocked vs. active
+                                          rides
+  reconcileDriverAssignments Every 5 min  Clears stale activeRideId links
+  grantDailyCoins           Midnight UTC  100 coins/day per user
+
+FIRESTORE DATA MODEL
+  users/{uid}               Profile, role, coins, coinsLocked, fcmToken
+  rides/{rideId}            Full ride document (status, route, coins,
+                            timestamps)
+    bids/{bidId}            Driver bids
+  coinTransactions/         Immutable audit log
+  ratings/                  Post-ride star ratings
+  whatsappRiders/           Phone-hashed placeholders
+  whatsappIngestionLogs/    Per-message parse audit trail
+
+RIDE STATE MACHINE
+  posted → accepted → driver_enroute → driver_arrived → ride_started → completed
+     └────────────────────── cancelled / expired ───────────────────────────┘
+
+  Coins: locked from rider on acceptance → transferred to driver on
+  completion → refunded on cancel.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BUGS FIXED (THIS SESSION)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Map pins not appearing
+    → Replaced raw Ride ForEach with MapRidePin: Identifiable struct
+
+  WhatsApp URL double country code
+    → Check if phone already contains country code before prepending
+
+  Map tab showing 0 rides
+    → Wired ridesForMap to storage.postedRides correctly
+
+  Feed disappearing on re-open
+    → Ignore empty Firestore cache snapshots; don't overwrite feed with []
+
+  Infinite spinner on Firestore error
+    → Set isLoading = false in error branch
+
+  Location button did nothing
+    → Added auth check, Settings alert, auto-center on first fix
+
+  "Always" option missing in system dialog
+    → Added UIBackgroundModes:location + correct plist key
+
+  Rides expiring in 5 minutes
+    → hotDuration default was 5 min; changed to 1440 (24h)
+
+  Expired rides disappearing
+    → Split "My Requests" into active + collapsible "Expired" section
+
+  Bot not parsing "morning/evening/night"
+    → Added named period handling to parseTimeString
+
+  Bot hot duration always returning 1440
+    → Fixed dead code — now uses time-until-pickup formula
+
+  Geocoding failing for bare city names
+    → Switched from CLGeocoder to MKLocalSearch
+      (handles "Nashua", "Boston Logan", etc.)
+
+  Duplicate geocode calls
+    → Shared geocodedCoordinates dict between Rides + Map tabs
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+KNOWN LIMITATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - WhatsApp bot misses offline messages: Baileys uses syncFullHistory:false,
+    so messages sent while the bot is offline are permanently missed.
+    Workaround: manually re-ingest via the raw export API endpoint.
+
+  - Driver mode disabled: fully built (bid placement, assignment, coin
+    transfer, ride tracking) but hidden behind role check pending driver
+    onboarding.
+
+  - No real money: coins are community currency only; no payment integration.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INFRASTRUCTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Firebase project:   vaahana-fb9b8
+  Region:             us-central1
+  iOS minimum:        iOS 17
+  Cloud Functions:    Node.js 22 (LTS)
+  Git branch:         firebase-integration
+  Remote:             github.com/Puneet-Ramini/Vaahana
