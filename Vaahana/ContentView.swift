@@ -980,19 +980,22 @@ struct DriverView: View {
         return locationService.location?.coordinate
     }
 
+    private static let listRadiusMiles = 100.0
+
     var filteredRides: [(ride: Ride, distanceMiles: Double?)] {
         let hot = storage.hotPostedRides
-        guard let center = mapCenter else {
+        guard let userLoc = locationService.location else {
+            // No location yet — show all rides unsorted
             return hot.map { ($0, nil) }
         }
-        let centerLoc = CLLocation(latitude: center.latitude, longitude: center.longitude)
         return hot
             .compactMap { ride -> (ride: Ride, distanceMiles: Double?)? in
                 guard let lat = ride.pickupLat, let lng = ride.pickupLng else {
+                    // No coords — include but distance unknown
                     return (ride, nil)
                 }
-                let dist = centerLoc.distance(from: CLLocation(latitude: lat, longitude: lng)) / 1609.34
-                guard dist <= filterRadius else { return nil }
+                let dist = userLoc.distance(from: CLLocation(latitude: lat, longitude: lng)) / 1609.34
+                guard dist <= Self.listRadiusMiles else { return nil }
                 return (ride, dist)
             }
             .sorted {
@@ -1086,7 +1089,7 @@ struct DriverView: View {
                                     .foregroundStyle(.quaternary)
                                 Text(storage.hotPostedRides.isEmpty
                                      ? "No requests right now"
-                                     : "No requests within \(Int(filterRadius)) mi")
+                                     : "No requests within \(Int(DriverView.listRadiusMiles)) mi")
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                             }

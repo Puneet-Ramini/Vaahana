@@ -7,7 +7,9 @@
 //  Login   → Forgot Password
 
 import SwiftUI
+import Combine
 import FirebaseAuth
+import FirebaseFirestore
 import FirebaseFunctions
 
 // MARK: - Auth Flow Root
