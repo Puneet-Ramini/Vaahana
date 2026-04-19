@@ -74,14 +74,6 @@ enum RideStatus: String, Codable {
     }
 }
 
-// MARK: CoinStatus — lifecycle of coins for a ride
-enum CoinStatus: String, Codable {
-    case none
-    case locked       // locked from rider at acceptance
-    case transferred  // transferred to driver at completion
-    case refunded     // unlocked back to rider on cancellation
-}
-
 // MARK: UserRole
 enum UserRole: String, Codable {
     case rider
@@ -113,7 +105,6 @@ struct Ride: Identifiable, Codable, Equatable {
     var source: String?
 
     // Details
-    var coins: Int
     var hotDuration: Int       // minutes the request stays visible
     var pickupDate: Date
 
@@ -122,11 +113,6 @@ struct Ride: Identifiable, Codable, Equatable {
     var driverName: String?
     var driverPhone: String?
     var driverWhatsapp: String?
-
-    // Coin lifecycle
-    var coinStatus: CoinStatus
-    var coinsLocked: Int
-    var coinsTransferred: Int
 
     // State timestamps
     var acceptedAt: Date?
@@ -146,8 +132,6 @@ struct Ride: Identifiable, Codable, Equatable {
     // Bid marketplace summary (denormalized for quick display)
     var bidCount: Int
     var selectedBidId: String?
-    var finalCoins: Int?          // agreed coin amount after bid selection
-    var lowestBidCoins: Int?
     var latestBidAt: Date?
 
     // MARK: Computed
@@ -182,6 +166,12 @@ struct Ride: Identifiable, Codable, Equatable {
         return f.string(from: pickupDate)
     }
 
+    var postedAtShort: String {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d, h:mm a"
+        return f.string(from: createdAt)
+    }
+
     // MARK: Convenience init (for creating new rides)
 
     init(
@@ -198,7 +188,6 @@ struct Ride: Identifiable, Codable, Equatable {
         pickupLat: Double? = nil,
         pickupLng: Double? = nil,
         source: String? = "app",
-        coins: Int,
         hotDuration: Int = 30,
         pickupDate: Date,
         notes: String? = nil,
@@ -221,7 +210,6 @@ struct Ride: Identifiable, Codable, Equatable {
         self.pickupLat = pickupLat
         self.pickupLng = pickupLng
         self.source = source
-        self.coins = coins
         self.hotDuration = hotDuration
         self.pickupDate = pickupDate
         self.notes = notes
@@ -229,9 +217,6 @@ struct Ride: Identifiable, Codable, Equatable {
         self.driverName = nil
         self.driverPhone = nil
         self.driverWhatsapp = nil
-        self.coinStatus = .none
-        self.coinsLocked = 0
-        self.coinsTransferred = 0
         self.acceptedAt = nil
         self.driverEnrouteAt = nil
         self.arrivedAt = nil
@@ -242,8 +227,6 @@ struct Ride: Identifiable, Codable, Equatable {
         self.cancellationReasonCode = nil
         self.bidCount = 0
         self.selectedBidId = nil
-        self.finalCoins = nil
-        self.lowestBidCoins = nil
         self.latestBidAt = nil
     }
 
@@ -275,7 +258,6 @@ struct Ride: Identifiable, Codable, Equatable {
         pickupLat              = try? c.decodeIfPresent(Double.self, forKey: .pickupLat)
         pickupLng              = try? c.decodeIfPresent(Double.self, forKey: .pickupLng)
         source                 = try? c.decodeIfPresent(String.self, forKey: .source)
-        coins                  = (try? c.decodeIfPresent(Int.self, forKey: .coins))                    ?? 0
         // Default to 1440 min (24 h) so WhatsApp rides without an explicit duration stay visible
         hotDuration            = (try? c.decodeIfPresent(Int.self, forKey: .hotDuration))              ?? 1440
         pickupDate             = (try? c.decodeIfPresent(Date.self, forKey: .pickupDate))              ?? Date()
@@ -284,9 +266,6 @@ struct Ride: Identifiable, Codable, Equatable {
         driverName             = try? c.decodeIfPresent(String.self, forKey: .driverName)
         driverPhone            = try? c.decodeIfPresent(String.self, forKey: .driverPhone)
         driverWhatsapp         = try? c.decodeIfPresent(String.self, forKey: .driverWhatsapp)
-        coinStatus             = (try? c.decodeIfPresent(CoinStatus.self, forKey: .coinStatus))        ?? .none
-        coinsLocked            = (try? c.decodeIfPresent(Int.self, forKey: .coinsLocked))              ?? 0
-        coinsTransferred       = (try? c.decodeIfPresent(Int.self, forKey: .coinsTransferred))         ?? 0
         acceptedAt             = try? c.decodeIfPresent(Date.self, forKey: .acceptedAt)
         driverEnrouteAt        = try? c.decodeIfPresent(Date.self, forKey: .driverEnrouteAt)
         arrivedAt              = try? c.decodeIfPresent(Date.self, forKey: .arrivedAt)
@@ -297,8 +276,6 @@ struct Ride: Identifiable, Codable, Equatable {
         cancellationReasonCode = try? c.decodeIfPresent(String.self, forKey: .cancellationReasonCode)
         bidCount               = (try? c.decodeIfPresent(Int.self, forKey: .bidCount))         ?? 0
         selectedBidId          = try? c.decodeIfPresent(String.self, forKey: .selectedBidId)
-        finalCoins             = try? c.decodeIfPresent(Int.self, forKey: .finalCoins)
-        lowestBidCoins         = try? c.decodeIfPresent(Int.self, forKey: .lowestBidCoins)
         latestBidAt            = try? c.decodeIfPresent(Date.self, forKey: .latestBidAt)
     }
 
@@ -733,6 +710,16 @@ struct ContentView: View {
 // MARK: - Rider View
 
 struct RiderView: View {
+    private enum RadiusOption: Int, CaseIterable, Identifiable {
+        case miles50 = 50
+        case miles100 = 100
+        case miles200 = 200
+
+        var id: Int { rawValue }
+        var label: String { "\(rawValue) mi" }
+        var distanceMiles: Double { Double(rawValue) }
+    }
+
     @EnvironmentObject var storage: RideStorage
     @EnvironmentObject var locationService: LocationService
     @State private var showingPostSheet = false
@@ -740,6 +727,7 @@ struct RiderView: View {
     @State private var showMyRequests = false
     @State private var showExpiredRequests = false
     @State private var searchText = ""
+    @State private var selectedRadius: RadiusOption = .miles100
 
     var myActiveRides: [Ride] {
         storage.myRides.filter { $0.status == .posted }
@@ -756,23 +744,39 @@ struct RiderView: View {
             : storage.postedRides.filter { $0.from.localizedCaseInsensitiveContains(searchText) }
 
         guard let userLoc = locationService.location else {
-            // No location yet — just newest first
-            return base
+            // No location yet — radius filtering cannot be applied.
+            return base.sorted { $0.createdAt > $1.createdAt }
         }
         let userCL = CLLocation(latitude: userLoc.coordinate.latitude, longitude: userLoc.coordinate.longitude)
 
-        return base.sorted { a, b in
-            let aC = storage.geocodedCoordinates[a.id]
-            let bC = storage.geocodedCoordinates[b.id]
-            if let aC, let bC {
-                let aDist = CLLocation(latitude: aC.latitude, longitude: aC.longitude).distance(from: userCL)
-                let bDist = CLLocation(latitude: bC.latitude, longitude: bC.longitude).distance(from: userCL)
-                // If more than 1 mile apart, closer ride wins
-                if abs(aDist - bDist) > 1609 { return aDist < bDist }
+        let maxDistanceMeters = selectedRadius.distanceMiles * 1609.34
+
+        return base
+            .compactMap { ride -> (ride: Ride, distanceMeters: Double)? in
+                let coordinate: CLLocationCoordinate2D?
+                if let lat = ride.pickupLat, let lng = ride.pickupLng {
+                    coordinate = CLLocationCoordinate2D(latitude: lat, longitude: lng)
+                } else {
+                    coordinate = storage.geocodedCoordinates[ride.id]
+                }
+
+                guard let coordinate else { return nil }
+
+                let distanceMeters = CLLocation(
+                    latitude: coordinate.latitude,
+                    longitude: coordinate.longitude
+                ).distance(from: userCL)
+
+                guard distanceMeters <= maxDistanceMeters else { return nil }
+                return (ride, distanceMeters)
             }
-            // Same distance bucket (or no coords) → newest first
-            return a.createdAt > b.createdAt
-        }
+            .sorted { a, b in
+                if abs(a.distanceMeters - b.distanceMeters) > 1609 {
+                    return a.distanceMeters < b.distanceMeters
+                }
+                return a.ride.createdAt > b.ride.createdAt
+            }
+            .map(\.ride)
     }
 
     var body: some View {
@@ -792,6 +796,31 @@ struct RiderView: View {
                                 .font(.subheadline).fontWeight(.semibold)
                                 .foregroundStyle(.secondary)
                             Spacer()
+                            Menu {
+                                ForEach(RadiusOption.allCases) { option in
+                                    Button {
+                                        selectedRadius = option
+                                    } label: {
+                                        if option == selectedRadius {
+                                            Label(option.label, systemImage: "checkmark")
+                                        } else {
+                                            Text(option.label)
+                                        }
+                                    }
+                                }
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Text(selectedRadius.label)
+                                        .font(.caption).fontWeight(.semibold)
+                                    Image(systemName: "slider.horizontal.3")
+                                        .font(.system(size: 11, weight: .semibold))
+                                }
+                                .foregroundStyle(.primary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                                .background(Color(UIColor.secondarySystemGroupedBackground))
+                                .clipShape(Capsule())
+                            }
                         }
                         .padding(.top, 4)
 
@@ -935,12 +964,16 @@ struct RiderView: View {
 
     private var emptyState: some View {
         VStack(spacing: 16) {
-            Image(systemName: "car.2.fill")
+            Image(systemName: locationService.location == nil ? "location.slash" : "car.2.fill")
                 .font(.system(size: 48))
                 .foregroundStyle(.quaternary)
-            Text("No rides available")
+            Text(locationService.location == nil ? "Location needed" : "No rides in range")
                 .font(.headline)
-            Text("Check back soon — rides from the\nWhatsApp group appear here.")
+            Text(
+                locationService.location == nil
+                ? "Turn on location access to filter rides by pickup radius."
+                : "No rides with pickup locations are within \(selectedRadius.rawValue) miles right now."
+            )
                 .font(.subheadline).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
         }
@@ -1172,23 +1205,33 @@ struct CompactRideRow: View {
                             .lineLimit(1)
                     }
 
-                    // Meta row
-                    HStack(spacing: 6) {
-                        Label(ride.pickupDateShort, systemImage: "calendar")
-                            .font(.caption).foregroundStyle(.secondary)
-
-                        if ride.miles > 0 {
-                            Text("·").foregroundStyle(.quaternary)
-                            Text(String(format: "%.1f mi", ride.miles))
-                                .font(.caption).foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Text("Needed")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundStyle(.secondary)
+                            Text(ride.pickupDateShort)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
 
-                        Text("·").foregroundStyle(.quaternary)
-                        Image(systemName: "clock")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.orange)
-                        Text(ride.createdAt, format: .dateTime.hour().minute())
-                            .font(.caption).foregroundStyle(.orange)
+                        HStack(spacing: 6) {
+                            Text("Posted")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundStyle(.secondary)
+                            Text(ride.postedAtShort)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            if ride.miles > 0 {
+                                Text("·").foregroundStyle(.quaternary)
+                                Text(String(format: "%.1f mi", ride.miles))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                     }
 
                     // Tags row
@@ -1201,10 +1244,6 @@ struct CompactRideRow: View {
                                 .background(Color.green.opacity(0.1))
                                 .clipShape(Capsule())
                         }
-
-                        Text("🪙 \(ride.coins)")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(.orange)
 
                         Spacer()
 
@@ -1719,7 +1758,6 @@ struct PostRideSheet: View {
     @State private var routeCoords: [CLLocationCoordinate2D] = []
     @State private var routeETA: String? = nil
     @State private var milesText = ""
-    @State private var coinsText = ""
     @State private var isCalculatingRoute = false
 
     // Location pickers
@@ -1756,14 +1794,11 @@ struct PostRideSheet: View {
     ]
 
     var miles: Double { Double(milesText) ?? 0 }
-    var coins: Int    { Int(coinsText)    ?? 0 }
-    var suggestedCoins: Int { max(1, Int(miles)) }
 
     var isValid: Bool {
         pickupResult != nil &&
         dropoffResult != nil &&
         miles > 0 &&
-        coins > 0 &&
         !name.isEmpty &&
         phone.count >= 6 &&
         (sameNumberForBoth || whatsappPhone.count >= 6) &&
@@ -1812,34 +1847,8 @@ struct PostRideSheet: View {
                             .keyboardType(.decimalPad)
                             .multilineTextAlignment(.trailing)
                             .frame(width: 60)
-                            .onChange(of: milesText) { old, new in
-                                if coinsText.isEmpty || Int(coinsText) == max(1, Int(Double(old) ?? 0)) {
-                                    if let v = Double(new) { coinsText = "\(max(1, Int(v)))" }
-                                }
-                            }
                         Text("mi").foregroundStyle(.secondary).font(.subheadline)
                         if isCalculatingRoute { ProgressView().scaleEffect(0.7) }
-                    }
-
-                    HStack {
-                        Label("Coins", systemImage: "centsign.circle.fill")
-                            .font(.subheadline).foregroundStyle(.orange)
-                        Spacer()
-                        TextField("0", text: $coinsText)
-                            .keyboardType(.numberPad)
-                            .multilineTextAlignment(.trailing)
-                            .frame(width: 60)
-                            .fontWeight(.semibold)
-                        if miles > 0 && suggestedCoins != coins {
-                            Button { coinsText = "\(suggestedCoins)" } label: {
-                                Text("Suggest \(suggestedCoins)")
-                                    .font(.caption2).fontWeight(.medium)
-                                    .padding(.horizontal, 8).padding(.vertical, 4)
-                                    .background(Color.orange.opacity(0.1))
-                                    .clipShape(Capsule())
-                            }
-                            .buttonStyle(.borderless)
-                        }
                     }
 
                     DatePicker("Pickup", selection: $pickupDate, in: Date()...)
@@ -1854,7 +1863,7 @@ struct PostRideSheet: View {
                 } header: {
                     Label("Details", systemImage: "slider.horizontal.3")
                 } footer: {
-                    Text("Coins are community currency — no real money. Request expires after the active duration.")
+                    Text("Your request is shared with nearby drivers. It expires after the selected active duration.")
                 }
 
                 // MARK: Notes
@@ -2013,7 +2022,6 @@ struct PostRideSheet: View {
         guard let ride = editingRide else { return }
         // Restore text fields; coordinates are embedded in the ride
         milesText = String(format: "%.1f", ride.miles)
-        coinsText = "\(ride.coins)"
         hotDuration = ride.hotDuration
         pickupDate = ride.pickupDate
         notes = ride.notes ?? ""
@@ -2063,7 +2071,6 @@ struct PostRideSheet: View {
             updated.from                 = pickupResult?.name ?? editingRide.from
             updated.to                   = dropoffResult?.name ?? editingRide.to
             updated.miles                = miles
-            updated.coins                = coins
             updated.hotDuration          = hotDuration
             updated.pickupDate           = pickupDate
             updated.notes                = notes.isEmpty ? nil : notes
@@ -2088,7 +2095,6 @@ struct PostRideSheet: View {
                 miles: miles,
                 pickupLat: coord?.latitude,
                 pickupLng: coord?.longitude,
-                coins: coins,
                 hotDuration: hotDuration,
                 pickupDate: pickupDate,
                 notes: notes.isEmpty ? nil : notes,
@@ -2101,7 +2107,7 @@ struct PostRideSheet: View {
     }
 
     /// Calculates route between pickup and dropoff using MKDirections.
-    /// Populates routeCoords, milesText, coinsText (if not customised), and routeETA.
+    /// Populates routeCoords, milesText, and routeETA.
     func calculateRoute() {
         guard let pickup = pickupResult, let dropoff = dropoffResult else { return }
         // Skip if dropoff has no real coordinate (editing fallback placeholder)
@@ -2130,14 +2136,9 @@ struct PostRideSheet: View {
                 route.polyline.getCoordinates(&coords, range: NSRange(location: 0, length: count))
                 routeCoords = coords
 
-                // Distance and coins
+                // Distance
                 let calculatedMiles = route.distance / 1609.34
-                let prevSuggested = max(1, Int(Double(milesText) ?? 0))
                 milesText = String(format: "%.1f", calculatedMiles)
-                // Only auto-update coins if user hasn't changed them from the last suggestion
-                if coinsText.isEmpty || Int(coinsText) == prevSuggested {
-                    coinsText = "\(max(1, Int(calculatedMiles)))"
-                }
 
                 // ETA
                 let totalSeconds = Int(route.expectedTravelTime)
@@ -2237,7 +2238,7 @@ struct RideCard: View {
             HStack(spacing: 8) {
                 StatusChip(status: ride.status)
                 InfoChip(text: String(format: "%.1f mi", ride.miles), color: .gray)
-                InfoChip(text: "🪙 \(ride.coins)", color: .orange)
+                InfoChip(text: "Posted \(ride.postedAtShort)", color: .blue)
             }
 
             // Hot timer
@@ -2294,10 +2295,6 @@ struct RideCard: View {
                         Image(systemName: "person.2.fill")
                         Text("\(ride.bidCount) driver bid\(ride.bidCount == 1 ? "" : "s")")
                             .fontWeight(.semibold)
-                        if let lowest = ride.lowestBidCoins {
-                            Text("· best 🪙 \(lowest)")
-                                .foregroundStyle(.green)
-                        }
                         Spacer()
                         Image(systemName: "chevron.right")
                     }
@@ -2421,7 +2418,7 @@ struct RideCard: View {
     
     func openWhatsApp() {
         let cleanedCountryCode = ride.whatsappCountryCode.replacingOccurrences(of: "+", with: "")
-        let message = "Hi \(ride.name)! I saw your ride request on Vaahana (\(ride.from) → \(ride.to), \(ride.coins) coins). I'd love to help — interested?"
+        let message = "Hi \(ride.name)! I saw your ride request on Vaahana (\(ride.from) → \(ride.to)). I'd love to help — interested?"
         let encodedMessage = message.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
         if let url = URL(string: "https://wa.me/\(cleanedCountryCode)\(ride.whatsappPhone)?text=\(encodedMessage)") {
             UIApplication.shared.open(url)
@@ -2687,10 +2684,8 @@ struct MapTabView: View {
                 VStack(spacing: 1) {
                     Image(systemName: "figure.wave")
                         .font(.system(size: size * 0.28)).foregroundStyle(.white)
-                    if ride.coins > 0 {
-                        Text("🪙\(ride.coins)")
-                            .font(.system(size: 7, weight: .bold)).foregroundStyle(.white)
-                    }
+                    Text("R")
+                        .font(.system(size: 7, weight: .bold)).foregroundStyle(.white)
                 }
                 if ride.isWhatsAppSource {
                     VStack {
@@ -2763,7 +2758,7 @@ struct SwitchRoleTab: View {
                     roleOption(
                         icon: "car.fill",
                         title: "Driver",
-                        description: "Browse nearby requests, place bids, and earn coins.",
+                        description: "Browse nearby requests and place offers to help riders.",
                         isActive: userState.role == .driver,
                         color: .primary,
                         onSelect: { switchRole(to: .driver) }
@@ -2868,7 +2863,6 @@ struct SettingsTab: View {
     @State private var displayName = ""
     @State private var phone = ""
     @State private var whatsapp = ""
-    @State private var coins: Int = 0
     @State private var ratingAverage: Double? = nil
     @State private var isSaving = false
     @State private var errorMessage: String?
@@ -2928,8 +2922,6 @@ struct SettingsTab: View {
                                 Label(userState.role == .driver ? "Driver" : "Rider",
                                       systemImage: userState.role == .driver ? "car.fill" : "figure.wave")
                                     .font(.caption).foregroundStyle(.blue)
-                                Label("🪙 \(coins)", systemImage: "")
-                                    .font(.caption).fontWeight(.semibold).foregroundStyle(.orange)
                                 if let avg = ratingAverage {
                                     HStack(spacing: 2) {
                                         Image(systemName: "star.fill")
@@ -3109,7 +3101,6 @@ struct SettingsTab: View {
                 displayName  = data["displayName"] as? String ?? currentUser?.displayName ?? ""
                 phone        = data["phone"]       as? String ?? ""
                 whatsapp     = data["whatsapp"]    as? String ?? ""
-                coins        = data["coins"]       as? Int    ?? 0
                 vehicleMake  = data["vehicleMake"]  as? String ?? ""
                 vehicleModel = data["vehicleModel"] as? String ?? ""
                 vehicleColor = data["vehicleColor"] as? String ?? ""

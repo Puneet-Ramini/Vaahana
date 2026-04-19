@@ -121,7 +121,7 @@ class UserState: ObservableObject {
                     self.role = role
                 } else {
                     self.role = .rider
-                    self.db.collection("users").document(uid).setData(["role": "rider", "coins": 100, "coinsLocked": 0], merge: true)
+                    self.db.collection("users").document(uid).setData(["role": "rider"], merge: true)
                 }
 
                 // Cache profile fields and decide if setup sheet is needed
@@ -140,21 +140,6 @@ class UserState: ObservableObject {
                     self.db.collection("users").document(uid).setData(["fcmToken": token], merge: true)
                 }
                 #endif
-
-                // Daily coin grant: 100 coins per day to every user
-                let formatter = DateFormatter()
-                formatter.dateFormat = "yyyy-MM-dd"
-                let today = formatter.string(from: Date())
-                let lastGrant = data?["lastDailyCoinDate"] as? String ?? ""
-                if lastGrant != today {
-                    var grant: [String: Any] = [
-                        "coins":             FieldValue.increment(Int64(100)),
-                        "lastDailyCoinDate": today,
-                    ]
-                    // Ensure coinsLocked exists for users created before we added it
-                    if data?["coinsLocked"] == nil { grant["coinsLocked"] = 0 }
-                    self.db.collection("users").document(uid).setData(grant, merge: true)
-                }
 
                 self.isLoadingRole = false
             }

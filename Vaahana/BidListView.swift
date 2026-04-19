@@ -2,8 +2,8 @@
 //  BidListView.swift
 //  Vaahana
 //
-//  Rider view: live list of driver bids on a posted ride.
-//  Sorted lowest-coin-first. Rider chooses one to accept.
+//  Rider view: live list of driver responses on a posted ride.
+//  Rider chooses one to accept.
 //
 
 import SwiftUI
@@ -26,7 +26,9 @@ struct BidListView: View {
     private let db = Firestore.firestore()
 
     var activeBids: [RideBid] {
-        bids.filter { $0.status == .active }.sorted { $0.bidCoins < $1.bidCoins }
+        bids
+            .filter { $0.status == .active }
+            .sorted(by: { ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast) })
     }
 
     // MARK: - Body
@@ -97,15 +99,13 @@ struct BidListView: View {
                 // Summary header
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Your offer: 🪙 \(ride.coins)")
+                        Text("Needed \(ride.pickupDate.formatted(date: .abbreviated, time: .shortened))")
                             .font(.subheadline).foregroundStyle(.secondary)
-                        if let lowest = ride.lowestBidCoins {
-                            Text("Best bid: 🪙 \(lowest)")
-                                .font(.subheadline).fontWeight(.semibold).foregroundStyle(.green)
-                        }
+                        Text("Posted \(ride.createdAt.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.subheadline).fontWeight(.semibold)
                     }
                     Spacer()
-                    Text("Sorted: lowest first")
+                    Text("Sorted: newest first")
                         .font(.caption2).foregroundStyle(.secondary)
                 }
                 .padding(.horizontal, 4)
@@ -122,7 +122,7 @@ struct BidListView: View {
 
     private func bidCard(_ bid: RideBid) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Driver + coins
+            // Driver header
             HStack(spacing: 12) {
                 Circle()
                     .fill(Color.blue)
@@ -138,12 +138,6 @@ struct BidListView: View {
                 }
 
                 Spacer()
-
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text("🪙 \(bid.bidCoins)")
-                        .font(.title3).fontWeight(.bold).foregroundStyle(.orange)
-                    savingsLabel(bid)
-                }
             }
 
             // Optional message
@@ -185,20 +179,6 @@ struct BidListView: View {
         .shadow(color: .black.opacity(0.05), radius: 6)
     }
 
-    @ViewBuilder
-    private func savingsLabel(_ bid: RideBid) -> some View {
-        if bid.bidCoins < ride.coins {
-            Text("saves \(ride.coins - bid.bidCoins) 🪙")
-                .font(.caption2).foregroundStyle(.green)
-        } else if bid.bidCoins > ride.coins {
-            Text("+\(bid.bidCoins - ride.coins) extra")
-                .font(.caption2).foregroundStyle(.secondary)
-        } else {
-            Text("as offered")
-                .font(.caption2).foregroundStyle(.blue)
-        }
-    }
-
     // MARK: - Empty State
 
     private var emptyState: some View {
@@ -233,7 +213,7 @@ struct BidListView: View {
     }
 
     private func openWhatsApp(bid: RideBid) {
-        let msg = "Hi \(bid.driverName), I saw your bid on Vaahana (\(ride.from) → \(ride.to), 🪙 \(bid.bidCoins)). Are you available?"
+        let msg = "Hi \(bid.driverName), I saw your response on Vaahana for \(ride.from) → \(ride.to). Are you available?"
         let encoded = msg.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
         let cleaned = bid.driverWhatsapp.replacingOccurrences(of: " ", with: "")
         if let url = URL(string: "https://wa.me/\(cleaned)?text=\(encoded)") {

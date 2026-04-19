@@ -14,12 +14,11 @@
  *
  *  reconcileRecentRides       — scheduled every 5 min
  *    Scans non-final rides and recently-finalized rides (last 7 days).
- *    Repairs: stale active bids, locked-coin leaks, posted-ride stale fields.
- *    Logs:    missing drivers on active rides, missing coin transactions.
+ *    Repairs: stale active bids, posted-ride stale fields.
+ *    Logs:    missing drivers on active rides.
  *
  *  reconcileUserLocks         — scheduled every 5 min
- *    For every user with coinsLocked > 0, recomputes the expected lock amount
- *    from their active rides and patches any mismatch.
+ *    Legacy placeholder after pricing removal.
  *
  *  reconcileDriverAssignments — scheduled every 5 min
  *    For every user whose activeRideId is set, verifies the referenced ride
@@ -34,6 +33,7 @@ const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { onCall, HttpsError, onRequest } = require("firebase-functions/v2/https");
 const { onDocumentCreated, onDocumentUpdated } = require("firebase-functions/v2/firestore");
 const { initializeApp } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const { getMessaging } = require("firebase-admin/messaging");
 const { defineSecret } = require("firebase-functions/params");
@@ -43,11 +43,15 @@ const WHATSAPP_API_KEY = defineSecret("WHATSAPP_INGEST_API_KEY");
 
 initializeApp();
 const db = getFirestore();
+const auth = getAuth();
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const FINAL_STATUSES  = ["completed", "cancelled", "expired"];
 const ACTIVE_STATUSES = ["accepted", "driver_enroute", "driver_arrived", "ride_started"];
+const FIREBASE_WEB_API_KEY = "AIzaSyBrlq9vEjWgWt6vwrS00HQUJoSWfpAuTFk";
+const PASSWORD_RESET_LIMIT_PER_MONTH = 2;
+const PASSWORD_RESET_HANDLER_URL = "https://vaahana-fb9b8.web.app/reset-password";
 
 const Severity = {
   INFO:     "info",
@@ -69,6 +73,62 @@ const IssueCode = {
 };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function getMonthKeyInNewYork(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+  }).formatToParts(date);
+
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  return `${year}-${month}`;
+}
+
+function passwordFingerprint(uid, password) {
+  return crypto
+    .scryptSync(password, `vaahana-password-history:${uid}`, 32)
+    .toString("hex");
+}
+
+async function callIdentityToolkit(path, payload) {
+  const response = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/${path}?key=${FIREBASE_WEB_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }
+  );
+
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(json.error?.message || "IDENTITY_TOOLKIT_ERROR");
+  }
+  return json;
+}
+
+function mapPasswordResetError(error) {
+  const code = typeof error?.message === "string" ? error.message : "";
+
+  switch (code) {
+    case "EMAIL_NOT_FOUND":
+      return new HttpsError("not-found", "No account was found for that email.");
+    case "INVALID_EMAIL":
+      return new HttpsError("invalid-argument", "Please enter a valid email address.");
+    case "EXPIRED_OOB_CODE":
+    case "INVALID_OOB_CODE":
+      return new HttpsError("failed-precondition", "This reset link is invalid or has expired. Request a new one.");
+    case "WEAK_PASSWORD":
+      return new HttpsError("invalid-argument", "Password must be at least 6 characters.");
+    default:
+      if (code.startsWith("WEAK_PASSWORD")) {
+        return new HttpsError("invalid-argument", "Password must be at least 6 characters.");
+      }
+      return new HttpsError("internal", "Password reset failed. Please try again.");
+  }
+}
 
 /**
  * Writes one entry to the reconciliationLogs collection.
@@ -125,12 +185,10 @@ async function sendToUser(uid, title, body, data = {}) {
  *
  * Safe auto-repairs applied here:
  *   - Close active bids on final rides
- *   - Refund locked coins on cancelled/expired rides
- *   - Clear stale driver/bid/finalCoins fields on posted rides
+ *   - Clear stale driver/bid fields on posted rides
  *
  * Log-only (not auto-repaired):
  *   - Missing driver on active ride
- *   - Missing coin transaction on completed ride
  */
 async function inspectRide(rideDoc) {
   const ride    = rideDoc.data();
@@ -140,7 +198,7 @@ async function inspectRide(rideDoc) {
   const isFinal = FINAL_STATUSES.includes(status);
   const issues  = [];
 
-  // ── A1 & A5: Final rides — close active bids & refund locked coins ─────────
+  // ── A1: Final rides — close active bids ───────────────────────────────────
 
   if (isFinal) {
     // Close any bids still marked active
@@ -168,53 +226,6 @@ async function inspectRide(rideDoc) {
       await writeLog({ entityType: "ride", entityId: rideId, severity: Severity.WARNING, ...issue });
     }
 
-    // Refund locked coins on cancelled/expired rides
-    const coinsLocked = ride.coinsLocked || 0;
-    const needsRefund  = (status === "cancelled" || status === "expired") && coinsLocked > 0;
-
-    if (needsRefund && ride.riderId) {
-      const riderRef = db.collection("users").doc(ride.riderId);
-      const batch    = db.batch();
-      batch.update(riderRef, {
-        coins:       FieldValue.increment(coinsLocked),
-        coinsLocked: FieldValue.increment(-coinsLocked),
-      });
-      batch.update(rideRef, {
-        coinStatus:  "refunded",
-        coinsLocked: 0,
-        updatedAt:   FieldValue.serverTimestamp(),
-      });
-      await batch.commit();
-
-      const issue = {
-        code:       IssueCode.LOCKED_COINS_ON_CANCELLED_RIDE,
-        actionTaken: "auto_refunded",
-        details: { rideStatus: status, riderId: ride.riderId, coinsLocked },
-      };
-      issues.push(issue);
-      await writeLog({ entityType: "ride", entityId: rideId, severity: Severity.WARNING, ...issue });
-    }
-
-    // Log completed rides missing a coin transaction (manual review only)
-    if (status === "completed") {
-      const txSnap = await db.collection("coinTransactions")
-        .where("rideId", "==", rideId)
-        .limit(1)
-        .get();
-
-      if (txSnap.empty) {
-        const issue = {
-          code:       IssueCode.MISSING_COIN_TRANSACTION,
-          actionTaken: "logged_for_manual_review",
-          details: {
-            driverId:        ride.driverId || null,
-            coinsTransferred: ride.coinsTransferred || 0,
-          },
-        };
-        issues.push(issue);
-        await writeLog({ entityType: "ride", entityId: rideId, severity: Severity.ERROR, ...issue });
-      }
-    }
   }
 
   // ── A2: Active rides must have a driver ────────────────────────────────────
@@ -235,8 +246,6 @@ async function inspectRide(rideDoc) {
     const staleFields = {};
     if (ride.driverId)      staleFields.driverId      = FieldValue.delete();
     if (ride.selectedBidId) staleFields.selectedBidId = FieldValue.delete();
-    if (ride.finalCoins)    staleFields.finalCoins    = FieldValue.delete();
-    if (ride.coinsLocked && ride.coinsLocked > 0) staleFields.coinsLocked = 0;
 
     if (Object.keys(staleFields).length > 0) {
       staleFields.updatedAt = FieldValue.serverTimestamp();
@@ -305,7 +314,7 @@ exports.reconcileRecentRides = onSchedule(
   }
 );
 
-// ─── Function 2: reconcileUserLocks ──────────────────────────────────────────
+// ─── Function 2: reconcileUserLocks (legacy no-op) ──────────────────────────
 
 exports.reconcileUserLocks = onSchedule(
   {
@@ -314,59 +323,7 @@ exports.reconcileUserLocks = onSchedule(
     memory:         "256MiB",
   },
   async () => {
-    // All users who have locked coins
-    const usersSnap = await db.collection("users")
-      .where("coinsLocked", ">", 0)
-      .get();
-
-    console.log(`[reconcileUserLocks] Checking ${usersSnap.size} users with coinsLocked > 0`);
-    let corrections = 0;
-
-    for (const userDoc of usersSnap.docs) {
-      try {
-        const uid           = userDoc.id;
-        const currentLocked = userDoc.data().coinsLocked || 0;
-
-        // Fetch all rides where this rider has coins in locked state
-        const lockedRidesSnap = await db.collection("rides")
-          .where("riderId", "==", uid)
-          .where("coinStatus", "==", "locked")
-          .get();
-
-        // Only count coins from non-final rides
-        let expectedLocked = 0;
-        for (const rideDoc of lockedRidesSnap.docs) {
-          const rideData = rideDoc.data();
-          if (!FINAL_STATUSES.includes(rideData.status)) {
-            expectedLocked += rideData.coinsLocked || 0;
-          }
-        }
-
-        if (currentLocked !== expectedLocked) {
-          await db.collection("users").doc(uid).update({
-            coinsLocked: expectedLocked,
-            updatedAt:   FieldValue.serverTimestamp(),
-          });
-          corrections++;
-          await writeLog({
-            entityType: "user",
-            entityId:   uid,
-            severity:   Severity.WARNING,
-            issueCode:  IssueCode.LOCKED_COINS_MISMATCH,
-            actionTaken: "auto_corrected",
-            details: {
-              wasLocked:       currentLocked,
-              nowLocked:       expectedLocked,
-              lockedRideCount: lockedRidesSnap.size,
-            },
-          });
-        }
-      } catch (err) {
-        console.error(`[reconcileUserLocks] Error on user ${userDoc.id}:`, err.message);
-      }
-    }
-
-    console.log(`[reconcileUserLocks] Done. Users checked: ${usersSnap.size}, Corrected: ${corrections}`);
+    console.log("[reconcileUserLocks] skipped; pricing flow removed");
   }
 );
 
@@ -453,15 +410,11 @@ exports.reconcileDriverAssignments = onSchedule(
   }
 );
 
-// ─── Function 4: grantDailyCoins ─────────────────────────────────────────────
+// ─── Function 4: grantDailyCoins (legacy no-op) ─────────────────────────────
 
 /**
- * Runs at midnight UTC every day.
- * Grants 100 coins to every user who hasn't already received them today
- * (checked via the `lastDailyCoinDate` field — "YYYY-MM-DD" string).
- *
- * The iOS app also does a client-side grant on launch as a failsafe,
- * but this function covers users who don't open the app that day.
+ * Retained as a scheduled placeholder so existing deployments keep a stable
+ * function surface after pricing removal.
  */
 exports.grantDailyCoins = onSchedule(
   {
@@ -470,34 +423,7 @@ exports.grantDailyCoins = onSchedule(
     memory:         "512MiB",
   },
   async () => {
-    const today        = new Date().toISOString().split("T")[0]; // "2026-04-10"
-    const allUsersSnap = await db.collection("users").get();
-
-    const BATCH_SIZE = 450;
-    let batch        = db.batch();
-    let opCount      = 0;
-    let grantCount   = 0;
-
-    for (const userDoc of allUsersSnap.docs) {
-      const lastGrant = userDoc.data().lastDailyCoinDate || "";
-      if (lastGrant === today) continue; // already granted today
-
-      batch.update(userDoc.ref, {
-        coins:             FieldValue.increment(100),
-        lastDailyCoinDate: today,
-      });
-      opCount++;
-      grantCount++;
-
-      if (opCount >= BATCH_SIZE) {
-        await batch.commit();
-        batch   = db.batch();
-        opCount = 0;
-      }
-    }
-
-    if (opCount > 0) await batch.commit();
-    console.log(`[grantDailyCoins] Granted 100 coins to ${grantCount}/${allUsersSnap.size} users on ${today}`);
+    console.log("[grantDailyCoins] skipped; pricing flow removed");
   }
 );
 
@@ -1254,20 +1180,12 @@ exports.ingestWhatsAppMessages = onRequest(
           pickupLng:           geo ? geo.lng : null,
 
           // Timing
-          coins:               0,            // driver makes an offer via bid
           hotDuration:         rideData.hotDuration,
           pickupDate:          rideData.pickupDate,
-
-          // Coin state
-          coinStatus:          "none",
-          coinsLocked:         0,
-          coinsTransferred:    0,
 
           // Bid marketplace
           bidCount:            0,
           selectedBidId:       null,
-          finalCoins:          null,
-          lowestBidCoins:      null,
           latestBidAt:         null,
 
           // Driver (empty until accepted)
@@ -1393,12 +1311,11 @@ exports.onBidPlaced = onDocumentCreated(
     if (ride.status !== "posted") return;
 
     const driverName = bid.driverName || "A driver";
-    const coins      = bid.bidCoins   || 0;
 
     await sendToUser(
       ride.riderId,
-      "New bid on your ride",
-      `${driverName} offered ${coins} coins for ${ride.from} → ${ride.to}`,
+      "New driver response",
+      `${driverName} responded to your request for ${ride.from} → ${ride.to}`,
       { type: "new_bid", rideId }
     );
   }
@@ -1520,3 +1437,155 @@ exports.checkPhoneUnique = onCall(async (request) => {
   }
   return { unique: true };
 });
+
+// ─── Password reset management ───────────────────────────────────────────────
+
+exports.recordCurrentPassword = onCall(
+  { enforceAppCheck: false },
+  async (request) => {
+    if (!request.auth?.uid) {
+      throw new HttpsError("unauthenticated", "Must be signed in.");
+    }
+
+    const password = String(request.data?.password || "");
+    if (password.length < 6) {
+      throw new HttpsError("invalid-argument", "Password must be at least 6 characters.");
+    }
+
+    await db.collection("passwordResetMeta").doc(request.auth.uid).set({
+      lastPasswordHash: passwordFingerprint(request.auth.uid, password),
+      lastPasswordChangedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return { recorded: true };
+  }
+);
+
+exports.sendManagedPasswordResetEmail = onCall(
+  { enforceAppCheck: false },
+  async (request) => {
+    const email = String(request.data?.email || "").trim().toLowerCase();
+    if (!email) {
+      throw new HttpsError("invalid-argument", "Email is required.");
+    }
+
+    let userRecord;
+    try {
+      userRecord = await auth.getUserByEmail(email);
+    } catch (error) {
+      if (error?.code === "auth/user-not-found") {
+        return { sent: true };
+      }
+      throw new HttpsError("internal", "Unable to process password reset right now.");
+    }
+
+    const metaRef = db.collection("passwordResetMeta").doc(userRecord.uid);
+    const monthKey = getMonthKeyInNewYork();
+
+    await db.runTransaction(async (transaction) => {
+      const metaDoc = await transaction.get(metaRef);
+      const meta = metaDoc.exists ? metaDoc.data() : {};
+      const currentMonth = meta.resetRequestMonth === monthKey ? monthKey : null;
+      const requestCount = currentMonth ? (meta.resetRequestCount || 0) : 0;
+
+      if (requestCount >= PASSWORD_RESET_LIMIT_PER_MONTH) {
+        throw new HttpsError(
+          "resource-exhausted",
+          "You can request a password reset only twice per month."
+        );
+      }
+
+      transaction.set(metaRef, {
+        resetRequestMonth: monthKey,
+        resetRequestCount: requestCount + 1,
+        lastResetRequestAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+    });
+
+    try {
+      await callIdentityToolkit("accounts:sendOobCode", {
+        requestType: "PASSWORD_RESET",
+        email,
+        continueUrl: PASSWORD_RESET_HANDLER_URL,
+      });
+    } catch (error) {
+      if (error?.message === "EMAIL_NOT_FOUND") {
+        return { sent: true };
+      }
+      await metaRef.set({
+        resetRequestMonth: monthKey,
+        resetRequestCount: FieldValue.increment(-1),
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      throw mapPasswordResetError(error);
+    }
+
+    return { sent: true };
+  }
+);
+
+exports.finalizeManagedPasswordReset = onCall(
+  { enforceAppCheck: false },
+  async (request) => {
+    const oobCode = String(request.data?.oobCode || "").trim();
+    const newPassword = String(request.data?.newPassword || "");
+
+    if (!oobCode) {
+      throw new HttpsError("invalid-argument", "Reset code is required.");
+    }
+    if (newPassword.length < 6) {
+      throw new HttpsError("invalid-argument", "Password must be at least 6 characters.");
+    }
+
+    let resetInfo;
+    try {
+      resetInfo = await callIdentityToolkit("accounts:resetPassword", { oobCode });
+    } catch (error) {
+      throw mapPasswordResetError(error);
+    }
+
+    const email = String(resetInfo?.email || "").trim().toLowerCase();
+    if (!email) {
+      throw new HttpsError("failed-precondition", "This reset link is invalid or has expired. Request a new one.");
+    }
+
+    let userRecord;
+    try {
+      userRecord = await auth.getUserByEmail(email);
+    } catch {
+      throw new HttpsError("not-found", "No account was found for that reset link.");
+    }
+
+    const metaRef = db.collection("passwordResetMeta").doc(userRecord.uid);
+    const metaDoc = await metaRef.get();
+    const lastPasswordHash = metaDoc.exists ? metaDoc.data().lastPasswordHash : null;
+    const newPasswordHash = passwordFingerprint(userRecord.uid, newPassword);
+
+    if (lastPasswordHash && lastPasswordHash === newPasswordHash) {
+      throw new HttpsError(
+        "failed-precondition",
+        "New password must be different from your previous password."
+      );
+    }
+
+    try {
+      await callIdentityToolkit("accounts:resetPassword", {
+        oobCode,
+        newPassword,
+      });
+    } catch (error) {
+      throw mapPasswordResetError(error);
+    }
+
+    await metaRef.set({
+      lastPasswordHash: newPasswordHash,
+      lastPasswordChangedAt: FieldValue.serverTimestamp(),
+      lastResetCompletedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return { success: true };
+  }
+);

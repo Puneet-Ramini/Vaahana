@@ -200,16 +200,18 @@ struct SignUpView: View {
                     "phone":       phone.trimmingCharacters(in: .whitespaces),
                     "whatsapp":    phone.trimmingCharacters(in: .whitespaces),
                     "role":        "rider",
-                    "coins":       100,
-                    "coinsLocked": 0,
                     "isAdmin":     false,
                 ], merge: true)
 
-                // Send Firebase verification email
-                user.sendEmailVerification { _ in
-                    DispatchQueue.main.async {
-                        isLoading = false
-                        screen = .verifyEmail
+                // Seed password history so reset flow can reject password reuse.
+                let recordPassword = functions.httpsCallable("recordCurrentPassword")
+                recordPassword.call(["password": password]) { _, _ in
+                    // Send Firebase verification email
+                    user.sendEmailVerification { _ in
+                        DispatchQueue.main.async {
+                            isLoading = false
+                            screen = .verifyEmail
+                        }
                     }
                 }
             }
@@ -450,6 +452,8 @@ struct ForgotPasswordView: View {
     @State private var sent       = false
     @State private var errorMessage: String?
 
+    private let functions = Functions.functions()
+
     var body: some View {
         VStack(spacing: 32) {
             Spacer()
@@ -515,12 +519,15 @@ struct ForgotPasswordView: View {
     private func sendReset() {
         isSending = true
         errorMessage = nil
-        Auth.auth().sendPasswordReset(
-            withEmail: email.lowercased().trimmingCharacters(in: .whitespaces)
-        ) { error in
+        let callable = functions.httpsCallable("sendManagedPasswordResetEmail")
+        callable.call([
+            "email": email.lowercased().trimmingCharacters(in: .whitespaces)
+        ]) { _, error in
             DispatchQueue.main.async {
                 isSending = false
-                if let error { errorMessage = error.localizedDescription }
+                if let error {
+                    errorMessage = SignUpView.callableError(error)
+                }
                 else { sent = true }
             }
         }

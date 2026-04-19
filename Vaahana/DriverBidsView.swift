@@ -130,16 +130,11 @@ private struct BidEntryCard: View {
                 }
             }
 
-            // Coins row
+            // Timing row
             HStack(spacing: 16) {
-                Label("Your bid: \(entry.bid.bidCoins) coins", systemImage: "circle.fill")
+                Label(entry.bid.timeAgo, systemImage: "clock")
                     .font(.subheadline)
-                    .foregroundStyle(.orange)
-                if entry.rideCoins > 0 {
-                    Text("Rider offered: \(entry.rideCoins)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                    .foregroundStyle(.blue)
                 Spacer()
             }
 

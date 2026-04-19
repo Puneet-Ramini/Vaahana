@@ -12,7 +12,6 @@ struct ProfileView: View {
     @State private var phone = ""
     @State private var whatsapp = ""
     @State private var role: UserRole? = nil
-    @State private var coins: Int = 0
     @State private var ratingAverage: Double? = nil
     @State private var isSaving = false
     @State private var errorMessage: String?
@@ -53,18 +52,13 @@ struct ProfileView: View {
                     .listRowBackground(Color.clear)
                 }
 
-                // Role + Coins
+                // Role
                 Section {
                     HStack {
                         Label(role == .driver ? "Driver" : "Rider",
                               systemImage: role == .driver ? "car.fill" : "figure.wave")
                         Spacer()
                         Text("Role").font(.caption).foregroundStyle(.secondary)
-                    }
-                    HStack {
-                        Text("🪙 \(coins) coins")
-                        Spacer()
-                        Text("Balance").font(.caption).foregroundStyle(.secondary)
                     }
                 } header: {
                     Text("Account")
@@ -178,7 +172,6 @@ struct ProfileView: View {
             displayName  = data["displayName"] as? String ?? currentUser?.displayName ?? ""
             phone        = data["phone"]       as? String ?? ""
             whatsapp     = data["whatsapp"]    as? String ?? ""
-            coins        = data["coins"]       as? Int    ?? 0
             vehicleMake  = data["vehicleMake"]  as? String ?? ""
             vehicleModel = data["vehicleModel"] as? String ?? ""
             vehicleColor = data["vehicleColor"] as? String ?? ""

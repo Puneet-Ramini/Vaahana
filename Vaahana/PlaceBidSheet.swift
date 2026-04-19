@@ -14,7 +14,6 @@ struct PlaceBidSheet: View {
     let existingBid: RideBid?
 
     @Environment(\.dismiss) private var dismiss
-    @State private var bidCoinsText: String
     @State private var message: String
     @State private var isSubmitting = false
     @State private var errorMessage: String?
@@ -25,13 +24,11 @@ struct PlaceBidSheet: View {
     init(ride: Ride, existingBid: RideBid? = nil) {
         self.ride = ride
         self.existingBid = existingBid
-        _bidCoinsText = State(initialValue: "\(existingBid?.bidCoins ?? ride.coins)")
         _message      = State(initialValue: existingBid?.message ?? "")
     }
 
-    private var bidCoins: Int  { Int(bidCoinsText) ?? 0 }
     private var isEditing: Bool { existingBid != nil }
-    private var isValid: Bool   { bidCoins > 0 && !isSubmitting }
+    private var isValid: Bool   { !isSubmitting }
 
     // MARK: - Body
 
@@ -45,44 +42,14 @@ struct PlaceBidSheet: View {
                         Image(systemName: "arrow.right").foregroundStyle(.secondary)
                         Text(ride.to).fontWeight(.semibold)
                     }
-                    HStack {
-                        Text("Rider offering")
-                        Spacer()
-                        Text("🪙 \(ride.coins) coins")
-                            .fontWeight(.semibold)
-                            .foregroundStyle(.orange)
-                    }
                 }
 
-                // Bid amount
                 Section {
-                    HStack(spacing: 8) {
-                        Text("🪙")
-                            .font(.title3)
-                        TextField("Coins", text: $bidCoinsText)
-                            .keyboardType(.numberPad)
-                            .font(.title3)
-                            .fontWeight(.semibold)
-                        Text("coins")
-                            .foregroundStyle(.secondary)
-                    }
-
-                    if bidCoins > 0 {
-                        if bidCoins < ride.coins {
-                            Label("Lower than rider's offer — great deal!", systemImage: "arrow.down.circle.fill")
-                                .font(.caption).foregroundStyle(.green)
-                        } else if bidCoins > ride.coins {
-                            Label("Higher than rider's offer", systemImage: "arrow.up.circle.fill")
-                                .font(.caption).foregroundStyle(.orange)
-                        } else {
-                            Label("Matches rider's offered amount", systemImage: "checkmark.circle.fill")
-                                .font(.caption).foregroundStyle(.blue)
-                        }
-                    }
-                } header: {
-                    Text("Your Bid")
+                    Text("Send a short note so the rider knows your ETA or any pickup details.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                 } footer: {
-                    Text("Coins are locked only after the rider chooses you. You can edit or withdraw until then.")
+                    Text("You can edit or withdraw your response until the rider chooses you.")
                 }
 
                 // Optional message
@@ -158,7 +125,6 @@ struct PlaceBidSheet: View {
                 try await RideService.shared.placeBid(
                     ride:          ride,
                     existingBidId: existingBid?.id,
-                    bidCoins:      bidCoins,
                     message:       message.isEmpty ? nil : message,
                     driverName:    driverName,
                     driverPhone:   driverPhone,

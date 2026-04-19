@@ -36,7 +36,7 @@ struct RoleSelectionView: View {
                     RoleCard(
                         icon: "figure.wave",
                         title: "I need a ride",
-                        subtitle: "Post ride requests. Earn coins when drivers help you.",
+                        subtitle: "Post ride requests and get matched with nearby drivers.",
                         color: .blue,
                         isLoading: isSaving,
                         onSelect: { save(.rider) }
@@ -45,7 +45,7 @@ struct RoleSelectionView: View {
                     RoleCard(
                         icon: "car.fill",
                         title: "I'm a driver",
-                        subtitle: "Browse nearby hot requests. Help your community, earn coins.",
+                        subtitle: "Browse nearby hot requests and help your community.",
                         color: .black,
                         isLoading: isSaving,
                         onSelect: { save(.driver) }
@@ -73,15 +73,7 @@ struct RoleSelectionView: View {
         errorMessage = nil
         Task {
             do {
-                var userData: [String: Any] = ["role": role.rawValue]
-                if role == .rider {
-                    // New riders start with 100 coins; don't overwrite if doc already has coins
-                    let existing = try? await db.collection("users").document(uid).getDocument()
-                    if existing?.data()?["coins"] == nil {
-                        userData["coins"] = 100
-                        userData["coinsLocked"] = 0
-                    }
-                }
+                let userData: [String: Any] = ["role": role.rawValue]
                 try await db.collection("users").document(uid).setData(userData, merge: true)
                 await MainActor.run {
                     isSaving = false

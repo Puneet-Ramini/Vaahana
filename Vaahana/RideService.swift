@@ -2,7 +2,7 @@
 //  RideService.swift
 //  Vaahana
 //
-//  Handles ride lifecycle transitions and coin operations via Firestore transactions.
+//  Handles ride lifecycle transitions and bid selection via Firestore transactions.
 //
 
 import Foundation
@@ -10,7 +10,7 @@ import FirebaseFirestore
 import FirebaseAuth
 
 /// Central service for all ride lifecycle mutations.
-/// All state changes go through here to ensure atomic coin operations.
+/// All state changes go through here to ensure atomic ride assignment updates.
 final class RideService {
     static let shared = RideService()
     private let db = Firestore.firestore()
@@ -18,7 +18,7 @@ final class RideService {
 
     // MARK: - Accept Ride
 
-    /// Driver accepts a posted ride. Locks the rider's coins atomically.
+    /// Driver accepts a posted ride.
     func acceptRide(
         _ ride: Ride,
         driverName: String,
@@ -28,9 +28,8 @@ final class RideService {
         guard let driverId = Auth.auth().currentUser?.uid else {
             throw RideServiceError.notAuthenticated
         }
-        let rideRef   = db.collection("rides").document(ride.id.uuidString)
-        let riderRef  = db.collection("users").document(ride.riderId)
-        let now       = Date()
+        let rideRef = db.collection("rides").document(ride.id.uuidString)
+        let now     = Date()
 
         try await db.runTransaction { transaction, errorPointer in
             // Verify ride is still posted
@@ -46,25 +45,6 @@ final class RideService {
                 return nil
             }
 
-            // Verify rider has enough coins
-            let riderDoc: DocumentSnapshot
-            do { riderDoc = try transaction.getDocument(riderRef) }
-            catch let e { errorPointer?.pointee = e as NSError; return nil }
-
-            let riderCoins = riderDoc.data()?["coins"] as? Int ?? 0
-            guard riderCoins >= ride.coins else {
-                errorPointer?.pointee = NSError(
-                    domain: "RideService", code: 402,
-                    userInfo: [NSLocalizedDescriptionKey: "Rider does not have enough coins."])
-                return nil
-            }
-
-            // Lock coins from rider's balance
-            transaction.updateData([
-                "coins":       riderCoins - ride.coins,
-                "coinsLocked": FieldValue.increment(Int64(ride.coins))
-            ], forDocument: riderRef)
-
             // Mark ride accepted with driver info
             transaction.updateData([
                 "status":         "accepted",
@@ -72,8 +52,6 @@ final class RideService {
                 "driverName":     driverName,
                 "driverPhone":    driverPhone,
                 "driverWhatsapp": driverWhatsapp,
-                "coinStatus":     "locked",
-                "coinsLocked":    ride.coins,
                 "acceptedAt":     Timestamp(date: now),
                 "updatedAt":      Timestamp(date: now)
             ], forDocument: rideRef)
@@ -150,7 +128,7 @@ final class RideService {
     // MARK: - Cancel Ride
 
     /// Cancels the ride. Validates ownership, final-state, and cancellation rules.
-    /// Refunds locked coins and clears driver's activeRideId atomically.
+    /// Clears driver's activeRideId atomically when needed.
     func cancelRide(_ ride: Ride, cancelledBy uid: String, reason: String? = nil) async throws {
         guard let actorId = Auth.auth().currentUser?.uid, actorId == uid else {
             throw RideServiceError.notAuthenticated
@@ -164,7 +142,6 @@ final class RideService {
         }
 
         let rideRef   = db.collection("rides").document(ride.id.uuidString)
-        let riderRef  = db.collection("users").document(ride.riderId)
         let driverRef = ride.driverId.map { db.collection("users").document($0) }
         let now       = Date()
 
@@ -198,16 +175,6 @@ final class RideService {
                 return nil
             }
 
-            // Refund locked coins if applicable
-            let coinsLocked = rideDoc.data()?["coinsLocked"] as? Int ?? 0
-            if coinsLocked > 0 {
-                cancelFields["coinStatus"] = "refunded"
-                transaction.updateData([
-                    "coins":       FieldValue.increment(Int64(coinsLocked)),
-                    "coinsLocked": FieldValue.increment(Int64(-coinsLocked))
-                ], forDocument: riderRef)
-            }
-
             // Clear driver's active ride slot
             if let dr = driverRef {
                 transaction.updateData(["activeRideId": FieldValue.delete()], forDocument: dr)
@@ -220,8 +187,7 @@ final class RideService {
 
     // MARK: - Complete Ride
 
-    /// Completes the ride and transfers coins to the driver.
-    /// Uses `finalCoins` (the agreed bid amount) if available, else `coinsLocked`.
+    /// Completes the ride.
     /// Validates: actor is assigned driver, ride is in rideStarted state.
     func completeRide(_ ride: Ride) async throws {
         guard let actorId = Auth.auth().currentUser?.uid else {
@@ -235,11 +201,8 @@ final class RideService {
         }
 
         let rideRef   = db.collection("rides").document(ride.id.uuidString)
-        let riderRef  = db.collection("users").document(ride.riderId)
         let driverRef = db.collection("users").document(driverId)
-        let txnRef    = db.collection("coinTransactions").document(UUID().uuidString)
         let now       = Date()
-        let coins     = ride.finalCoins ?? ride.coinsLocked
 
         try await db.runTransaction { transaction, errorPointer in
             let rideDoc: DocumentSnapshot
@@ -262,23 +225,14 @@ final class RideService {
                 return nil
             }
 
-            transaction.updateData(["coinsLocked": FieldValue.increment(Int64(-coins))], forDocument: riderRef)
-            transaction.updateData(["coins": FieldValue.increment(Int64(coins)),
-                                    "activeRideId": FieldValue.delete()], forDocument: driverRef)
             transaction.updateData([
-                "status":           "completed",
-                "coinStatus":       "transferred",
-                "coinsTransferred": coins,
-                "completedAt":      Timestamp(date: now),
-                "updatedAt":        Timestamp(date: now)
+                "activeRideId": FieldValue.delete()
+            ], forDocument: driverRef)
+            transaction.updateData([
+                "status":      "completed",
+                "completedAt": Timestamp(date: now),
+                "updatedAt":   Timestamp(date: now)
             ], forDocument: rideRef)
-            transaction.setData([
-                "rideId":    ride.id.uuidString,
-                "fromUid":   ride.riderId,
-                "toUid":     driverId,
-                "coins":     coins,
-                "createdAt": Timestamp(date: now)
-            ], forDocument: txnRef)
             return nil
         }
     }
@@ -291,7 +245,6 @@ final class RideService {
     func placeBid(
         ride: Ride,
         existingBidId: String?,
-        bidCoins: Int,
         message: String?,
         driverName: String,
         driverPhone: String,
@@ -327,16 +280,11 @@ final class RideService {
         if let existingId = existingBidId {
             // Update the driver's existing bid
             var updates: [String: Any] = [
-                "bidCoins":  bidCoins,
                 "updatedAt": now
             ]
             if let msg = message { updates["message"] = msg } else { updates["message"] = FieldValue.delete() }
             try await bidsRef.document(existingId).updateData(updates)
-
-            // Keep ride summary fresh
-            if bidCoins < (ride.lowestBidCoins ?? Int.max) {
-                try await rideRef.updateData(["lowestBidCoins": bidCoins, "latestBidAt": now])
-            }
+            try await rideRef.updateData(["latestBidAt": now])
         } else {
             // New bid — create document, embed route info for collection-group queries
             let bidId = UUID().uuidString
@@ -347,23 +295,19 @@ final class RideService {
                 "driverName":     driverName,
                 "driverPhone":    driverPhone,
                 "driverWhatsapp": driverWhatsapp,
-                "bidCoins":       bidCoins,
                 "status":         "active",
                 "createdAt":      now,
                 "updatedAt":      now,
                 // Denormalized route info for DriverBidsStore collection-group listener
                 "rideFrom":       ride.from,
-                "rideTo":         ride.to,
-                "rideCoins":      ride.coins
+                "rideTo":         ride.to
             ]
             if let msg = message { bidData["message"] = msg }
             try await bidsRef.document(bidId).setData(bidData)
 
             // Update ride bid summary
-            let newLowest = min(ride.lowestBidCoins ?? bidCoins, bidCoins)
             try await rideRef.updateData([
                 "bidCount":      FieldValue.increment(Int64(1)),
-                "lowestBidCoins": newLowest,
                 "latestBidAt":   now
             ])
         }
@@ -389,7 +333,6 @@ final class RideService {
     /// - verify caller is the ride's rider
     /// - verify chosen driver has no active ride
     /// - mark ride accepted with selected driver details
-    /// - lock finalCoins from rider
     /// - mark chosen bid as selected
     /// Then batch-rejects remaining bids on this ride and auto-closes the selected
     /// driver's other active bids across all rides.
@@ -399,11 +342,10 @@ final class RideService {
         }
         let rideRef   = db.collection("rides").document(ride.id.uuidString)
         let bidRef    = rideRef.collection("bids").document(bid.id)
-        let riderRef  = db.collection("users").document(ride.riderId)
         let driverRef = db.collection("users").document(bid.driverId)
         let now       = Date()
 
-        // Transaction: verify + accept + lock coins
+        // Transaction: verify + accept
         try await db.runTransaction { transaction, errorPointer in
             let rideDoc: DocumentSnapshot
             do { rideDoc = try transaction.getDocument(rideRef) }
@@ -439,18 +381,6 @@ final class RideService {
                 return nil
             }
 
-            let riderDoc: DocumentSnapshot
-            do { riderDoc = try transaction.getDocument(riderRef) }
-            catch let e { errorPointer?.pointee = e as NSError; return nil }
-
-            let riderCoins = riderDoc.data()?["coins"] as? Int ?? 0
-            guard riderCoins >= bid.bidCoins else {
-                errorPointer?.pointee = NSError(
-                    domain: "RideService", code: 402,
-                    userInfo: [NSLocalizedDescriptionKey: "You don't have enough coins for this bid."])
-                return nil
-            }
-
             // Accept ride with selected driver
             transaction.updateData([
                 "status":         "accepted",
@@ -459,18 +389,9 @@ final class RideService {
                 "driverPhone":    bid.driverPhone,
                 "driverWhatsapp": bid.driverWhatsapp,
                 "selectedBidId":  bid.id,
-                "finalCoins":     bid.bidCoins,
-                "coinStatus":     "locked",
-                "coinsLocked":    bid.bidCoins,
                 "acceptedAt":     Timestamp(date: now),
                 "updatedAt":      Timestamp(date: now)
             ], forDocument: rideRef)
-
-            // Lock coins from rider
-            transaction.updateData([
-                "coins":       riderCoins - bid.bidCoins,
-                "coinsLocked": FieldValue.increment(Int64(bid.bidCoins))
-            ], forDocument: riderRef)
 
             // Mark the driver's activeRideId so they can't be double-booked
             transaction.updateData([

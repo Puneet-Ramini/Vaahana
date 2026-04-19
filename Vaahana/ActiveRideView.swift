@@ -87,10 +87,9 @@ struct ActiveRideView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text("🪙 \(ride.coins)")
+                Label(ride.postedAtShort, systemImage: "clock")
                     .font(.subheadline)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding()
@@ -203,9 +202,7 @@ struct ActiveRideView: View {
                 Task { await run { try await RideService.shared.cancelRide(ride, cancelledBy: uid) } }
             }
         } message: {
-            Text(ride.coinStatus == .locked
-                 ? "Your \(ride.coinsLocked) locked coins will be refunded."
-                 : "The ride will be cancelled.")
+            Text("The ride will be cancelled.")
         }
     }
 
