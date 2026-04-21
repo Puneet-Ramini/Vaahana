@@ -1,0 +1,1105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0a0a" />
+  <title>Vaahana</title>
+  <link rel="stylesheet" href="/assets/styles.css?v=6" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+</head>
+<body>
+  <!-- Loading shim -->
+  <div id="boot" class="page">
+    <div class="card center">
+      <div class="brand">Vaahana</div>
+      <div class="spinner dark" style="margin:12px auto;"></div>
+    </div>
+  </div>
+
+  <!-- Main app shell -->
+  <section id="view-app" class="hidden">
+    <div class="app-shell">
+      <header class="app-header">
+        <div class="app-title" id="app-title">Vaahana</div>
+        <button id="header-post" class="btn btn-sm btn-primary" style="width:auto;">
+          <i data-lucide="plus" class="icon-sm"></i>
+          Post
+        </button>
+      </header>
+
+      <div id="tab-home"     class="tab-view"></div>
+      <div id="tab-map"      class="tab-view hidden"></div>
+      <div id="tab-active"   class="tab-view hidden"></div>
+      <div id="tab-history"  class="tab-view hidden"></div>
+      <div id="tab-profile"  class="tab-view hidden"></div>
+    </div>
+
+    <nav class="tab-bar" id="tab-bar"></nav>
+  </section>
+
+  <!-- Post Ride Sheet -->
+  <div id="post-ride-sheet" class="sheet-backdrop hidden">
+    <div class="sheet">
+      <div class="sheet-handle"></div>
+      <div class="sheet-header">
+        <h2>Request a Ride</h2>
+        <button class="btn btn-sm btn-ghost" id="post-cancel">Cancel</button>
+      </div>
+
+      <div class="section-title"><i data-lucide="route" class="icon-sm"></i> Route</div>
+      <div class="field">
+        <label class="field-label">Pickup</label>
+        <input class="input" id="pr-pickup" type="text" placeholder="Start typing an address…" autocomplete="off" />
+        <div id="pr-pickup-results" class="geo-results hidden"></div>
+      </div>
+      <div class="field">
+        <label class="field-label">Drop-off</label>
+        <input class="input" id="pr-dropoff" type="text" placeholder="Start typing an address…" autocomplete="off" />
+        <div id="pr-dropoff-results" class="geo-results hidden"></div>
+      </div>
+
+      <div id="pr-map" class="map-container hidden"></div>
+
+      <div class="section-title"><i data-lucide="sliders-horizontal" class="icon-sm"></i> Details</div>
+      <div class="field">
+        <label class="field-label">Distance</label>
+        <div style="position:relative;">
+          <input class="input" id="pr-miles" type="text" readonly placeholder="Auto-calculated from route" style="padding-right:64px;cursor:default;background:var(--surface-2);" />
+          <div id="pr-miles-status" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);font-size:12px;color:var(--muted);pointer-events:none;"></div>
+        </div>
+      </div>
+      <div class="field">
+        <label class="field-label">Pickup time</label>
+        <input class="input" id="pr-date" type="datetime-local" />
+      </div>
+      <div class="field">
+        <label class="field-label">Active for</label>
+        <select class="select" id="pr-duration">
+          <option value="30" selected>30 minutes</option>
+          <option value="60">1 hour</option>
+          <option value="300">5 hours</option>
+          <option value="1440">1 day</option>
+        </select>
+      </div>
+
+      <div class="section-title"><i data-lucide="message-square" class="icon-sm"></i> Notes</div>
+      <div class="field">
+        <textarea class="textarea" id="pr-notes" placeholder="Special instructions for the driver…"></textarea>
+      </div>
+
+      <div class="section-title"><i data-lucide="phone" class="icon-sm"></i> Contact</div>
+      <div class="field">
+        <label class="field-label">Full name</label>
+        <input class="input" id="pr-name" type="text" />
+      </div>
+      <div class="field">
+        <label class="field-label">Phone</label>
+        <div class="input-row">
+          <select class="select" id="pr-cc">
+            <option value="+1">🇺🇸 +1</option>
+            <option value="+91">🇮🇳 +91</option>
+            <option value="+44">🇬🇧 +44</option>
+            <option value="+61">🇦🇺 +61</option>
+            <option value="+971">🇦🇪 +971</option>
+          </select>
+          <input class="input" id="pr-phone" type="tel" inputmode="numeric" />
+        </div>
+      </div>
+      <div class="toggle-row">
+        <span class="label">Same number for WhatsApp</span>
+        <label class="switch">
+          <input type="checkbox" id="pr-samewa" checked />
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="field hidden" id="pr-wa-field">
+        <label class="field-label">WhatsApp number</label>
+        <div class="input-row">
+          <select class="select" id="pr-wacc">
+            <option value="+1">🇺🇸 +1</option>
+            <option value="+91">🇮🇳 +91</option>
+            <option value="+44">🇬🇧 +44</option>
+            <option value="+61">🇦🇺 +61</option>
+            <option value="+971">🇦🇪 +971</option>
+          </select>
+          <input class="input" id="pr-waphone" type="tel" inputmode="numeric" />
+        </div>
+      </div>
+      <p class="tiny" style="padding:4px 2px 0;">Drivers will reach out on WhatsApp.</p>
+
+      <button class="btn btn-primary mt-16" id="pr-submit">
+        <span class="btn-label">Post Request</span>
+      </button>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="https://unpkg.com/lucide@0.441.0/dist/umd/lucide.min.js"></script>
+
+  <script type="module">
+    import {
+      auth, db, onAuthStateChanged, signOut,
+      doc, Timestamp,
+    } from "/assets/firebase.js";
+    import {
+      getUserProfile, saveUserProfile,
+      newRide, postRide, cancelRide,
+      driverAcceptRide, setRideStatus,
+      listenPostedRides, listenMyActiveRide, listenMyActiveDriverRide,
+      loadRideHistory,
+    } from "/assets/rides.js";
+    import { searchPlaces, routeDistanceMiles, haversineMiles } from "/assets/geo.js";
+    import {
+      el, timeAgo, fmtPickup, debounce, whatsappLink, telLink,
+      toast, prefillWhatsAppMessage,
+    } from "/assets/util.js";
+
+    // Lucide icon helper — returns an <i> placeholder that lucide.createIcons()
+    // swaps into an <svg>.
+    function icon(name, cls = "icon") {
+      return el("i", { "data-lucide": name, class: cls });
+    }
+    function refreshIcons() {
+      if (window.lucide) window.lucide.createIcons();
+    }
+
+    // ---- App state ----
+    const state = {
+      user: null,
+      profile: null,
+      tab: "home",
+      myRiderRide: null,    // ride I posted that's still active
+      myDriverRide: null,   // someone else's ride I accepted
+      postedRides: [],      // live feed of hot rides
+      unsubscribers: [],
+    };
+
+    // ---- Auth gate ----
+    onAuthStateChanged(auth, async (user) => {
+      if (!user || !user.emailVerified) {
+        window.location.href = "/";
+        return;
+      }
+      state.user = user;
+      state.profile = (await getUserProfile(user.uid)) || {};
+      startApp();
+    });
+
+    function startApp() {
+      document.getElementById("boot").classList.add("hidden");
+      document.getElementById("view-app").classList.remove("hidden");
+      buildTabBar();
+      setTab("home");
+      wireListeners();
+      refreshIcons();
+    }
+
+    function wireListeners() {
+      state.unsubscribers.forEach((u) => { try { u(); } catch {} });
+      state.unsubscribers = [
+        listenPostedRides((rides) => {
+          state.postedRides = rides;
+          if (state.tab === "home") renderHomeTab();
+          if (state.tab === "map")  rebuildMapMarkers();
+        }),
+        listenMyActiveRide(state.user.uid, (r) => {
+          state.myRiderRide = r;
+          if (state.tab === "home")   renderHomeTab();
+          if (state.tab === "active") renderActiveTab();
+          updateTabBadges();
+        }),
+        listenMyActiveDriverRide(state.user.uid, (r) => {
+          state.myDriverRide = r;
+          if (state.tab === "home")   renderHomeTab();
+          if (state.tab === "active") renderActiveTab();
+          updateTabBadges();
+        }),
+      ];
+    }
+
+    document.getElementById("header-post").onclick = openPostRideSheet;
+
+    // ---- Tab bar ----
+    function buildTabBar() {
+      const bar = document.getElementById("tab-bar");
+      const tabs = [
+        { id: "home",    label: "Home",    icon: "home" },
+        { id: "map",     label: "Map",     icon: "map" },
+        { id: "active",  label: "Active",  icon: "navigation" },
+        { id: "history", label: "History", icon: "history" },
+        { id: "profile", label: "Profile", icon: "user" },
+      ];
+      bar.innerHTML = "";
+      tabs.forEach((t) => {
+        const btn = el("button", { class: "tab-item", "data-tab": t.id, onclick: () => setTab(t.id) },
+          icon(t.icon, ""),
+          el("div", {}, t.label),
+        );
+        bar.appendChild(btn);
+      });
+      refreshIcons();
+    }
+
+    function setTab(id) {
+      state.tab = id;
+      document.querySelectorAll(".tab-item").forEach((n) => {
+        n.classList.toggle("active", n.dataset.tab === id);
+      });
+      document.querySelectorAll(".tab-view").forEach((n) => n.classList.add("hidden"));
+      document.getElementById(`tab-${id}`).classList.remove("hidden");
+      const titles = { home: "Vaahana", map: "Map", active: "Active Ride", history: "History", profile: "Profile" };
+      document.getElementById("app-title").textContent = titles[id] || "Vaahana";
+      renderCurrentTab();
+    }
+
+    function updateTabBadges() {
+      const activeItem = document.querySelector('.tab-item[data-tab="active"]');
+      if (!activeItem) return;
+      const existing = activeItem.querySelector(".dot");
+      const has = state.myRiderRide || state.myDriverRide;
+      if (has && !existing) {
+        const dot = document.createElement("div");
+        dot.className = "dot";
+        dot.style.cssText = "position:absolute;top:6px;right:14px;width:6px;height:6px;background:#fff;border-radius:50%;";
+        activeItem.style.position = "relative";
+        activeItem.appendChild(dot);
+      } else if (!has && existing) {
+        existing.remove();
+      }
+    }
+
+    function renderCurrentTab() {
+      if (state.tab === "home")    renderHomeTab();
+      if (state.tab === "map")     renderMapTab();
+      if (state.tab === "active")  renderActiveTab();
+      if (state.tab === "history") renderHistoryTab();
+      if (state.tab === "profile") renderProfileTab();
+      refreshIcons();
+    }
+
+    // ====== HOME (unified) ======
+    function renderHomeTab() {
+      const host = document.getElementById("tab-home");
+      host.innerHTML = "";
+
+      // 1) Your own active rides — summary cards at the top.
+      if (state.myRiderRide) {
+        host.appendChild(el("div", { class: "section-title" }, "Your request"));
+        host.appendChild(renderRideCard(state.myRiderRide, { viewAs: "rider" }));
+      }
+      if (state.myDriverRide) {
+        host.appendChild(el("div", { class: "section-title" }, "Ride you're driving"));
+        host.appendChild(renderRideCard(state.myDriverRide, { viewAs: "driver" }));
+      }
+
+      // 2) Nearby hot rides — exclude my own posted ride + rides I'm already driving.
+      const mine = new Set([state.myRiderRide?.id, state.myDriverRide?.id].filter(Boolean));
+      const nearby = (state.postedRides || []).filter((r) =>
+        r.riderId !== state.user.uid && !mine.has(r.id),
+      );
+
+      host.appendChild(el("div", { class: "section-title" }, "Nearby requests"));
+
+      if (nearby.length === 0) {
+        host.appendChild(el("div", { class: "empty" },
+          el("div", { class: "empty-icon" }, icon("inbox", "icon-lg")),
+          el("h3", { class: "mb-8" }, "No active requests"),
+          el("div", { class: "muted" }, "Post one to get a ride, or check back shortly."),
+        ));
+      } else {
+        nearby.forEach((r) => host.appendChild(renderRideCard(r, { viewAs: "browse" })));
+      }
+    }
+
+    function renderRideCard(r, { viewAs }) {
+      const card = el("div", { class: "ride-card" });
+
+      // Header: name + status badge
+      const status = statusLabel(r.status);
+      const badgeClass =
+        r.status === "posted" ? "badge-hot" :
+        ["accepted","driverEnroute","driverArrived","rideStarted"].includes(r.status) ? "badge-active" :
+        r.status === "completed" ? "badge-completed" :
+        r.status === "cancelled" ? "badge-cancelled" : "badge-expired";
+
+      const headerRight = el("div", { class: "row", style: "gap:6px;" });
+      if (r.source === "whatsapp") {
+        headerRight.appendChild(el("span", { class: "badge badge-whatsapp", title: "Via WhatsApp" },
+          icon("message-circle", "icon-sm"), "WhatsApp",
+        ));
+      }
+      headerRight.appendChild(el("span", { class: `badge ${badgeClass}` }, status));
+      card.appendChild(el("div", { class: "spread" },
+        el("strong", {}, viewAs === "driver" ? (r.name || "Rider") : (r.name || "You")),
+        headerRight,
+      ));
+
+      // Route
+      card.appendChild(el("div", { class: "route-row mt-8" },
+        el("span", { class: "route-dot pickup" }),
+        el("span", {}, r.from),
+      ));
+      card.appendChild(el("div", { class: "route-row" },
+        el("span", { class: "route-dot dropoff" }),
+        el("span", {}, r.to),
+      ));
+
+      card.appendChild(el("div", { class: "muted mt-8" },
+        `${(Number(r.miles) || 0).toFixed(1)} mi · ${fmtPickup(r.pickupDate)} · ${timeAgo(r.createdAt)}`,
+      ));
+
+      if (r.notes) {
+        card.appendChild(el("div", { class: "muted mt-8", style: "font-style:italic;" }, `"${r.notes}"`));
+      }
+
+      // Actions row depends on context.
+      const actions = el("div", { class: "row mt-12", style: "flex-wrap:wrap;gap:8px;" });
+
+      if (viewAs === "browse") {
+        const waMsg = prefillWhatsAppMessage(r, state.profile?.displayName || "");
+        actions.appendChild(el("a", {
+          class: "contact-pill wa", target: "_blank", rel: "noopener",
+          href: whatsappLink(r.whatsappCountryCode, r.whatsappPhone, waMsg),
+        }, icon("message-circle", "icon-sm"), "WhatsApp"));
+        actions.appendChild(el("a", {
+          class: "contact-pill call",
+          href: telLink(r.phoneCountryCode, r.phone),
+        }, icon("phone", "icon-sm"), "Call"));
+        actions.appendChild(el("button", {
+          class: "btn btn-sm btn-primary", style: "margin-left:auto;",
+          onclick: () => handleAcceptRide(r),
+        }, icon("check", "icon-sm"), "Accept"));
+      } else if (viewAs === "driver" && r.status !== "posted") {
+        // I'm the driver — show contact to rider
+        const waMsg = prefillWhatsAppMessage(r, state.profile?.displayName || "");
+        actions.appendChild(el("a", {
+          class: "contact-pill wa", target: "_blank", rel: "noopener",
+          href: whatsappLink(r.whatsappCountryCode, r.whatsappPhone, waMsg),
+        }, icon("message-circle", "icon-sm"), `WhatsApp ${r.name || "rider"}`));
+        actions.appendChild(el("a", {
+          class: "contact-pill call",
+          href: telLink(r.phoneCountryCode, r.phone),
+        }, icon("phone", "icon-sm"), "Call"));
+      } else if (viewAs === "rider" && r.driverName) {
+        actions.appendChild(el("div", { class: "muted" }, `Driver: ${r.driverName}`));
+      }
+
+      if (actions.childNodes.length) card.appendChild(actions);
+
+      return card;
+    }
+
+    // ====== MAP ======
+    let mapObj = null, mapMarkers = [], userMarker = null, userAccuracy = null;
+    let userLoc = null, hasCentered = false, geoWatchId = null;
+
+    function renderMapTab() {
+      const host = document.getElementById("tab-map");
+      if (!host.dataset.wired) {
+        host.dataset.wired = "1";
+        host.innerHTML = "";
+        host.style.cssText = "position:fixed;inset:64px 0 0 0;";
+        const mapEl = document.createElement("div");
+        mapEl.id = "main-map";
+        mapEl.style.cssText = "position:absolute;inset:0;";
+        host.appendChild(mapEl);
+
+        // Count pill
+        const pill = document.createElement("div");
+        pill.id = "map-count";
+        pill.style.cssText = "position:absolute;left:50%;transform:translateX(-50%);bottom:96px;background:rgba(18,18,18,0.92);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid var(--border-2);color:var(--text);padding:8px 14px;border-radius:999px;font-size:12px;font-weight:600;letter-spacing:0.02em;z-index:5;";
+        host.appendChild(pill);
+
+        // Recenter button
+        const rec = document.createElement("button");
+        rec.textContent = "⊙";
+        rec.title = "Recenter";
+        rec.style.cssText = "position:absolute;right:16px;top:16px;width:40px;height:40px;background:rgba(18,18,18,0.92);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid var(--border-2);color:var(--text);border-radius:999px;font-size:18px;z-index:5;cursor:pointer;";
+        rec.onclick = () => { hasCentered = false; ensureUserLocation(); };
+        host.appendChild(rec);
+      }
+
+      // Host is fixed-positioned; clear app-shell padding for clean full-screen.
+      if (!mapObj) {
+        mapObj = L.map("main-map", { zoomControl: true, attributionControl: true }).setView([20, 0], 2);
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          attribution: "&copy; OpenStreetMap",
+          maxZoom: 19,
+        }).addTo(mapObj);
+      }
+      setTimeout(() => mapObj.invalidateSize(), 60);
+      ensureUserLocation();
+      rebuildMapMarkers();
+    }
+
+    function ensureUserLocation() {
+      if (!navigator.geolocation || !mapObj) return;
+      // If a watch is already running, just recenter.
+      if (geoWatchId != null) {
+        if (userLoc) mapObj.setView([userLoc.lat, userLoc.lng], Math.max(mapObj.getZoom(), 14));
+        return;
+      }
+
+      const onUpdate = (pos) => {
+        userLoc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        const acc = pos.coords.accuracy || 50;
+
+        // Accuracy halo (only when >20m to avoid clutter).
+        if (userAccuracy) mapObj.removeLayer(userAccuracy);
+        if (acc > 20) {
+          userAccuracy = L.circle([userLoc.lat, userLoc.lng], {
+            radius: acc,
+            color: "#ffffff",
+            weight: 1,
+            opacity: 0.4,
+            fillColor: "#ffffff",
+            fillOpacity: 0.06,
+          }).addTo(mapObj);
+        }
+
+        // Pulsing dot for the user.
+        if (userMarker) mapObj.removeLayer(userMarker);
+        const icon = L.divIcon({
+          className: "user-dot",
+          html: `
+            <div style="position:relative;width:22px;height:22px;">
+              <div style="position:absolute;inset:0;border-radius:50%;background:rgba(255,255,255,0.28);animation:vh-pulse 1.6s ease-out infinite;"></div>
+              <div style="position:absolute;inset:4px;border-radius:50%;background:#ffffff;border:2px solid #000;box-shadow:0 0 0 3px rgba(255,255,255,0.2);"></div>
+            </div>`,
+          iconSize: [22, 22], iconAnchor: [11, 11],
+        });
+        userMarker = L.marker([userLoc.lat, userLoc.lng], { icon, zIndexOffset: 1000 }).addTo(mapObj);
+
+        // Only center on user if there are no pins yet — otherwise let
+        // rebuildMapMarkers' fit-bounds show the full picture.
+        if (!hasCentered && !mapHasFit) {
+          mapObj.setView([userLoc.lat, userLoc.lng], 13);
+          hasCentered = true;
+        }
+      };
+
+      const onError = (err) => {
+        console.warn("geolocation error:", err);
+        if (err.code === err.PERMISSION_DENIED) {
+          toast("Location permission denied", { type: "error" });
+        }
+      };
+
+      geoWatchId = navigator.geolocation.watchPosition(onUpdate, onError, {
+        enableHighAccuracy: true,
+        maximumAge: 5_000,
+        timeout: 15_000,
+      });
+    }
+
+    async function rebuildMapMarkers() {
+      if (!mapObj) return;
+      mapMarkers.forEach((m) => mapObj.removeLayer(m));
+      mapMarkers = [];
+
+      // ALL posted rides — app + WhatsApp, including your own.
+      const all = (state.postedRides || []).slice();
+
+      // Best-effort geocode for rides missing coords (WhatsApp-ingested ones
+      // where the Cloud Function's geocode failed).
+      await Promise.all(all.map(async (r) => {
+        if (typeof r.pickupLat === "number" && typeof r.pickupLng === "number") return;
+        const key = r.from || "";
+        if (!key) return;
+        if (geocodeCache.has(key)) {
+          const p = geocodeCache.get(key);
+          if (p) { r.pickupLat = p.lat; r.pickupLng = p.lng; }
+          return;
+        }
+        try {
+          const results = await searchPlaces(key, { limit: 1 });
+          const p = results[0];
+          geocodeCache.set(key, p || null);
+          if (p) { r.pickupLat = p.lat; r.pickupLng = p.lng; }
+        } catch { geocodeCache.set(key, null); }
+      }));
+
+      const pinned = all.filter((r) => typeof r.pickupLat === "number" && typeof r.pickupLng === "number");
+
+      pinned.forEach((r) => {
+        const mine = r.riderId === state.user.uid;
+        const isWa = r.source === "whatsapp";
+        // Three marker styles (iOS-aligned colors):
+        // - Mine:     blue filled (SF systemBlue) + "ME"
+        // - WhatsApp: green filled (SF systemGreen)  + "WA"
+        // - App:      white filled + route dot •
+        let bg, fg, glyph;
+        if (mine) {
+          bg = "#0a84ff"; fg = "#ffffff"; glyph = "ME";
+        } else if (isWa) {
+          bg = "#30d158"; fg = "#ffffff"; glyph = "WA";
+        } else {
+          bg = "#ffffff"; fg = "#000000"; glyph = "•";
+        }
+        const size = mine ? 30 : 26;
+        const font = mine ? 9 : 11;
+        const pinIcon = L.divIcon({
+          className: "ride-pin",
+          html: `<div style="width:${size}px;height:${size}px;background:${bg};color:${fg};border:2px solid rgba(255,255,255,0.9);border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:${font}px;font-weight:800;letter-spacing:0.04em;box-shadow:0 4px 10px rgba(0,0,0,0.5);">${glyph}</div>`,
+          iconSize: [size, size], iconAnchor: [size/2, size/2],
+        });
+        const marker = L.marker([r.pickupLat, r.pickupLng], { icon: pinIcon, zIndexOffset: mine ? 500 : 0 });
+        marker.bindPopup(renderPinPopupHtml(r, { mine }), { maxWidth: 280, className: "ride-popup" });
+        marker.on("popupopen", () => wirePopupButtons(r, { mine }));
+        marker.addTo(mapObj);
+        mapMarkers.push(marker);
+      });
+
+      // Fit bounds to show all pins (plus user location if available) — only
+      // on first populate, so user pans aren't clobbered on subsequent updates.
+      if (!mapHasFit && (pinned.length || userLoc)) {
+        const points = pinned.map((r) => [r.pickupLat, r.pickupLng]);
+        if (userLoc) points.push([userLoc.lat, userLoc.lng]);
+        if (points.length >= 2) {
+          mapObj.fitBounds(L.latLngBounds(points).pad(0.25), { maxZoom: 13 });
+          mapHasFit = true;
+        } else if (points.length === 1) {
+          mapObj.setView(points[0], 13);
+          mapHasFit = true;
+        }
+      }
+
+      const total = all.length;
+      const pill = document.getElementById("map-count");
+      if (pill) {
+        const missing = total - pinned.length;
+        const mineCount = all.filter((r) => r.riderId === state.user.uid).length;
+        const parts = [`${total} ride${total === 1 ? "" : "s"}`];
+        if (mineCount) parts.push(`${mineCount} yours`);
+        if (missing)   parts.push(`${missing} without location`);
+        pill.textContent = parts.join(" · ");
+      }
+    }
+    const geocodeCache = new Map();
+    let mapHasFit = false;
+
+    function renderPinPopupHtml(r, opts = {}) {
+      const miles = (Number(r.miles) || 0).toFixed(1);
+      const pickup = fmtPickup(r.pickupDate);
+      const waBadge = r.source === "whatsapp"
+        ? `<span style="margin-left:6px;font-size:9px;padding:2px 8px;border-radius:999px;letter-spacing:0.08em;text-transform:uppercase;color:#30d158;background:rgba(48,209,88,0.14);font-weight:700;">WhatsApp</span>`
+        : "";
+      const mineBadge = opts.mine
+        ? `<span style="margin-left:6px;font-size:9px;padding:2px 8px;border-radius:999px;letter-spacing:0.08em;text-transform:uppercase;color:#0a84ff;background:rgba(10,132,255,0.14);font-weight:700;">Yours</span>`
+        : "";
+      const actions = opts.mine
+        ? `<div style="font-size:12px;color:#8a8a8a;">This is your request.</div>`
+        : `<div style="display:flex;gap:6px;flex-wrap:wrap;">
+             <a id="pop-wa" target="_blank" rel="noopener" style="flex:1;padding:8px;text-align:center;background:rgba(48,209,88,0.14);color:#30d158;border-radius:8px;text-decoration:none;font-size:12px;font-weight:600;">WhatsApp</a>
+             <button id="pop-accept" style="flex:1;padding:8px;background:#0a84ff;color:#fff;border:none;border-radius:8px;font-size:12px;font-weight:700;cursor:pointer;">Accept</button>
+           </div>`;
+      return `
+        <div style="font-family:inherit;color:#f2f2f2;min-width:220px;">
+          <div style="font-weight:700;margin-bottom:6px;">${escapeHtml(r.name || "Rider")}${waBadge}${mineBadge}</div>
+          <div style="font-size:13px;color:#c7c7c7;margin-bottom:4px;">${escapeHtml(r.from)} →</div>
+          <div style="font-size:13px;color:#c7c7c7;margin-bottom:8px;">${escapeHtml(r.to)}</div>
+          <div style="font-size:12px;color:#8a8a8a;margin-bottom:10px;">${miles ? miles + " mi · " : ""}${escapeHtml(pickup)}</div>
+          ${actions}
+        </div>`;
+    }
+    function escapeHtml(s) {
+      return String(s || "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" })[c]);
+    }
+
+    function wirePopupButtons(r, opts = {}) {
+      if (opts.mine) return;
+      const wa = document.getElementById("pop-wa");
+      if (wa) {
+        const msg = prefillWhatsAppMessage(r, state.profile?.displayName || "");
+        wa.href = whatsappLink(r.whatsappCountryCode, r.whatsappPhone, msg);
+      }
+      const acc = document.getElementById("pop-accept");
+      if (acc) acc.onclick = () => handleAcceptRide(r);
+    }
+
+    function statusLabel(s) {
+      return ({
+        posted: "Hot",
+        accepted: "Accepted",
+        driverEnroute: "On the way",
+        driverArrived: "Arrived",
+        rideStarted: "In progress",
+        completed: "Completed",
+        cancelled: "Cancelled",
+        expired: "Expired",
+      })[s] || s;
+    }
+
+    async function handleAcceptRide(r) {
+      if (state.myDriverRide) {
+        return toast("Finish your current ride before accepting another.", { type: "error" });
+      }
+      if (!confirm(`Accept ride from ${r.name || "this rider"}?`)) return;
+      try {
+        await driverAcceptRide(r.id, {
+          uid: state.user.uid,
+          displayName: state.profile.displayName || "",
+          phone: state.profile.phone || "",
+          phoneCountryCode: state.profile.phoneCountryCode || "+1",
+          whatsappPhone: state.profile.whatsappPhone || state.profile.phone || "",
+          whatsappCountryCode: state.profile.whatsappCountryCode || state.profile.phoneCountryCode || "+1",
+        });
+        toast("Ride accepted", { type: "success" });
+        setTab("active");
+      } catch (err) {
+        toast(err.message || "Couldn't accept ride", { type: "error" });
+      }
+    }
+
+    // ====== ACTIVE ======
+    function renderActiveTab() {
+      const host = document.getElementById("tab-active");
+      host.innerHTML = "";
+      const any = state.myRiderRide || state.myDriverRide;
+      if (!any) {
+        host.appendChild(el("div", { class: "empty" },
+          el("div", { class: "empty-icon" }, icon("navigation", "icon-lg")),
+          el("h3", { class: "mb-8" }, "No active ride"),
+          el("div", { class: "muted" }, "Post a request or accept one from the Home tab."),
+        ));
+        return;
+      }
+      if (state.myRiderRide)  host.appendChild(renderActiveDetailed(state.myRiderRide, "rider"));
+      if (state.myDriverRide) host.appendChild(renderActiveDetailed(state.myDriverRide, "driver"));
+    }
+
+    function renderActiveDetailed(r, viewerRole) {
+      const labels = {
+        posted: "Waiting for a driver",
+        accepted: "Driver confirmed",
+        driverEnroute: "Driver is on the way",
+        driverArrived: "Driver has arrived",
+        rideStarted: "On the ride",
+      };
+      const bannerIconName = ({
+        posted: "clock",
+        accepted: "check-circle-2",
+        driverEnroute: "navigation",
+        driverArrived: "map-pin",
+        rideStarted: "car",
+      })[r.status] || "clock";
+      const bannerClass = ({
+        posted: "posted",
+        accepted: "accepted",
+        driverEnroute: "enroute",
+        driverArrived: "arrived",
+        rideStarted: "started",
+      })[r.status] || "posted";
+      const card = el("div", { class: "ride-card" },
+        el("div", { class: `status-banner ${bannerClass}` },
+          icon(bannerIconName, "icon"),
+          el("span", {},
+            el("span", { class: "prefix" }, viewerRole === "driver" ? "DRIVING" : "YOUR RIDE"),
+            labels[r.status] || r.status,
+          ),
+        ),
+        el("div", { class: "route-row" },
+          el("span", { class: "route-dot pickup" }),
+          el("span", {}, r.from),
+        ),
+        el("div", { class: "route-row" },
+          el("span", { class: "route-dot dropoff" }),
+          el("span", {}, r.to),
+        ),
+        el("div", { class: "muted mt-8" },
+          `${(Number(r.miles) || 0).toFixed(1)} mi · ${fmtPickup(r.pickupDate)}`),
+      );
+
+      if (r.notes) card.appendChild(el("div", { class: "muted mt-8", style: "font-style:italic;" }, `"${r.notes}"`));
+
+      // Contact
+      const contact = el("div", { class: "row mt-12", style: "flex-wrap:wrap;gap:8px;" });
+      if (viewerRole === "driver") {
+        const waMsg = prefillWhatsAppMessage(r, state.profile?.displayName || "");
+        contact.appendChild(el("a", {
+          class: "contact-pill wa", target: "_blank", rel: "noopener",
+          href: whatsappLink(r.whatsappCountryCode, r.whatsappPhone, waMsg),
+        }, icon("message-circle", "icon-sm"), `WhatsApp ${r.name || "rider"}`));
+        contact.appendChild(el("a", {
+          class: "contact-pill call",
+          href: telLink(r.phoneCountryCode, r.phone),
+        }, icon("phone", "icon-sm"), "Call"));
+      } else if (r.driverId) {
+        contact.appendChild(el("div", { class: "muted" }, `Driver: ${r.driverName || "—"}`));
+        if (r.driverWhatsapp) {
+          contact.appendChild(el("a", {
+            class: "contact-pill wa", target: "_blank", rel: "noopener",
+            href: `https://wa.me/${(r.driverWhatsapp || "").replace(/[^\d]/g, "")}`,
+          }, icon("message-circle", "icon-sm"), "WhatsApp driver"));
+        }
+      }
+      if (contact.childNodes.length) card.appendChild(contact);
+
+      // Actions
+      const actions = el("div", { class: "stack mt-16" });
+      if (viewerRole === "rider") {
+        if (["posted", "accepted", "driverEnroute", "driverArrived"].includes(r.status)) {
+          actions.appendChild(el("button", {
+            class: "btn btn-danger",
+            onclick: async () => {
+              if (!confirm("Cancel this ride?")) return;
+              try { await cancelRide(r.id, state.user.uid); toast("Cancelled"); }
+              catch (err) { toast(err.message || "Couldn't cancel", { type: "error" }); }
+            },
+          }, icon("x", "icon-sm"), "Cancel request"));
+        }
+      } else if (viewerRole === "driver") {
+        const next = nextDriverStatus(r.status);
+        if (next) {
+          const nextIcon = ({
+            driverEnroute: "navigation",
+            driverArrived: "map-pin",
+            rideStarted:   "car",
+            completed:     "check-circle-2",
+          })[next.status] || "arrow-right";
+          actions.appendChild(el("button", {
+            class: "btn btn-green",
+            onclick: async () => {
+              try { await setRideStatus(r.id, next.status); toast(next.toast); }
+              catch (err) { toast(err.message || "Couldn't update", { type: "error" }); }
+            },
+          }, icon(nextIcon, "icon-sm"), next.label));
+        }
+        if (["accepted", "driverEnroute", "driverArrived", "rideStarted"].includes(r.status)) {
+          actions.appendChild(el("button", {
+            class: "btn btn-outline",
+            onclick: async () => {
+              if (!confirm("Cancel this ride?")) return;
+              try { await cancelRide(r.id, state.user.uid); toast("Cancelled"); }
+              catch (err) { toast(err.message || "Couldn't cancel", { type: "error" }); }
+            },
+          }, icon("x", "icon-sm"), "Cancel"));
+        }
+      }
+      if (actions.childNodes.length) card.appendChild(actions);
+
+      return card;
+    }
+
+    function nextDriverStatus(current) {
+      switch (current) {
+        case "accepted":       return { status: "driverEnroute", label: "I'm on the way",  toast: "Enroute" };
+        case "driverEnroute":  return { status: "driverArrived", label: "I've arrived",     toast: "Arrived" };
+        case "driverArrived":  return { status: "rideStarted",   label: "Start ride",       toast: "Started" };
+        case "rideStarted":    return { status: "completed",     label: "Complete ride",    toast: "Completed" };
+        default: return null;
+      }
+    }
+
+    // ====== HISTORY ======
+    async function renderHistoryTab() {
+      const host = document.getElementById("tab-history");
+      host.innerHTML = "";
+      host.appendChild(el("div", { class: "muted center", style: "padding:20px 0;" },
+        el("span", { class: "spinner dark" }), " Loading…"));
+      try {
+        const rides = await loadRideHistory(state.user.uid);
+        host.innerHTML = "";
+        if (rides.length === 0) {
+          host.appendChild(el("div", { class: "empty" },
+            el("div", { class: "empty-icon" }, icon("history", "icon-lg")),
+            el("div", { class: "muted" }, "No past rides yet."),
+          ));
+          return;
+        }
+        rides.forEach((r) => host.appendChild(renderHistoryRow(r)));
+      } catch (err) {
+        host.innerHTML = "";
+        host.appendChild(el("div", { class: "alert alert-error" }, err.message || "Couldn't load history."));
+      }
+    }
+
+    function renderHistoryRow(r) {
+      const youWereDriver = r.driverId === state.user.uid;
+      const other = youWereDriver ? (r.name || "Rider") : (r.driverName || "Driver");
+      const role = youWereDriver ? "Drove" : "Rode";
+      return el("div", { class: "ride-card" },
+        el("div", { class: "spread" },
+          el("div", {},
+            el("strong", {}, other),
+            el("span", { class: "muted", style: "margin-left:8px;" }, role),
+          ),
+          el("span", { class: `badge badge-${r.status}` }, r.status),
+        ),
+        el("div", { class: "route-row mt-8" },
+          el("span", { class: "route-dot pickup" }),
+          el("span", {}, r.from),
+        ),
+        el("div", { class: "route-row" },
+          el("span", { class: "route-dot dropoff" }),
+          el("span", {}, r.to),
+        ),
+        el("div", { class: "muted mt-8" },
+          `${(Number(r.miles) || 0).toFixed(1)} mi · ${fmtPickup(r.updatedAt || r.createdAt)}`),
+      );
+    }
+
+    // ====== PROFILE ======
+    function renderProfileTab() {
+      const host = document.getElementById("tab-profile");
+      host.innerHTML = "";
+      const p = state.profile || {};
+
+      const mkField = (id, label, value, type = "text") => {
+        const wrap = el("div", { class: "field" });
+        wrap.appendChild(el("label", { class: "field-label" }, label));
+        wrap.appendChild(el("input", { class: "input", id, type, value: value ?? "" }));
+        return wrap;
+      };
+
+      host.appendChild(el("div", { class: "section-title" }, "Account"));
+      host.appendChild(mkField("prof-name", "Full name", p.displayName));
+      host.appendChild(el("div", { class: "field" },
+        el("label", { class: "field-label" }, "Email"),
+        el("input", { class: "input", value: state.user.email || "", disabled: true }),
+      ));
+
+      host.appendChild(el("div", { class: "field" },
+        el("label", { class: "field-label" }, "Phone"),
+        el("div", { class: "input-row" },
+          el("select", { class: "select", id: "prof-cc" },
+            ...["+1","+91","+44","+61","+971"].map((c) =>
+              el("option", { value: c, selected: (p.phoneCountryCode || "+1") === c ? "" : null }, c))),
+          el("input", { class: "input", id: "prof-phone", type: "tel", value: p.phone || "" }),
+        ),
+      ));
+
+      host.appendChild(el("div", { class: "field" },
+        el("label", { class: "field-label" }, "WhatsApp"),
+        el("div", { class: "input-row" },
+          el("select", { class: "select", id: "prof-wacc" },
+            ...["+1","+91","+44","+61","+971"].map((c) =>
+              el("option", { value: c, selected: (p.whatsappCountryCode || p.phoneCountryCode || "+1") === c ? "" : null }, c))),
+          el("input", { class: "input", id: "prof-waphone", type: "tel", value: p.whatsappPhone || p.phone || "" }),
+        ),
+      ));
+
+      host.appendChild(el("button", {
+        class: "btn btn-primary mt-16",
+        onclick: saveProfile,
+      }, el("span", { class: "btn-label" }, "Save profile")));
+
+      host.appendChild(el("button", {
+        class: "btn btn-ghost mt-12",
+        onclick: () => signOut(auth),
+      }, "Sign out"));
+    }
+
+    async function saveProfile() {
+      const patch = {
+        displayName: document.getElementById("prof-name").value.trim(),
+        phone: document.getElementById("prof-phone").value.replace(/[^\d]/g, ""),
+        phoneCountryCode: document.getElementById("prof-cc").value,
+        whatsappPhone: document.getElementById("prof-waphone").value.replace(/[^\d]/g, ""),
+        whatsappCountryCode: document.getElementById("prof-wacc").value,
+      };
+      try {
+        await saveUserProfile(state.user.uid, patch);
+        state.profile = { ...state.profile, ...patch };
+        toast("Saved", { type: "success" });
+      } catch (err) {
+        toast(err.message || "Couldn't save", { type: "error" });
+      }
+    }
+
+    // ====== POST RIDE SHEET ======
+    const sheet = document.getElementById("post-ride-sheet");
+    let prPickup = null, prDropoff = null, prMap = null, prMapMarkers = [];
+
+    function openPostRideSheet() {
+      if (state.myRiderRide) {
+        return toast("You already have an active request.", { type: "error" });
+      }
+      const p = state.profile || {};
+      document.getElementById("pr-name").value = p.displayName || "";
+      document.getElementById("pr-phone").value = p.phone || "";
+      document.getElementById("pr-cc").value = p.phoneCountryCode || "+1";
+      document.getElementById("pr-waphone").value = p.whatsappPhone || p.phone || "";
+      document.getElementById("pr-wacc").value = p.whatsappCountryCode || p.phoneCountryCode || "+1";
+      const same = !p.whatsappPhone || p.whatsappPhone === p.phone;
+      document.getElementById("pr-samewa").checked = same;
+      document.getElementById("pr-wa-field").classList.toggle("hidden", same);
+
+      const d = new Date(Date.now() + 15 * 60 * 1000);
+      d.setSeconds(0, 0);
+      document.getElementById("pr-date").value = toLocalInput(d);
+      document.getElementById("pr-duration").value = "30";
+      document.getElementById("pr-miles").value = "";
+      document.getElementById("pr-notes").value = "";
+      document.getElementById("pr-pickup").value = "";
+      document.getElementById("pr-dropoff").value = "";
+      prPickup = prDropoff = null;
+      document.getElementById("pr-map").classList.add("hidden");
+
+      sheet.classList.remove("hidden");
+      refreshIcons();
+    }
+
+    function toLocalInput(d) {
+      const pad = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+
+    document.getElementById("post-cancel").onclick = () => sheet.classList.add("hidden");
+    sheet.addEventListener("click", (e) => { if (e.target === sheet) sheet.classList.add("hidden"); });
+
+    document.getElementById("pr-samewa").addEventListener("change", (e) => {
+      document.getElementById("pr-wa-field").classList.toggle("hidden", e.target.checked);
+    });
+
+    wireGeoInput("pr-pickup", "pr-pickup-results", (place) => { prPickup = place; maybeUpdateDistanceAndMap(); });
+    wireGeoInput("pr-dropoff", "pr-dropoff-results", (place) => { prDropoff = place; maybeUpdateDistanceAndMap(); });
+
+    function wireGeoInput(inputId, resultsId, onPick) {
+      const input = document.getElementById(inputId);
+      const results = document.getElementById(resultsId);
+      const onInput = debounce(async () => {
+        const q = input.value.trim();
+        if (q.length < 3) { results.classList.add("hidden"); results.innerHTML = ""; return; }
+        try {
+          const places = await searchPlaces(q);
+          results.innerHTML = "";
+          if (places.length === 0) { results.classList.add("hidden"); return; }
+          places.forEach((p) => {
+            const row = el("div", { class: "geo-result" },
+              el("div", { class: "main" }, p.short),
+              el("div", { class: "sub" }, p.displayName),
+            );
+            row.onclick = () => {
+              input.value = p.short;
+              results.classList.add("hidden");
+              onPick(p);
+            };
+            results.appendChild(row);
+          });
+          results.classList.remove("hidden");
+        } catch { results.classList.add("hidden"); }
+      }, 350);
+      input.addEventListener("input", onInput);
+      input.addEventListener("blur", () => setTimeout(() => results.classList.add("hidden"), 150));
+      input.addEventListener("focus", () => { if (results.children.length) results.classList.remove("hidden"); });
+    }
+
+    async function maybeUpdateDistanceAndMap() {
+      const milesInput  = document.getElementById("pr-miles");
+      const milesStatus = document.getElementById("pr-miles-status");
+
+      if (!prPickup || !prDropoff) {
+        milesInput.value = "";
+        milesStatus.textContent = "";
+        return;
+      }
+
+      const mapEl = document.getElementById("pr-map");
+      mapEl.classList.remove("hidden");
+      if (!prMap) {
+        prMap = L.map("pr-map", { zoomControl: false }).setView([prPickup.lat, prPickup.lng], 11);
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          attribution: "&copy; OpenStreetMap",
+          maxZoom: 19,
+        }).addTo(prMap);
+      }
+      prMapMarkers.forEach((m) => prMap.removeLayer(m));
+      prMapMarkers = [];
+      const mA = L.marker([prPickup.lat, prPickup.lng]).addTo(prMap);
+      const mB = L.marker([prDropoff.lat, prDropoff.lng]).addTo(prMap);
+      prMapMarkers = [mA, mB];
+      prMap.fitBounds(L.latLngBounds([mA.getLatLng(), mB.getLatLng()]).pad(0.3));
+      setTimeout(() => prMap.invalidateSize(), 120);
+
+      // Start with haversine fallback so user sees something immediately.
+      const straight = haversineMiles(prPickup, prDropoff);
+      milesInput.value = straight.toFixed(1);
+      milesStatus.textContent = "calculating…";
+
+      // Then request actual driving distance from OSRM.
+      try {
+        const miles = await routeDistanceMiles(prPickup, prDropoff);
+        if (typeof miles === "number" && miles > 0) {
+          milesInput.value = miles.toFixed(1);
+          milesStatus.textContent = "mi · driving";
+        } else {
+          milesStatus.textContent = "mi · straight-line";
+        }
+      } catch {
+        milesStatus.textContent = "mi · straight-line";
+      }
+    }
+
+    document.getElementById("pr-submit").onclick = async () => {
+      const btn = document.getElementById("pr-submit");
+      const name  = document.getElementById("pr-name").value.trim();
+      const phone = document.getElementById("pr-phone").value.replace(/[^\d]/g, "");
+      const cc    = document.getElementById("pr-cc").value;
+      const sameWA = document.getElementById("pr-samewa").checked;
+      const wacc   = sameWA ? cc : document.getElementById("pr-wacc").value;
+      const waphone = sameWA ? phone : document.getElementById("pr-waphone").value.replace(/[^\d]/g, "");
+      const miles = parseFloat(document.getElementById("pr-miles").value);
+      const duration = parseInt(document.getElementById("pr-duration").value, 10);
+      const pickupDateStr = document.getElementById("pr-date").value;
+      const notes = document.getElementById("pr-notes").value.trim();
+
+      if (!prPickup || !prDropoff) return toast("Pick a pickup and drop-off", { type: "error" });
+      if (!name) return toast("Enter your name", { type: "error" });
+      if (phone.length < 6) return toast("Enter a valid phone", { type: "error" });
+      if (!sameWA && waphone.length < 6) return toast("Enter WhatsApp number", { type: "error" });
+      if (!(miles > 0)) return toast("Enter distance", { type: "error" });
+      if (!pickupDateStr) return toast("Pick a pickup time", { type: "error" });
+
+      setBtnLoading(btn, true, "Posting…");
+      try {
+        const ride = newRide({
+          riderId: state.user.uid,
+          name, phone, phoneCountryCode: cc,
+          whatsappPhone: waphone, whatsappCountryCode: wacc,
+          from: prPickup.short || prPickup.displayName,
+          to:   prDropoff.short || prDropoff.displayName,
+          miles, pickupLat: prPickup.lat, pickupLng: prPickup.lng,
+          hotDuration: duration,
+          pickupDate: new Date(pickupDateStr),
+          notes: notes || null,
+        });
+        await postRide(ride);
+        // Persist contact details back onto the profile for next time.
+        await saveUserProfile(state.user.uid, {
+          displayName: name,
+          phone, phoneCountryCode: cc,
+          whatsappPhone: waphone, whatsappCountryCode: wacc,
+        }).catch(() => {});
+        state.profile = { ...state.profile, displayName: name, phone, phoneCountryCode: cc, whatsappPhone: waphone, whatsappCountryCode: wacc };
+        toast("Posted", { type: "success" });
+        sheet.classList.add("hidden");
+        setTab("active");
+      } catch (err) {
+        toast(err.message || "Couldn't post ride", { type: "error" });
+      } finally {
+        setBtnLoading(btn, false, "Post Request");
+      }
+    };
+
+    function setBtnLoading(btn, loading, label) {
+      btn.disabled = !!loading;
+      const span = btn.querySelector(".btn-label");
+      if (loading) {
+        if (span) span.textContent = label || "Working…";
+        if (!btn.querySelector(".spinner")) {
+          const s = document.createElement("span");
+          s.className = "spinner invert";
+          btn.prepend(s);
+        }
+      } else {
+        if (span) span.textContent = label || span.textContent;
+        btn.querySelector(".spinner")?.remove();
+      }
+    }
+  </script>
+</body>
+</html>
