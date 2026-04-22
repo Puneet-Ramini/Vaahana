@@ -40,6 +40,9 @@ const { defineSecret } = require("firebase-functions/params");
 const crypto = require("crypto");
 const https  = require("https");
 const WHATSAPP_API_KEY = defineSecret("WHATSAPP_INGEST_API_KEY");
+const GROQ_API_KEY     = defineSecret("GROQ_API_KEY");
+
+const { extractRideDataLLM } = require("./lib/groq");
 
 initializeApp();
 const db = getFirestore();
@@ -1063,7 +1066,7 @@ function geocodeAddress(address) {
 
 exports.ingestWhatsAppMessages = onRequest(
   {
-    secrets: [WHATSAPP_API_KEY],
+    secrets: [WHATSAPP_API_KEY, GROQ_API_KEY],
     cors: false,
     timeoutSeconds: 120,
     memory: "512MiB",
@@ -1115,10 +1118,25 @@ exports.ingestWhatsAppMessages = onRequest(
       rides:     [],   // IDs of created ride docs
     };
 
+    const groqKey = GROQ_API_KEY.value();
+
     for (const msg of rawMessages) {
       try {
-        // 1. Extract ride data
-        const rideData = extractRideData(msg.text, msg.timestamp);
+        // 1. Extract ride data — LLM first, regex fallback.
+        let rideData = null;
+        let parseSource = null;
+        if (groqKey) {
+          try {
+            rideData = await extractRideDataLLM(msg.text, msg.timestamp, groqKey);
+            if (rideData) parseSource = "llm";
+          } catch (err) {
+            console.warn(`[ingest] groq threw: ${err.message}`);
+          }
+        }
+        if (!rideData) {
+          rideData = extractRideData(msg.text, msg.timestamp);
+          if (rideData) parseSource = "regex";
+        }
         if (!rideData) {
           console.log(`[ingest] SKIP not_ride_request | ${msg.phone} | "${msg.text.slice(0,80)}"`);
           results.skipped++; continue;
@@ -1197,6 +1215,10 @@ exports.ingestWhatsAppMessages = onRequest(
           // Metadata
           rawText:             msg.text,
           rawTimeHint:         rideData.rawTimeHint,
+          parseSource:         parseSource,                      // "llm" | "regex"
+          llmModel:            rideData._llm?.model || null,
+          llmConfidence:       rideData._llm?.confidence ?? null,
+          llmReasoning:        rideData._llm?.reasoning || null,
           createdAt:           FieldValue.serverTimestamp(),
           updatedAt:           FieldValue.serverTimestamp(),
         };
@@ -1214,6 +1236,9 @@ exports.ingestWhatsAppMessages = onRequest(
           parsedTo:      rideData.to,
           parsedPickup:  rideData.pickupDate,
           linkedUser:    !!vaahanaUser,
+          parseSource,
+          llmConfidence: rideData._llm?.confidence ?? null,
+          llmReasoning:  rideData._llm?.reasoning  || null,
           createdAt:     FieldValue.serverTimestamp(),
         });
 
