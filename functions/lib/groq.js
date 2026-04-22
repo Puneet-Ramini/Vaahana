@@ -1,131 +1,104 @@
 "use strict";
 
 /**
- * Groq LLM parser for WhatsApp ride-request messages.
+ * Groq LLM parser for WhatsApp ride messages. Primary parser; regex is
+ * fallback. Handles formal English, casual English, and transliterated
+ * Indian-language phrasings (Hindi/Telugu/Tamil/Marathi in Latin script).
  *
- * Replaces (with regex fallback) the handwritten regex in
- * functions/index.js so that informal phrasings like
- *   "anyone going to jfk tmrw morn?"
- *   "need a lift to logan 5ish"
- *   "ride needed for my parents monday 3pm"
- * get correctly classified and extracted.
- *
- * Returns the same shape as the regex `extractRideData()` on success:
- *   { from, to, pickupDate: Date, hotDuration: number, rawTimeHint: string,
+ * Output (null on failure):
+ *   { from, to, pickupLocalDateTime, hotDuration, rawTimeHint, intent,
  *     _llm: { confidence, model, reasoning } }
- * Returns null when the message is not a ride request, the LLM call fails,
- * or the extracted confidence is below MIN_CONFIDENCE.
  */
 
 const GROQ_URL  = "https://api.groq.com/openai/v1/chat/completions";
-const MODEL     = "llama-3.1-8b-instant"; // cheapest/fastest Groq Llama
+const MODEL     = "llama-3.1-8b-instant";
 const TIMEOUT_MS = 8_000;
-const MIN_CONFIDENCE = 0.55;              // below this → treat as null / review
+const MIN_CONFIDENCE = 0.55;
 
-const SYSTEM_PROMPT = `You extract ride-request details from informal WhatsApp chat messages.
+// Compact prompt — every token costs free-tier TPM budget.
+const SYSTEM_PROMPT = `Extract ride details from WhatsApp messages. Messages may be in English, casual English, or transliterated Hindi/Telugu/Tamil/Marathi/Punjabi (written in Latin script — "kal" = tomorrow, "subah" = morning, "repu" = tomorrow (Telugu), "naalai" = tomorrow (Tamil), "kavali"/"chahiye" = need, "ja raha hai" = going).
 
-Classify whether the message is a RIDER looking for a ride. Ignore driver offers ("I can drive"), accommodation, food, unrelated chit-chat, greetings.
+Intent:
+- rider_request: sender needs a ride
+- driver_offer:  sender is driving, offering seats
 
-A rider request must include intent to travel from somewhere to somewhere. A pickup location and drop-off location are both required — if either is clearly missing, return isRideRequest=false.
+Both need a clear pickup + drop-off; if either is vague, isRideRequest=false.
 
-Return STRICT JSON with these exact keys:
-{
-  "isRideRequest": boolean,
-  "from":          string | null,   // pickup location in Title Case
-  "to":            string | null,   // drop-off location in Title Case
-  "pickupIso":     string | null,   // ISO-8601 local pickup datetime or null
-  "pickupHint":    string,          // the original time phrase from the message ("tomorrow 5pm", "in 20 min")
-  "hotDuration":   number,          // how many minutes the request should stay visible: 30 / 60 / 300 / 1440. Default 1440.
-  "confidence":    number,          // 0.0 — 1.0, how sure you are this is a ride request with clear from/to
-  "reasoning":     string           // one short sentence
+Return ONLY this JSON (no prose, no fences):
+{"isRideRequest":bool,"intent":"rider_request"|"driver_offer"|null,"from":str|null,"to":str|null,"pickupLocalDateTime":str|null,"pickupHint":str,"hotDuration":30|60|300|1440,"confidence":0-1,"reasoning":str}
+
+pickupLocalDateTime: naive local wall-clock at pickup location, format "YYYY-MM-DDTHH:mm:ss" (NO timezone/Z). Use CURRENT_ISO as reference for relative times. morning=09:00, afternoon=14:00, evening=18:00, night=21:00. If no time mentioned, null.
+
+Confidence <0.55 → isRideRequest=false.`;
+
+async function callGroqWithRetry(apiKey, body, retries = 1) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+    let res;
+    try {
+      res = await fetch(GROQ_URL, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: ctl.signal,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      console.warn(`[groq] network/abort (attempt ${attempt}): ${err.message}`);
+      if (attempt < retries) { await sleep(400); continue; }
+      return null;
+    }
+    clearTimeout(timer);
+
+    if (res.status === 429 && attempt < retries) {
+      // Respect Retry-After if present; cap at 4s to stay within function timeout.
+      const retryAfter = Math.min(parseFloat(res.headers.get("retry-after") || "2") * 1000, 4_000);
+      console.warn(`[groq] 429 — waiting ${retryAfter}ms before retry ${attempt + 1}`);
+      await sleep(retryAfter);
+      continue;
+    }
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      console.warn(`[groq] HTTP ${res.status}: ${txt.slice(0, 200)}`);
+      return null;
+    }
+    return res.json().catch((err) => { console.warn(`[groq] bad JSON: ${err.message}`); return null; });
+  }
+  return null;
 }
 
-Rules for pickupIso:
-- You will be told the current time (CURRENT_ISO). Use it to resolve relative phrases like "tomorrow", "tonight", "in 30 min", "5ish".
-- "morning" → 9:00, "afternoon" → 14:00, "evening" → 18:00, "night" → 21:00 unless otherwise specified.
-- If the message says no time at all, return pickupIso=null (the caller will default to "now").
-- Never invent a time. If ambiguous, set pickupIso=null.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-Rules for confidence:
-- High (0.85–1.0): both from + to are explicit, intent is clearly a rider needing a ride.
-- Medium (0.55–0.85): from + to are clear but phrasing is casual ("anyone going to X from Y?").
-- Low (<0.55): from or to is vague ("somewhere near my place"), or it's unclear whether rider or driver. In this case, set isRideRequest=false.
-
-Do NOT output anything other than the JSON object. No prose, no code fences.`;
-
-/**
- * @param {string} text           raw WhatsApp message
- * @param {Date}   messageTs      timestamp of when the message was sent
- * @param {string} apiKey         Groq API key
- * @returns {Promise<object|null>}
- */
 async function extractRideDataLLM(text, messageTs, apiKey) {
   if (!text || typeof text !== "string" || text.trim().length < 3) return null;
   if (!apiKey) throw new Error("GROQ_API_KEY missing");
 
   const currentIso = (messageTs instanceof Date ? messageTs : new Date()).toISOString();
-  const userPrompt = `CURRENT_ISO: ${currentIso}\n\nMESSAGE:\n"""\n${text.trim()}\n"""`;
+  const userPrompt = `CURRENT_ISO: ${currentIso}\n\nMESSAGE:\n${text.trim()}`;
 
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
-
-  let res;
-  try {
-    res = await fetch(GROQ_URL, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        temperature: 0,
-        max_tokens: 400,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user",   content: userPrompt },
-        ],
-      }),
-      signal: ctl.signal,
-    });
-  } catch (err) {
-    clearTimeout(timer);
-    console.warn(`[groq] network/abort: ${err.message}`);
-    return null;
-  }
-  clearTimeout(timer);
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    console.warn(`[groq] HTTP ${res.status}: ${body.slice(0, 200)}`);
-    return null;
-  }
-
-  let payload;
-  try {
-    payload = await res.json();
-  } catch (err) {
-    console.warn(`[groq] bad JSON envelope: ${err.message}`);
-    return null;
-  }
+  const payload = await callGroqWithRetry(apiKey, {
+    model: MODEL,
+    temperature: 0,
+    max_tokens: 250,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user",   content: userPrompt },
+    ],
+  });
+  if (!payload) return null;
 
   const content = payload?.choices?.[0]?.message?.content;
-  if (!content) {
-    console.warn("[groq] no choices.message.content");
-    return null;
-  }
+  if (!content) { console.warn("[groq] no content"); return null; }
 
   let parsed;
-  try {
-    parsed = JSON.parse(content);
-  } catch {
-    console.warn(`[groq] model output not JSON: ${String(content).slice(0, 200)}`);
-    return null;
-  }
+  try { parsed = JSON.parse(content); }
+  catch { console.warn(`[groq] model output not JSON: ${String(content).slice(0, 200)}`); return null; }
 
-  // ── Validate & normalize ──────────────────────────────────────────────────
   if (!parsed.isRideRequest) return null;
+
+  const intent = parsed.intent === "driver_offer" ? "driver_offer" : "rider_request";
 
   const confidence = Number(parsed.confidence);
   if (!Number.isFinite(confidence) || confidence < MIN_CONFIDENCE) {
@@ -137,27 +110,18 @@ async function extractRideDataLLM(text, messageTs, apiKey) {
   const to   = typeof parsed.to   === "string" ? parsed.to.trim()   : "";
   if (!from || !to) return null;
 
-  // Resolve pickup date
-  let pickupDate = null;
-  if (typeof parsed.pickupIso === "string" && parsed.pickupIso) {
-    const d = new Date(parsed.pickupIso);
-    if (!isNaN(d.getTime())) pickupDate = d;
-  }
-  if (!pickupDate) {
-    // Default: 30 min from message timestamp — gives the rider a buffer.
-    pickupDate = new Date((messageTs instanceof Date ? messageTs : new Date()).getTime() + 30 * 60 * 1000);
-  }
+  const raw = typeof parsed.pickupLocalDateTime === "string" ? parsed.pickupLocalDateTime.trim() : "";
+  const pickupLocalDateTime = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(raw) ? raw : null;
 
-  // Hot duration — clamp to allowed buckets.
-  const ALLOWED = [30, 60, 300, 1440];
+  const ALLOWED_HOT = [30, 60, 300, 1440];
   let hotDuration = Number(parsed.hotDuration);
-  if (!ALLOWED.includes(hotDuration)) hotDuration = 1440;
+  if (!ALLOWED_HOT.includes(hotDuration)) hotDuration = 1440;
 
   return {
-    from,
-    to,
-    pickupDate,
+    from, to,
+    pickupLocalDateTime,
     hotDuration,
+    intent,
     rawTimeHint: typeof parsed.pickupHint === "string" ? parsed.pickupHint : "",
     _llm: {
       confidence,

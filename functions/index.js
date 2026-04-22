@@ -43,6 +43,27 @@ const WHATSAPP_API_KEY = defineSecret("WHATSAPP_INGEST_API_KEY");
 const GROQ_API_KEY     = defineSecret("GROQ_API_KEY");
 
 const { extractRideDataLLM } = require("./lib/groq");
+const tzlookup = require("tz-lookup");
+const { DateTime } = require("luxon");
+
+const DEFAULT_TZ = "America/New_York";
+
+/** coord → IANA tz like "America/New_York" (DEFAULT_TZ on failure). */
+function tzFromCoord(lat, lng) {
+  if (typeof lat !== "number" || typeof lng !== "number") return DEFAULT_TZ;
+  try { return tzlookup(lat, lng) || DEFAULT_TZ; }
+  catch { return DEFAULT_TZ; }
+}
+
+/** Convert naive local datetime "YYYY-MM-DDTHH:mm:ss" in `tz` → UTC Date. */
+function naiveLocalToUtc(naiveIso, tz) {
+  if (!naiveIso) return null;
+  try {
+    const dt = DateTime.fromISO(naiveIso, { zone: tz });
+    if (!dt.isValid) return null;
+    return dt.toJSDate();
+  } catch { return null; }
+}
 
 initializeApp();
 const db = getFirestore();
@@ -1062,6 +1083,40 @@ function geocodeAddress(address) {
   });
 }
 
+/** Great-circle distance (miles) between two {lat,lng} points. */
+function haversineMiles(a, b) {
+  const R = 3958.8;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const s =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+/**
+ * Driving distance in miles via OSRM public demo; falls back to haversine.
+ * Returns a number > 0 or null.
+ */
+async function drivingMiles(a, b) {
+  if (!a || !b) return null;
+  const url = `https://router.project-osrm.org/route/v1/driving/${a.lng},${a.lat};${b.lng},${b.lat}?overview=false`;
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 4000);
+    const res = await fetch(url, { signal: ctl.signal });
+    clearTimeout(timer);
+    if (res.ok) {
+      const data = await res.json();
+      const meters = data?.routes?.[0]?.distance;
+      if (typeof meters === "number" && meters > 0) return meters / 1609.344;
+    }
+  } catch { /* fallthrough to haversine */ }
+  const h = haversineMiles(a, b);
+  return h > 0 ? h : null;
+}
+
 // ── 8. HTTP endpoint ──────────────────────────────────────────────────────────
 
 exports.ingestWhatsAppMessages = onRequest(
@@ -1165,12 +1220,31 @@ exports.ingestWhatsAppMessages = onRequest(
           riderName = msg.name || "WhatsApp Rider";
         }
 
-        // 5. Geocode pickup location (best-effort, non-blocking failure)
-        const geo = await geocodeAddress(rideData.from);
-        if (geo) {
-          console.log(`[ingest] geocoded "${rideData.from}" → ${geo.lat},${geo.lng}`);
-        } else {
-          console.log(`[ingest] geocode failed for "${rideData.from}" — ride saved without coords`);
+        // 5. Geocode both pickup + drop-off (best-effort).
+        const [geoFrom, geoTo] = await Promise.all([
+          geocodeAddress(rideData.from),
+          geocodeAddress(rideData.to),
+        ]);
+        console.log(`[ingest] geo from="${rideData.from}" → ${geoFrom ? `${geoFrom.lat},${geoFrom.lng}` : "null"} | to="${rideData.to}" → ${geoTo ? `${geoTo.lat},${geoTo.lng}` : "null"}`);
+
+        // 5b. Timezone of pickup location, so "tomorrow 7am" means 7am local.
+        const pickupTz = geoFrom ? tzFromCoord(geoFrom.lat, geoFrom.lng) : DEFAULT_TZ;
+
+        // 5c. Resolve LLM's naive local wall-clock time → UTC Date using pickup tz.
+        if (rideData.pickupLocalDateTime) {
+          const asUtc = naiveLocalToUtc(rideData.pickupLocalDateTime, pickupTz);
+          if (asUtc) {
+            rideData.pickupDate = asUtc;
+            console.log(`[ingest] pickup resolved: "${rideData.pickupLocalDateTime}" in ${pickupTz} → ${asUtc.toISOString()}`);
+          }
+        }
+
+        // 5d. Miles via OSRM (haversine fallback).
+        let miles = 0;
+        if (geoFrom && geoTo) {
+          const d = await drivingMiles(geoFrom, geoTo);
+          if (typeof d === "number" && d > 0) miles = Math.round(d * 10) / 10;
+          console.log(`[ingest] miles=${miles}`);
         }
 
         // 6. Build ride document
@@ -1193,9 +1267,11 @@ exports.ingestWhatsAppMessages = onRequest(
           // Route
           from:                rideData.from,
           to:                  rideData.to,
-          miles:               0,
-          pickupLat:           geo ? geo.lat : null,
-          pickupLng:           geo ? geo.lng : null,
+          miles:               miles,
+          pickupLat:           geoFrom ? geoFrom.lat : null,
+          pickupLng:           geoFrom ? geoFrom.lng : null,
+          dropoffLat:          geoTo   ? geoTo.lat   : null,
+          dropoffLng:          geoTo   ? geoTo.lng   : null,
 
           // Timing
           hotDuration:         rideData.hotDuration,
@@ -1216,6 +1292,8 @@ exports.ingestWhatsAppMessages = onRequest(
           rawText:             msg.text,
           rawTimeHint:         rideData.rawTimeHint,
           parseSource:         parseSource,                      // "llm" | "regex"
+          intent:              rideData.intent || "rider_request", // "rider_request" | "driver_offer"
+          pickupTimezone:      geoFrom ? pickupTz : null,
           llmModel:            rideData._llm?.model || null,
           llmConfidence:       rideData._llm?.confidence ?? null,
           llmReasoning:        rideData._llm?.reasoning || null,
