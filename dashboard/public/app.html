@@ -180,7 +180,7 @@
     // ---- Auth gate ----
     onAuthStateChanged(auth, async (user) => {
       if (!user || !user.emailVerified) {
-        window.location.href = "/";
+        window.location.href = "/login";
         return;
       }
       state.user = user;
