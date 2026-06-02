@@ -1,31 +1,224 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isAdmin() {
+      return isSignedIn()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isAdmin == true;
+    }
+
+    function isPostedRide() {
+      return resource.data.status == 'posted';
+    }
+
+    function isRideParticipant() {
+      return isSignedIn()
+        && (resource.data.riderId == request.auth.uid
+            || resource.data.driverId == request.auth.uid);
+    }
+
+    function userCreateKeysAreSafe(uid) {
+      return request.resource.data.uid == uid
+        && request.resource.data.keys().hasOnly([
+          'uid',
+          'email',
+          'displayName',
+          'phone',
+          'phoneCountryCode',
+          'whatsappPhone',
+          'whatsappCountryCode',
+          'vehicleMake',
+          'vehicleModel',
+          'vehicleColor',
+          'vehiclePlate',
+          'createdAt',
+          'updatedAt',
+          'fcmToken'
+        ]);
+    }
+
+    function userUpdateKeysAreSafe() {
+      return request.resource.data.diff(resource.data).changedKeys().hasOnly([
+        'email',
+        'displayName',
+        'phone',
+        'phoneCountryCode',
+        'whatsappPhone',
+        'whatsappCountryCode',
+        'vehicleMake',
+        'vehicleModel',
+        'vehicleColor',
+        'vehiclePlate',
+        'updatedAt',
+        'fcmToken'
+      ]);
+    }
 
     match /users/{uid} {
-      allow read: if request.auth != null;
-      allow write: if request.auth.uid == uid;
+      allow read: if isSignedIn();
+      allow create: if isAdmin() || (isSelf(uid) && userCreateKeysAreSafe(uid));
+      allow update: if isAdmin() || (isSelf(uid) && userUpdateKeysAreSafe());
+      allow delete: if false;
     }
 
     match /rides/{rideId} {
-      allow read: if true;  // drivers browse rides; dashboard reads without auth
-      allow create: if request.auth != null
+      function rideChangedKeysOnly(keys) {
+        return request.resource.data.diff(resource.data).changedKeys().hasOnly(keys);
+      }
+
+      function isRiderRideEdit() {
+        return resource.data.riderId == request.auth.uid
+          && resource.data.status == 'posted'
+          && request.resource.data.status == 'posted'
+          && rideChangedKeysOnly([
+            'name',
+            'phone',
+            'phoneCountryCode',
+            'whatsappPhone',
+            'whatsappCountryCode',
+            'from',
+            'to',
+            'miles',
+            'pickupLat',
+            'pickupLng',
+            'dropoffLat',
+            'dropoffLng',
+            'hotDuration',
+            'pickupDate',
+            'notes',
+            'updatedAt'
+          ]);
+      }
+
+      function isDirectDriverAccept() {
+        return resource.data.status == 'posted'
+          && request.resource.data.status == 'accepted'
+          && request.resource.data.driverId == request.auth.uid
+          && rideChangedKeysOnly([
+            'status',
+            'driverId',
+            'driverName',
+            'driverPhone',
+            'driverWhatsapp',
+            'acceptedAt',
+            'updatedAt'
+          ]);
+      }
+
+      function isBidSelectionAccept() {
+        return resource.data.riderId == request.auth.uid
+          && resource.data.status == 'posted'
+          && request.resource.data.status == 'accepted'
+          && rideChangedKeysOnly([
+            'status',
+            'driverId',
+            'driverName',
+            'driverPhone',
+            'driverWhatsapp',
+            'selectedBidId',
+            'acceptedAt',
+            'updatedAt'
+          ]);
+      }
+
+      function isAssignedDriverStatusUpdate() {
+        return resource.data.driverId == request.auth.uid
+          && (
+            (resource.data.status == 'accepted'
+              && request.resource.data.status in ['driverEnroute', 'driver_enroute']
+              && rideChangedKeysOnly(['status', 'driverEnrouteAt', 'updatedAt']))
+            || (resource.data.status in ['driverEnroute', 'driver_enroute']
+              && request.resource.data.status in ['driverArrived', 'driver_arrived']
+              && rideChangedKeysOnly(['status', 'arrivedAt', 'updatedAt']))
+            || (resource.data.status in ['driverArrived', 'driver_arrived']
+              && request.resource.data.status in ['rideStarted', 'ride_started']
+              && rideChangedKeysOnly(['status', 'startedAt', 'updatedAt']))
+            || (resource.data.status in ['rideStarted', 'ride_started']
+              && request.resource.data.status == 'completed'
+              && rideChangedKeysOnly(['status', 'completedAt', 'updatedAt']))
+          );
+      }
+
+      function isAllowedCancellation() {
+        return (
+          resource.data.riderId == request.auth.uid
+          && !(resource.data.status in ['completed', 'cancelled', 'expired', 'rideStarted', 'ride_started'])
+        ) || (
+          resource.data.driverId == request.auth.uid
+          && !(resource.data.status in ['completed', 'cancelled', 'expired'])
+        );
+      }
+
+      function isCancellationUpdate() {
+        return request.resource.data.status == 'cancelled'
+          && rideChangedKeysOnly(['status', 'cancelledBy', 'cancelledAt', 'updatedAt', 'cancellationReasonCode'])
+          && isAllowedCancellation();
+      }
+
+      function isClientExpiryUpdate() {
+        return resource.data.riderId == request.auth.uid
+          && resource.data.status == 'posted'
+          && request.resource.data.status == 'expired'
+          && rideChangedKeysOnly(['status', 'updatedAt']);
+      }
+
+      allow read: if isAdmin()
+                  || (isSignedIn() && (isPostedRide() || isRideParticipant()));
+      allow create: if isSignedIn()
                     && request.resource.data.riderId == request.auth.uid
                     && request.resource.data.status == 'posted';
-      allow update: if request.auth != null
-                    && !(resource.data.status in ['completed', 'cancelled', 'expired'])
-                    && (resource.data.riderId == request.auth.uid
-                        || resource.data.driverId == request.auth.uid
-                        || (resource.data.status == 'posted'
-                            && request.resource.data.driverId == request.auth.uid));
-      allow delete: if request.auth.uid == resource.data.riderId
+      allow update: if isAdmin()
+                    || (isSignedIn()
+                        && !(resource.data.status in ['completed', 'cancelled', 'expired'])
+                        && (
+                          isRiderRideEdit()
+                          || isDirectDriverAccept()
+                          || isBidSelectionAccept()
+                          || isAssignedDriverStatusUpdate()
+                          || isCancellationUpdate()
+                          || isClientExpiryUpdate()
+                        ));
+      allow delete: if isSelf(resource.data.riderId)
                     && resource.data.status == 'posted';
 
       match /bids/{bidId} {
-        allow read: if request.auth != null;
-        allow create: if request.auth != null
-                      && request.auth.uid == request.resource.data.driverId;
-        allow update: if request.auth != null;
+        function bidChangedKeysOnly(keys) {
+          return request.resource.data.diff(resource.data).changedKeys().hasOnly(keys);
+        }
+
+        function parentRide() {
+          return get(/databases/$(database)/documents/rides/$(rideId)).data;
+        }
+
+        allow read: if isAdmin()
+                    || (isSignedIn() && (
+                      parentRide().riderId == request.auth.uid
+                      || parentRide().driverId == request.auth.uid
+                      || resource.data.driverId == request.auth.uid
+                    ));
+        allow create: if isSignedIn()
+                      && request.auth.uid == request.resource.data.driverId
+                      && parentRide().status == 'posted';
+        allow update: if isAdmin()
+                      || (isSignedIn() && (
+                        (resource.data.driverId == request.auth.uid
+                          && (
+                            (resource.data.status == 'active'
+                              && request.resource.data.status == 'withdrawn'
+                              && bidChangedKeysOnly(['status', 'updatedAt']))
+                            || bidChangedKeysOnly(['message', 'updatedAt'])
+                          ))
+                        || (parentRide().riderId == request.auth.uid
+                          && request.resource.data.status in ['selected', 'rejected']
+                          && bidChangedKeysOnly(['status', 'updatedAt']))
+                      ));
         allow delete: if false;
       }
     }
@@ -44,21 +237,19 @@ service cloud.firestore {
     }
 
     match /ratings/{ratingId} {
-      allow read: if request.auth != null;
-      allow create: if request.auth != null
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
                     && request.auth.uid == request.resource.data.raterUid;
       allow update, delete: if false;
     }
 
-    // Placeholder profiles for WhatsApp-sourced riders (no Vaahana account yet)
     match /whatsappRiders/{docId} {
-      allow read: if true;   // dashboard reads without auth
+      allow read: if isAdmin();
       allow write: if false; // server-only
     }
 
-    // Ingestion audit trail — dashboard reads without auth
     match /whatsappIngestionLogs/{logId} {
-      allow read: if true;   // dashboard reads without auth
+      allow read: if isAdmin();
       allow write: if false; // server-only
     }
   }

@@ -8,6 +8,7 @@ import Combine
 import FirebaseCore
 import FirebaseAuth
 import FirebaseFirestore
+import FirebaseFunctions
 import UserNotifications
 #if canImport(FirebaseMessaging)
 import FirebaseMessaging
@@ -121,7 +122,7 @@ class UserState: ObservableObject {
                     self.role = role
                 } else {
                     self.role = .rider
-                    self.db.collection("users").document(uid).setData(["role": "rider"], merge: true)
+                    Functions.functions().httpsCallable("setUserRole").call(["role": "rider"])
                 }
 
                 // Cache profile fields and decide if setup sheet is needed
@@ -179,11 +180,8 @@ class LocationService: NSObject, ObservableObject, CLLocationManagerDelegate {
         manager.desiredAccuracy = kCLLocationAccuracyBest
         authorizationStatus = manager.authorizationStatus
 
-        // Request Always authorization so iOS shows all three options:
-        // "Allow Always" / "Allow While Using App" / "Don't Allow"
-        // Requires NSLocationAlwaysAndWhenInUseUsageDescription in Info.plist.
         if authorizationStatus == .notDetermined {
-            manager.requestAlwaysAuthorization()
+            manager.requestWhenInUseAuthorization()
         } else if authorizationStatus == .authorizedWhenInUse || authorizationStatus == .authorizedAlways {
             manager.startUpdatingLocation()
         }
@@ -250,7 +248,7 @@ class LocationService: NSObject, ObservableObject, CLLocationManagerDelegate {
         if status == .authorizedWhenInUse || status == .authorizedAlways {
             manager.startUpdatingLocation()
         } else if status == .notDetermined {
-            manager.requestAlwaysAuthorization()
+            manager.requestWhenInUseAuthorization()
         }
     }
 
@@ -276,7 +274,7 @@ class LocationService: NSObject, ObservableObject, CLLocationManagerDelegate {
             }
             pendingAuthorizationContinuation = continuation
 
-            manager.requestAlwaysAuthorization()
+            manager.requestWhenInUseAuthorization()
 
             authorizationTimeoutTask?.cancel()
             authorizationTimeoutTask = Task { [weak self] in
@@ -522,9 +520,11 @@ struct ProfileSetupView: View {
 
                 // Save to Firestore
                 try await db.collection("users").document(uid).setData([
-                    "displayName": trimmedName,
-                    "phone":       phone,
-                    "whatsapp":    phone,
+                    "displayName":         trimmedName,
+                    "phone":               phone,
+                    "phoneCountryCode":    "+1",
+                    "whatsappPhone":       phone,
+                    "whatsappCountryCode": "+1",
                 ], merge: true)
 
                 await MainActor.run {

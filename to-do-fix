@@ -1,0 +1,23 @@
+# Vaahana Fix List
+
+Priority order. Each item gets struck through only after the code change is in place.
+
+- [x] ~~Lock down Firestore reads for `rides`, `whatsappRiders`, and `whatsappIngestionLogs`; remove the fake public-admin model.~~
+- [x] ~~Restrict `/users/{uid}` writes so users cannot self-set protected fields like `isAdmin`, `role`, `activeRideId`, or `isAvailable`.~~
+- [x] ~~Restrict ride and bid updates so authenticated users can only mutate allowed fields for their own role and record.~~
+- [x] ~~Remove admin-dashboard XSS by escaping all untrusted Firestore/WhatsApp-derived values before inserting HTML.~~
+- [x] ~~Fix web signup duplicate-phone enforcement so duplicate numbers actually block account creation.~~
+- [x] ~~Seed password history for web-created accounts so reset-password reuse protection matches iOS.~~
+- [x] ~~Unify user contact schema across iOS, web, and Functions (`phone`, `phoneCountryCode`, `whatsappPhone`, `whatsappCountryCode`) and stop using the old `whatsapp` singleton field as the primary source.~~
+- [x] ~~Fix WhatsApp rider linking so backend matching works across stored number formats and platforms.~~
+- [x] ~~Make server-side ride expiry close active bids as well, not just mark the ride expired.~~
+- [x] ~~Make web ride acceptance enforce driver availability, single-active-ride constraints, and active-ride bookkeeping.~~
+- [x] ~~Block web ride acceptance when the driver profile has missing contact info.~~
+- [x] ~~Add server-side invariants for single active rider/driver workflows so multi-tab and cross-device use cannot create overlapping active rides.~~
+- [x] ~~Fix WhatsApp ingest ordering so timezone normalization happens before past-pickup and duplicate checks.~~
+- [x] ~~Restrict debug/admin callable functions like `reconcileRide` to admins only.~~
+- [x] ~~Resolve the role-flow contradiction: remove “role is permanent” copy or remove runtime role switching.~~
+- [x] ~~Align location permission scope and copy with actual product behavior; remove background location if it is not truly needed.~~
+- [x] ~~Fix admin dashboard metrics so “24h” and live counts are not computed from truncated snapshots.~~
+- [x] ~~Remove the public `/admin` link from the marketing site.~~
+- [x] ~~Clean up duplicate prototype files (`design/*`, extra `LocationService` copies) or clearly separate them from production code.~~

@@ -4,13 +4,5 @@
 <dict>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Vaahana uses your location to show nearby rides and center the map on your position.</string>
-
-	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>Allow Always so Vaahana can track your pickup location and update your position even when the app is in the background.</string>
-
-	<key>UIBackgroundModes</key>
-	<array>
-		<string>location</string>
-	</array>
 </dict>
 </plist>

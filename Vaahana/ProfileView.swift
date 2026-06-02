@@ -171,7 +171,9 @@ struct ProfileView: View {
         if let data = try? await db.collection("users").document(uid).getDocument().data() {
             displayName  = data["displayName"] as? String ?? currentUser?.displayName ?? ""
             phone        = data["phone"]       as? String ?? ""
-            whatsapp     = data["whatsapp"]    as? String ?? ""
+            whatsapp     = data["whatsappPhone"] as? String
+                        ?? data["whatsapp"] as? String
+                        ?? ""
             vehicleMake  = data["vehicleMake"]  as? String ?? ""
             vehicleModel = data["vehicleModel"] as? String ?? ""
             vehicleColor = data["vehicleColor"] as? String ?? ""
@@ -200,9 +202,11 @@ struct ProfileView: View {
                 }
                 if let uid = currentUser?.uid {
                     var payload: [String: Any] = [
-                        "displayName": trimmedName,
-                        "phone":       phone,
-                        "whatsapp":    whatsapp,
+                        "displayName":         trimmedName,
+                        "phone":               phone,
+                        "phoneCountryCode":    "+1",
+                        "whatsappPhone":       whatsapp,
+                        "whatsappCountryCode": "+1",
                     ]
                     if role == .driver {
                         payload["vehicleMake"]  = vehicleMake

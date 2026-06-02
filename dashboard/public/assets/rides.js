@@ -3,10 +3,10 @@
 // in RideService.swift.
 
 import {
-  db,
+  db, fn,
   doc, getDoc, setDoc, updateDoc,
   collection, query, where, orderBy, limit, onSnapshot,
-  runTransaction, getDocs, Timestamp,
+  getDocs, Timestamp, httpsCallable,
 } from "./firebase.js";
 import { uuidv4, asDate } from "./util.js";
 
@@ -52,8 +52,26 @@ export function newRide({
 }
 
 export async function postRide(ride) {
-  await setDoc(doc(db, "rides", ride.id), ride);
-  return ride.id;
+  const createRide = httpsCallable(fn, "createRideRequest");
+  const res = await createRide({
+    name: ride.name,
+    phone: ride.phone,
+    phoneCountryCode: ride.phoneCountryCode,
+    whatsappPhone: ride.whatsappPhone,
+    whatsappCountryCode: ride.whatsappCountryCode,
+    from: ride.from,
+    to: ride.to,
+    miles: ride.miles,
+    pickupLat: ride.pickupLat,
+    pickupLng: ride.pickupLng,
+    dropoffLat: ride.dropoffLat ?? null,
+    dropoffLng: ride.dropoffLng ?? null,
+    hotDuration: ride.hotDuration,
+    pickupDate: asDate(ride.pickupDate)?.toISOString?.() || ride.pickupDate,
+    notes: ride.notes || null,
+    source: "web",
+  });
+  return res?.data?.rideId || ride.id;
 }
 
 export async function updateRide(rideId, patch) {
@@ -63,40 +81,26 @@ export async function updateRide(rideId, patch) {
 // Driver claims a ride (web flow — no bid needed).
 // Only succeeds if still `posted`. Mirrors RideService.acceptRide.
 export async function driverAcceptRide(rideId, driverProfile) {
-  await runTransaction(db, async (tx) => {
-    const ref = doc(db, "rides", rideId);
-    const snap = await tx.get(ref);
-    if (!snap.exists()) throw new Error("Ride no longer exists.");
-    const r = snap.data();
-    if (r.status !== "posted") throw new Error("Ride is no longer available.");
-    tx.update(ref, {
-      status: "accepted",
-      driverId: driverProfile.uid,
-      driverName: driverProfile.displayName || "",
-      driverPhone: `${driverProfile.phoneCountryCode || ""}${driverProfile.phone || ""}`,
-      driverWhatsapp: `${driverProfile.whatsappCountryCode || driverProfile.phoneCountryCode || ""}${driverProfile.whatsappPhone || driverProfile.phone || ""}`,
-      acceptedAt: Timestamp.now(),
-      updatedAt: Timestamp.now(),
-    });
+  const claimRide = httpsCallable(fn, "claimRideAsDriver");
+  await claimRide({
+    rideId,
+    displayName: driverProfile.displayName || "",
+    phone: `${driverProfile.phoneCountryCode || ""}${driverProfile.phone || ""}`,
+    whatsapp: `${driverProfile.whatsappCountryCode || driverProfile.phoneCountryCode || ""}${driverProfile.whatsappPhone || driverProfile.phone || ""}`,
   });
 }
 
 export async function setRideStatus(rideId, status, extra = {}) {
-  const ts = Timestamp.now();
-  const fieldForStatus = {
-    driverEnroute: "driverEnrouteAt",
-    driverArrived: "arrivedAt",
-    rideStarted:   "startedAt",
-    completed:     "completedAt",
-    cancelled:     "cancelledAt",
-  }[status];
-  const patch = { status, updatedAt: ts, ...extra };
-  if (fieldForStatus) patch[fieldForStatus] = ts;
-  await updateDoc(doc(db, "rides", rideId), patch);
+  if (status === "cancelled") {
+    return cancelRide(rideId, extra.cancelledBy, extra.cancellationReasonCode);
+  }
+  const advance = httpsCallable(fn, "advanceRideStatus");
+  await advance({ rideId, status });
 }
 
-export async function cancelRide(rideId, byUid) {
-  await setRideStatus(rideId, "cancelled", { cancelledBy: byUid });
+export async function cancelRide(rideId, _byUid, reason = null) {
+  const cancel = httpsCallable(fn, "cancelManagedRide");
+  await cancel({ rideId, reason });
 }
 
 // ----- Listeners -----

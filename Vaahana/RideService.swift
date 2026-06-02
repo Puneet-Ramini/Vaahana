@@ -8,13 +8,48 @@
 import Foundation
 import FirebaseFirestore
 import FirebaseAuth
+import FirebaseFunctions
 
 /// Central service for all ride lifecycle mutations.
 /// All state changes go through here to ensure atomic ride assignment updates.
 final class RideService {
     static let shared = RideService()
     private let db = Firestore.firestore()
+    private let functions = Functions.functions()
     private init() {}
+
+    func createRide(
+        name: String,
+        phone: String,
+        phoneCountryCode: String,
+        whatsappPhone: String,
+        whatsappCountryCode: String,
+        from: String,
+        to: String,
+        miles: Double,
+        pickupLat: Double?,
+        pickupLng: Double?,
+        hotDuration: Int,
+        pickupDate: Date,
+        notes: String?
+    ) async throws {
+        _ = try await functions.httpsCallable("createRideRequest").call([
+            "name": name,
+            "phone": phone,
+            "phoneCountryCode": phoneCountryCode,
+            "whatsappPhone": whatsappPhone,
+            "whatsappCountryCode": whatsappCountryCode,
+            "from": from,
+            "to": to,
+            "miles": miles,
+            "pickupLat": pickupLat as Any,
+            "pickupLng": pickupLng as Any,
+            "hotDuration": hotDuration,
+            "pickupDate": ISO8601DateFormatter().string(from: pickupDate),
+            "notes": notes as Any,
+            "source": "app",
+        ])
+    }
 
     // MARK: - Accept Ride
 
@@ -25,39 +60,12 @@ final class RideService {
         driverPhone: String,
         driverWhatsapp: String
     ) async throws {
-        guard let driverId = Auth.auth().currentUser?.uid else {
-            throw RideServiceError.notAuthenticated
-        }
-        let rideRef = db.collection("rides").document(ride.id.uuidString)
-        let now     = Date()
-
-        try await db.runTransaction { transaction, errorPointer in
-            // Verify ride is still posted
-            let rideDoc: DocumentSnapshot
-            do { rideDoc = try transaction.getDocument(rideRef) }
-            catch let e { errorPointer?.pointee = e as NSError; return nil }
-
-            guard let currentStatus = rideDoc.data()?["status"] as? String,
-                  currentStatus == "posted" else {
-                errorPointer?.pointee = NSError(
-                    domain: "RideService", code: 409,
-                    userInfo: [NSLocalizedDescriptionKey: "This ride is no longer available."])
-                return nil
-            }
-
-            // Mark ride accepted with driver info
-            transaction.updateData([
-                "status":         "accepted",
-                "driverId":       driverId,
-                "driverName":     driverName,
-                "driverPhone":    driverPhone,
-                "driverWhatsapp": driverWhatsapp,
-                "acceptedAt":     Timestamp(date: now),
-                "updatedAt":      Timestamp(date: now)
-            ], forDocument: rideRef)
-
-            return nil
-        }
+        _ = try await functions.httpsCallable("claimRideAsDriver").call([
+            "rideId": ride.id.uuidString,
+            "displayName": driverName,
+            "phone": driverPhone,
+            "whatsapp": driverWhatsapp,
+        ])
     }
 
     // MARK: - Update Ride Status (enroute / arrived / started)
@@ -133,56 +141,10 @@ final class RideService {
         guard let actorId = Auth.auth().currentUser?.uid, actorId == uid else {
             throw RideServiceError.notAuthenticated
         }
-
-        // Ownership: actor must be the rider or the assigned driver
-        let isRider  = uid == ride.riderId
-        let isDriver = ride.driverId != nil && uid == ride.driverId
-        guard isRider || isDriver else {
-            throw RideServiceError.notAuthorized
-        }
-
-        let rideRef   = db.collection("rides").document(ride.id.uuidString)
-        let driverRef = ride.driverId.map { db.collection("users").document($0) }
-        let now       = Date()
-
-        var cancelFields: [String: Any] = [
-            "status":      "cancelled",
-            "cancelledBy": uid,
-            "cancelledAt": Timestamp(date: now),
-            "updatedAt":   Timestamp(date: now)
-        ]
-        if let reason { cancelFields["cancellationReasonCode"] = reason }
-
-        try await db.runTransaction { transaction, errorPointer in
-            let rideDoc: DocumentSnapshot
-            do { rideDoc = try transaction.getDocument(rideRef) }
-            catch let e { errorPointer?.pointee = e as NSError; return nil }
-
-            let rawStatus = rideDoc.data()?["status"] as? String ?? ""
-            let currentStatus = RideStatus(rawValue: rawStatus) ?? .posted
-
-            // Final-state immutability guard
-            if currentStatus.isFinal {
-                errorPointer?.pointee = NSError(domain: "RideService", code: 409,
-                    userInfo: [NSLocalizedDescriptionKey: "This ride is already in a final state."])
-                return nil
-            }
-
-            // Rider cannot cancel once the ride is in progress
-            if isRider && rawStatus == RideStatus.rideStarted.rawValue {
-                errorPointer?.pointee = NSError(domain: "RideService", code: 403,
-                    userInfo: [NSLocalizedDescriptionKey: "A ride in progress can only be cancelled by the driver."])
-                return nil
-            }
-
-            // Clear driver's active ride slot
-            if let dr = driverRef {
-                transaction.updateData(["activeRideId": FieldValue.delete()], forDocument: dr)
-            }
-
-            transaction.updateData(cancelFields, forDocument: rideRef)
-            return nil
-        }
+        _ = try await functions.httpsCallable("cancelManagedRide").call([
+            "rideId": ride.id.uuidString,
+            "reason": reason as Any,
+        ])
     }
 
     // MARK: - Complete Ride
@@ -190,51 +152,10 @@ final class RideService {
     /// Completes the ride.
     /// Validates: actor is assigned driver, ride is in rideStarted state.
     func completeRide(_ ride: Ride) async throws {
-        guard let actorId = Auth.auth().currentUser?.uid else {
-            throw RideServiceError.notAuthenticated
-        }
-        guard let driverId = ride.driverId else {
-            throw RideServiceError.missingDriver
-        }
-        guard actorId == driverId else {
-            throw RideServiceError.notAuthorized
-        }
-
-        let rideRef   = db.collection("rides").document(ride.id.uuidString)
-        let driverRef = db.collection("users").document(driverId)
-        let now       = Date()
-
-        try await db.runTransaction { transaction, errorPointer in
-            let rideDoc: DocumentSnapshot
-            do { rideDoc = try transaction.getDocument(rideRef) }
-            catch let e { errorPointer?.pointee = e as NSError; return nil }
-
-            let rawStatus = rideDoc.data()?["status"] as? String ?? ""
-
-            // Final-state immutability guard
-            if RideStatus(rawValue: rawStatus)?.isFinal == true {
-                errorPointer?.pointee = NSError(domain: "RideService", code: 409,
-                    userInfo: [NSLocalizedDescriptionKey: "This ride is already in a final state."])
-                return nil
-            }
-
-            // Must be in rideStarted to complete
-            guard rawStatus == RideStatus.rideStarted.rawValue else {
-                errorPointer?.pointee = NSError(domain: "RideService", code: 422,
-                    userInfo: [NSLocalizedDescriptionKey: "Ride must be started before it can be completed."])
-                return nil
-            }
-
-            transaction.updateData([
-                "activeRideId": FieldValue.delete()
-            ], forDocument: driverRef)
-            transaction.updateData([
-                "status":      "completed",
-                "completedAt": Timestamp(date: now),
-                "updatedAt":   Timestamp(date: now)
-            ], forDocument: rideRef)
-            return nil
-        }
+        _ = try await functions.httpsCallable("advanceRideStatus").call([
+            "rideId": ride.id.uuidString,
+            "status": "completed",
+        ])
     }
 
     // MARK: - Place Bid (driver)
@@ -340,99 +261,10 @@ final class RideService {
         guard let actorId = Auth.auth().currentUser?.uid, actorId == ride.riderId else {
             throw RideServiceError.notAuthorized
         }
-        let rideRef   = db.collection("rides").document(ride.id.uuidString)
-        let bidRef    = rideRef.collection("bids").document(bid.id)
-        let driverRef = db.collection("users").document(bid.driverId)
-        let now       = Date()
-
-        // Transaction: verify + accept
-        try await db.runTransaction { transaction, errorPointer in
-            let rideDoc: DocumentSnapshot
-            do { rideDoc = try transaction.getDocument(rideRef) }
-            catch let e { errorPointer?.pointee = e as NSError; return nil }
-
-            guard let status = rideDoc.data()?["status"] as? String, status == "posted" else {
-                errorPointer?.pointee = NSError(
-                    domain: "RideService", code: 409,
-                    userInfo: [NSLocalizedDescriptionKey: "This ride is no longer accepting bids."])
-                return nil
-            }
-
-            let bidDoc: DocumentSnapshot
-            do { bidDoc = try transaction.getDocument(bidRef) }
-            catch let e { errorPointer?.pointee = e as NSError; return nil }
-
-            guard let bidStatus = bidDoc.data()?["status"] as? String, bidStatus == "active" else {
-                errorPointer?.pointee = NSError(
-                    domain: "RideService", code: 410,
-                    userInfo: [NSLocalizedDescriptionKey: "This bid is no longer available."])
-                return nil
-            }
-
-            // Verify the chosen driver is not already on an active ride
-            let driverDoc: DocumentSnapshot
-            do { driverDoc = try transaction.getDocument(driverRef) }
-            catch let e { errorPointer?.pointee = e as NSError; return nil }
-
-            if let arId = driverDoc.data()?["activeRideId"] as? String, !arId.isEmpty {
-                errorPointer?.pointee = NSError(
-                    domain: "RideService", code: 423,
-                    userInfo: [NSLocalizedDescriptionKey: "This driver just accepted another ride. Please choose a different driver."])
-                return nil
-            }
-
-            // Accept ride with selected driver
-            transaction.updateData([
-                "status":         "accepted",
-                "driverId":       bid.driverId,
-                "driverName":     bid.driverName,
-                "driverPhone":    bid.driverPhone,
-                "driverWhatsapp": bid.driverWhatsapp,
-                "selectedBidId":  bid.id,
-                "acceptedAt":     Timestamp(date: now),
-                "updatedAt":      Timestamp(date: now)
-            ], forDocument: rideRef)
-
-            // Mark the driver's activeRideId so they can't be double-booked
-            transaction.updateData([
-                "activeRideId": ride.id.uuidString
-            ], forDocument: driverRef)
-
-            // Mark winning bid as selected
-            transaction.updateData([
-                "status":    "selected",
-                "updatedAt": Timestamp(date: now)
-            ], forDocument: bidRef)
-
-            return nil
-        }
-
-        // Batch-reject all remaining active bids on this ride (outside transaction)
-        if let otherBids = try? await rideRef.collection("bids")
-            .whereField("status", isEqualTo: "active")
-            .getDocuments() {
-            if !otherBids.documents.isEmpty {
-                let batch = db.batch()
-                for doc in otherBids.documents {
-                    batch.updateData(["status": "rejected", "updatedAt": Timestamp(date: now)], forDocument: doc.reference)
-                }
-                try? await batch.commit()
-            }
-        }
-
-        // Auto-close all other active bids by this driver across all rides
-        if let driverOtherBids = try? await db.collectionGroup("bids")
-            .whereField("driverId", isEqualTo: bid.driverId)
-            .whereField("status", isEqualTo: "active")
-            .getDocuments() {
-            if !driverOtherBids.documents.isEmpty {
-                let batch = db.batch()
-                for doc in driverOtherBids.documents {
-                    batch.updateData(["status": "autoClosed", "updatedAt": Timestamp(date: now)], forDocument: doc.reference)
-                }
-                try? await batch.commit()
-            }
-        }
+        _ = try await functions.httpsCallable("selectRideBid").call([
+            "rideId": ride.id.uuidString,
+            "bidId": bid.id,
+        ])
     }
 
     // MARK: - Expire Stale Ride (client-side, called by rider listener)

@@ -219,17 +219,16 @@
 
       setBtnLoading(suBtn, true, "Creating account…");
       try {
-        // Phone uniqueness check (same callable used by iOS).
         try {
           const check = httpsCallable(fn, "checkPhoneUnique");
-          const res = await check({ phone, countryCode: cc });
-          if (res?.data?.taken) {
-            setBtnLoading(suBtn, false, "Create account");
+          await check({ phone, countryCode: cc });
+        } catch (e) {
+          const code = String(e?.code || "");
+          if (code.includes("already-exists")) {
             return alertBox("error", "That phone number is already registered.");
           }
-        } catch (e) {
-          // Non-blocking: if callable is unreachable, let signup proceed.
-          console.warn("checkPhoneUnique failed (non-blocking):", e);
+          console.warn("checkPhoneUnique failed:", e);
+          return alertBox("error", "Couldn't verify that phone number right now. Please try again.");
         }
 
         const cred = await createUserWithEmailAndPassword(auth, email, pw);
@@ -247,6 +246,8 @@
           createdAt: Timestamp.now(),
           updatedAt: Timestamp.now(),
         }, { merge: true });
+        await httpsCallable(fn, "setUserRole")({ role: "rider" });
+        await httpsCallable(fn, "recordCurrentPassword")({ password: pw });
 
         await sendEmailVerification(cred.user);
         // Auth listener will route us to "verify" view.

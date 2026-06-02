@@ -120,7 +120,9 @@ struct PlaceBidSheet: View {
                 let driverName     = Auth.auth().currentUser?.displayName
                                      ?? (profile?["displayName"] as? String ?? "Driver")
                 let driverPhone    = profile?["phone"] as? String ?? ""
-                let driverWhatsapp = profile?["whatsapp"] as? String ?? driverPhone
+                let driverWhatsapp = profile?["whatsappPhone"] as? String
+                                  ?? profile?["whatsapp"] as? String
+                                  ?? driverPhone
 
                 try await RideService.shared.placeBid(
                     ride:          ride,

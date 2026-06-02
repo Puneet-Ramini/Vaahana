@@ -637,6 +637,10 @@
       if (state.myDriverRide) {
         return toast("Finish your current ride before accepting another.", { type: "error" });
       }
+      const missingContact = !state.profile?.phone || !(state.profile?.whatsappPhone || state.profile?.phone);
+      if (missingContact) {
+        return toast("Add your phone and WhatsApp number in Profile before accepting rides.", { type: "error" });
+      }
       if (!confirm(`Accept ride from ${r.name || "this rider"}?`)) return;
       try {
         await driverAcceptRide(r.id, {

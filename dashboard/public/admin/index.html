@@ -257,10 +257,9 @@
 <div id="auth-gate">
   <div class="box">
     <h2>Vaahana Dashboard</h2>
-    <p>Enter the dashboard password to continue.</p>
-    <input type="password" id="pw-input" placeholder="Password" autocomplete="current-password" />
-    <button id="pw-btn">Enter</button>
-    <div class="err" id="pw-err">Incorrect password.</div>
+    <p id="gate-copy">Checking your admin access…</p>
+    <button id="gate-action" style="display:none;">Go to login</button>
+    <div class="err" id="pw-err"></div>
   </div>
 </div>
 
@@ -360,48 +359,16 @@
 
 </main>
 
-<!-- Auth gate logic -->
-<script>
-  // Simple client-side gate — not a security boundary, just access control for the URL.
-  // The real security is Firestore rules requiring authentication.
-  const PASS_HASH = "a8f5f167f44f4964e6c998dee827110c"; // md5("vaahana2026") — change as needed
-  function md5(str) {
-    // Using SubtleCrypto for hashing
-    return crypto.subtle.digest("MD5", new TextEncoder().encode(str))
-      .catch(() => null);
-  }
-
-  const gate   = document.getElementById("auth-gate");
-  const btn    = document.getElementById("pw-btn");
-  const input  = document.getElementById("pw-input");
-  const errEl  = document.getElementById("pw-err");
-  const STORED = sessionStorage.getItem("vdash");
-
-  // Simple pass: store correct password hash in sessionStorage
-  const CORRECT = "vaahana2026";
-  if (STORED === CORRECT) gate.style.display = "none";
-
-  btn.addEventListener("click", () => {
-    if (input.value === CORRECT) {
-      sessionStorage.setItem("vdash", CORRECT);
-      gate.style.display = "none";
-    } else {
-      errEl.style.display = "block";
-      input.value = "";
-      input.focus();
-    }
-  });
-  input.addEventListener("keydown", e => { if (e.key === "Enter") btn.click(); });
-</script>
-
 <!-- Firebase SDK -->
 <script type="module">
   import { initializeApp }        from "https://www.gstatic.com/firebasejs/11.6.0/firebase-app.js";
+  import { getAuth, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-auth.js";
   import { getFirestore,
-           collection, query,
+           doc, getDoc, collection, query,
            where, orderBy, limit,
            onSnapshot, getDocs,
            Timestamp }             from "https://www.gstatic.com/firebasejs/11.6.0/firebase-firestore.js";
+  import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-functions.js";
   const firebaseConfig = {
     apiKey:            "AIzaSyAqHRI6HHkxbyr3Cb-TZue0r7JvKDpuTxk",
     authDomain:        "vaahana-fb9b8.firebaseapp.com",
@@ -413,6 +380,18 @@
 
   const app = initializeApp(firebaseConfig);
   const db  = getFirestore(app);
+  const auth = getAuth(app);
+  const fn = getFunctions(app);
+  const gate = document.getElementById("auth-gate");
+  const gateCopy = document.getElementById("gate-copy");
+  const gateAction = document.getElementById("gate-action");
+  const gateError = document.getElementById("pw-err");
+  let dashboardStarted = false;
+
+  gateAction.onclick = () => {
+    const returnTo = encodeURIComponent("/admin");
+    window.location.href = `/login?next=${returnTo}`;
+  };
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -442,167 +421,181 @@
 
   function el(id) { return document.getElementById(id); }
 
+  function escapeHtml(value) {
+    return String(value ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
   function last24hBoundary() {
     return Timestamp.fromDate(new Date(Date.now() - 24 * 60 * 60 * 1000));
   }
 
-  // ── Ingestion log (real-time) ─────────────────────────────────────────────
+  async function refreshStats() {
+    const getStats = httpsCallable(fn, "getAdminDashboardStats");
+    const res = await getStats();
+    const data = res?.data || {};
+    el("stat-ingested").textContent = data.ingested ?? 0;
+    el("stat-skipped").textContent = data.skipped ?? 0;
+    el("stat-dupes").textContent = data.duplicate ?? 0;
+    el("stat-errors").textContent = data.errors ?? 0;
+    el("stat-linked").textContent = data.linked ?? 0;
+    el("stat-live").textContent = data.liveWhatsapp ?? 0;
+    el("stat-live-app").textContent = data.liveApp ?? 0;
+    el("stat-placeholders").textContent = data.placeholders ?? 0;
 
-  const logsQ = query(
-    collection(db, "whatsappIngestionLogs"),
-    orderBy("createdAt", "desc"),
-    limit(50)
-  );
-
-  onSnapshot(logsQ, (snap) => {
-    setConnected(true);
-    el("log-count").textContent = `${snap.size} entries`;
-
-    // Compute 24h stats from these docs
-    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-    let ingested = 0, skipped = 0, dupes = 0, errors = 0, linked = 0;
-    const groupCounts = {};
-
-    snap.forEach(doc => {
-      const d = doc.data();
-      const ts = d.createdAt?.toDate?.()?.getTime() ?? 0;
-      if (ts < cutoff) return;
-
-      const outcome = d.outcome ?? (d.rideId ? "ingested" : "skipped");
-      if (outcome === "ingested") ingested++;
-      else if (outcome === "skipped")   skipped++;
-      else if (outcome === "duplicate") dupes++;
-      else if (outcome === "error")     errors++;
-
-      if (d.linkedUser) linked++;
-
-      const g = d.groupName || "Unknown";
-      groupCounts[g] = (groupCounts[g] || 0) + 1;
-    });
-
-    el("stat-ingested").textContent = ingested;
-    el("stat-skipped").textContent  = skipped;
-    el("stat-dupes").textContent    = dupes;
-    el("stat-errors").textContent   = errors;
-    el("stat-linked").textContent   = linked;
-
-    // Render log rows
-    const listEl = el("log-list");
-    if (snap.empty) {
-      listEl.innerHTML = '<div class="empty">No ingestion logs yet.</div>';
-    } else {
-      listEl.innerHTML = "";
-      snap.forEach(doc => {
-        const d = doc.data();
-        const outcome = d.outcome ?? (d.rideId ? "ingested" : "skipped");
-        const row = document.createElement("div");
-        row.className = "log-row";
-
-        const routeHtml = d.parsedFrom
-          ? `<div class="route">📍 ${d.parsedFrom} → ${d.parsedTo ?? "TBD"}</div>`
-          : "";
-
-        const nameTag = d.name && d.name !== "WhatsApp Rider"
-          ? `<strong>${d.name}</strong> · ` : "";
-
-        row.innerHTML = `
-          <div class="time">${fmtRelative(d.createdAt)}</div>
-          <div class="body">
-            <div>${nameTag}<span class="phone">${d.phone || "—"}</span> · ${d.groupName || ""}</div>
-            ${routeHtml}
-            <div class="raw">${(d.rawText || "").slice(0, 80)}</div>
-          </div>
-          <span class="badge ${outcome}">${outcome}</span>
-        `;
-        listEl.appendChild(row);
-      });
-    }
-
-    // Group breakdown
+    const groupCounts = data.groupCounts || {};
     const gbEl = el("group-breakdown");
-    const entries = Object.entries(groupCounts).sort((a,b) => b[1]-a[1]);
+    const entries = Object.entries(groupCounts).sort((a, b) => b[1] - a[1]);
     const maxCount = entries[0]?.[1] ?? 1;
     if (entries.length === 0) {
       gbEl.innerHTML = '<div class="empty">No data yet.</div>';
     } else {
       gbEl.innerHTML = entries.map(([name, count]) => `
         <div class="group-row">
-          <span style="min-width:160px;font-size:13px">${name}</span>
+          <span style="min-width:160px;font-size:13px">${escapeHtml(name)}</span>
           <div class="group-bar-wrap">
-            <div class="group-bar" style="width:${Math.round((count/maxCount)*100)}%"></div>
+            <div class="group-bar" style="width:${Math.round((count / maxCount) * 100)}%"></div>
           </div>
           <span style="font-size:12px;color:var(--muted);min-width:40px;text-align:right">${count}</span>
         </div>
       `).join("");
     }
 
-    el("last-updated").textContent = `Last updated: ${new Date().toLocaleTimeString()}`;
-  }, (err) => {
-    console.error(err);
-    setConnected(false);
-  });
+    el("last-updated").textContent = `Last updated: ${new Date(data.generatedAt || Date.now()).toLocaleTimeString()}`;
+  }
 
-  // ── Live WhatsApp rides (real-time) ───────────────────────────────────────
+  function showGate(message, { action = false, error = false } = {}) {
+    gate.style.display = "flex";
+    gateCopy.textContent = message;
+    gateAction.style.display = action ? "block" : "none";
+    gateError.style.display = error ? "block" : "none";
+    gateError.textContent = error ? message : "";
+  }
 
-  const waRidesQ = query(
-    collection(db, "rides"),
-    where("source",  "==", "whatsapp"),
-    where("status",  "==", "posted"),
-    orderBy("createdAt", "desc"),
-    limit(50)
-  );
+  function startDashboard() {
+    if (dashboardStarted) return;
+    dashboardStarted = true;
+    gate.style.display = "none";
 
-  onSnapshot(waRidesQ, (snap) => {
-    el("stat-live").textContent  = snap.size;
-    el("rides-count").textContent = `${snap.size} active`;
+    const logsQ = query(
+      collection(db, "whatsappIngestionLogs"),
+      orderBy("createdAt", "desc"),
+      limit(50)
+    );
 
-    const listEl = el("rides-list");
-    if (snap.empty) {
-      listEl.innerHTML = '<div class="empty">No live WhatsApp rides right now.</div>';
-      return;
-    }
-    listEl.innerHTML = "";
-    snap.forEach(doc => {
-      const d = doc.data();
-      const row = document.createElement("div");
-      row.className = "ride-row";
+    onSnapshot(logsQ, (snap) => {
+      setConnected(true);
+      el("log-count").textContent = `${snap.size} entries`;
 
-      const pickup = d.pickupDate?.toDate
-        ? d.pickupDate.toDate().toLocaleString(undefined, { month:"short", day:"numeric", hour:"2-digit", minute:"2-digit" })
-        : "—";
+      // Render log rows
+      const listEl = el("log-list");
+      if (snap.empty) {
+        listEl.innerHTML = '<div class="empty">No ingestion logs yet.</div>';
+      } else {
+        listEl.innerHTML = "";
+        snap.forEach(doc => {
+          const d = doc.data();
+          const outcome = d.outcome ?? (d.rideId ? "ingested" : "skipped");
+          const row = document.createElement("div");
+          row.className = "log-row";
 
-      const riderLabel = d.name && d.name !== "WhatsApp Rider"
-        ? `<strong>${d.name}</strong> · ${d.phone || d.whatsappPhone || "—"}`
-        : (d.phone || d.whatsappPhone || "—");
+          const routeHtml = d.parsedFrom
+            ? `<div class="route">📍 ${escapeHtml(d.parsedFrom)} → ${escapeHtml(d.parsedTo ?? "TBD")}</div>`
+            : "";
 
-      row.innerHTML = `
+          const nameTag = d.name && d.name !== "WhatsApp Rider"
+            ? `<strong>${escapeHtml(d.name)}</strong> · ` : "";
+
+          row.innerHTML = `
+          <div class="time">${fmtRelative(d.createdAt)}</div>
+          <div class="body">
+            <div>${nameTag}<span class="phone">${escapeHtml(d.phone || "—")}</span> · ${escapeHtml(d.groupName || "")}</div>
+            ${routeHtml}
+            <div class="raw">${escapeHtml((d.rawText || "").slice(0, 80))}</div>
+          </div>
+          <span class="badge ${escapeHtml(outcome)}">${escapeHtml(outcome)}</span>
+        `;
+          listEl.appendChild(row);
+        });
+      }
+
+    }, (err) => {
+      console.error(err);
+      setConnected(false);
+    });
+
+    const waRidesQ = query(
+      collection(db, "rides"),
+      where("source",  "==", "whatsapp"),
+      where("status",  "==", "posted"),
+      orderBy("createdAt", "desc"),
+      limit(50)
+    );
+
+    onSnapshot(waRidesQ, (snap) => {
+      el("rides-count").textContent = `${snap.size} active`;
+
+      const listEl = el("rides-list");
+      if (snap.empty) {
+        listEl.innerHTML = '<div class="empty">No live WhatsApp rides right now.</div>';
+        return;
+      }
+      listEl.innerHTML = "";
+      snap.forEach(doc => {
+        const d = doc.data();
+        const row = document.createElement("div");
+        row.className = "ride-row";
+
+        const pickup = d.pickupDate?.toDate
+          ? d.pickupDate.toDate().toLocaleString(undefined, { month:"short", day:"numeric", hour:"2-digit", minute:"2-digit" })
+          : "—";
+
+        const riderLabel = d.name && d.name !== "WhatsApp Rider"
+          ? `<strong>${escapeHtml(d.name)}</strong> · ${escapeHtml(d.phone || d.whatsappPhone || "—")}`
+          : escapeHtml(d.phone || d.whatsappPhone || "—");
+
+        row.innerHTML = `
         <div>
-          <div class="route">${d.from || "?"} → ${d.to || "?"}</div>
-          <div class="meta">${riderLabel} · ${d.groupName || ""} · pickup ${pickup}</div>
-          <div class="meta" style="margin-top:3px;color:var(--muted);font-size:10px;">${(d.rawText||"").slice(0,70)}</div>
+          <div class="route">${escapeHtml(d.from || "?")} → ${escapeHtml(d.to || "?")}</div>
+          <div class="meta">${riderLabel} · ${escapeHtml(d.groupName || "")} · pickup ${escapeHtml(pickup)}</div>
+          <div class="meta" style="margin-top:3px;color:var(--muted);font-size:10px;">${escapeHtml((d.rawText||"").slice(0,70))}</div>
         </div>
         <span class="source-badge whatsapp">WhatsApp</span>
       `;
-      listEl.appendChild(row);
+        listEl.appendChild(row);
+      });
     });
-  });
 
-  // ── App rides count (real-time) ───────────────────────────────────────────
+    const appRidesQ = query(
+      collection(db, "rides"),
+      where("status", "==", "posted")
+    );
 
-  const appRidesQ = query(
-    collection(db, "rides"),
-    where("status", "==", "posted")
-  );
+    onSnapshot(appRidesQ, () => { refreshStats().catch(console.error); });
+    refreshStats().catch(console.error);
+    setInterval(() => refreshStats().catch(console.error), 60000);
+  }
 
-  onSnapshot(appRidesQ, (snap) => {
-    const appCount = snap.docs.filter(d => d.data().source !== "whatsapp").length;
-    el("stat-live-app").textContent = appCount;
-  });
-
-  // ── Placeholder riders count (one-time) ───────────────────────────────────
-
-  getDocs(collection(db, "whatsappRiders")).then(snap => {
-    el("stat-placeholders").textContent = snap.size;
+  onAuthStateChanged(auth, async (user) => {
+    if (!user) {
+      showGate("You must sign in with an admin account to view this dashboard.", { action: true });
+      return;
+    }
+    try {
+      const userSnap = await getDoc(doc(db, "users", user.uid));
+      if (!userSnap.exists() || userSnap.data().isAdmin !== true) {
+        showGate("This account does not have admin access.", { error: true });
+        return;
+      }
+      startDashboard();
+    } catch (err) {
+      console.error(err);
+      showGate("Unable to verify admin access right now.", { error: true });
+    }
   });
 </script>
 </body>

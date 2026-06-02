@@ -10,6 +10,7 @@ import Combine
 import MapKit
 import FirebaseFirestore
 import FirebaseAuth
+import FirebaseFunctions
 import CoreLocation
 
 // MARK: - Data Models
@@ -2048,7 +2049,9 @@ struct PostRideSheet: View {
 
         let savedName     = data["displayName"] as? String ?? Auth.auth().currentUser?.displayName ?? ""
         let savedPhone    = data["phone"]    as? String ?? ""
-        let savedWhatsapp = data["whatsapp"] as? String ?? savedPhone
+        let savedWhatsapp = data["whatsappPhone"] as? String
+                         ?? data["whatsapp"] as? String
+                         ?? savedPhone
 
         await MainActor.run {
             if name.isEmpty          { name          = savedName }
@@ -2083,26 +2086,33 @@ struct PostRideSheet: View {
         } else {
             isSubmitting = true
             let coord = pickupResult?.coordinate
-            let ride = Ride(
-                riderId: Auth.auth().currentUser?.uid ?? "",
-                name: name,
-                phone: phone,
-                phoneCountryCode: phoneCountryCode,
-                whatsappPhone: finalWhatsappPhone,
-                whatsappCountryCode: finalWhatsappCountryCode,
-                from: pickupResult?.name ?? "",
-                to: dropoffResult?.name ?? "",
-                miles: miles,
-                pickupLat: coord?.latitude,
-                pickupLng: coord?.longitude,
-                hotDuration: hotDuration,
-                pickupDate: pickupDate,
-                notes: notes.isEmpty ? nil : notes,
-                status: .posted
-            )
-            storage.addRide(ride)
-            isSubmitting = false
-            dismiss()
+            Task {
+                do {
+                    try await RideService.shared.createRide(
+                        name: name,
+                        phone: phone,
+                        phoneCountryCode: phoneCountryCode,
+                        whatsappPhone: finalWhatsappPhone,
+                        whatsappCountryCode: finalWhatsappCountryCode,
+                        from: pickupResult?.name ?? "",
+                        to: dropoffResult?.name ?? "",
+                        miles: miles,
+                        pickupLat: coord?.latitude,
+                        pickupLng: coord?.longitude,
+                        hotDuration: hotDuration,
+                        pickupDate: pickupDate,
+                        notes: notes.isEmpty ? nil : notes
+                    )
+                    await MainActor.run {
+                        isSubmitting = false
+                        dismiss()
+                    }
+                } catch {
+                    await MainActor.run {
+                        isSubmitting = false
+                    }
+                }
+            }
         }
     }
 
@@ -2717,6 +2727,7 @@ struct SwitchRoleTab: View {
     @State private var errorMessage: String?
 
     private let db = Firestore.firestore()
+    private let functions = Functions.functions()
 
     var body: some View {
         ScrollView {
@@ -2841,7 +2852,7 @@ struct SwitchRoleTab: View {
         errorMessage = nil
         Task {
             do {
-                try await db.collection("users").document(uid).setData(["role": newRole.rawValue], merge: true)
+                _ = try await functions.httpsCallable("setUserRole").call(["role": newRole.rawValue])
                 await MainActor.run {
                     userState.role = newRole
                     isSwitching = false
@@ -2981,9 +2992,11 @@ struct SettingsTab: View {
                         }
                         .tint(.green)
                         .onChange(of: isOnline) { _, online in
-                            guard let uid = Auth.auth().currentUser?.uid else { return }
-                            Firestore.firestore().collection("users").document(uid)
-                                .setData(["isAvailable": online], merge: true)
+                            Task {
+                                try? await Functions.functions()
+                                    .httpsCallable("setDriverAvailability")
+                                    .call(["isAvailable": online])
+                            }
                         }
                     } header: {
                         Text("Availability")
@@ -3100,7 +3113,9 @@ struct SettingsTab: View {
             await MainActor.run {
                 displayName  = data["displayName"] as? String ?? currentUser?.displayName ?? ""
                 phone        = data["phone"]       as? String ?? ""
-                whatsapp     = data["whatsapp"]    as? String ?? ""
+                whatsapp     = data["whatsappPhone"] as? String
+                             ?? data["whatsapp"] as? String
+                             ?? ""
                 vehicleMake  = data["vehicleMake"]  as? String ?? ""
                 vehicleModel = data["vehicleModel"] as? String ?? ""
                 vehicleColor = data["vehicleColor"] as? String ?? ""
@@ -3130,9 +3145,11 @@ struct SettingsTab: View {
                 }
                 if let uid = currentUser?.uid {
                     var payload: [String: Any] = [
-                        "displayName": trimmedName,
-                        "phone":       phone,
-                        "whatsapp":    whatsapp,
+                        "displayName":         trimmedName,
+                        "phone":               phone,
+                        "phoneCountryCode":    "+1",
+                        "whatsappPhone":       whatsapp,
+                        "whatsappCountryCode": "+1",
                     ]
                     if userState.role == .driver {
                         payload["vehicleMake"]  = vehicleMake
