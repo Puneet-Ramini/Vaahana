@@ -122,7 +122,11 @@ class UserState: ObservableObject {
                     self.role = role
                 } else {
                     self.role = .rider
-                    Functions.functions().httpsCallable("setUserRole").call(["role": "rider"])
+                    Task {
+                        try? await Functions.functions()
+                            .httpsCallable("setUserRole")
+                            .call(["role": "rider"])
+                    }
                 }
 
                 // Cache profile fields and decide if setup sheet is needed
