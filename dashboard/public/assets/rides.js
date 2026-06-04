@@ -1,6 +1,6 @@
 // Firestore ride + user service for Vaahana web.
-// Matches the Swift Ride model in ContentView.swift:84 and state transitions
-// in RideService.swift.
+// Matches the Swift Ride model in ContentView.swift and the managed state
+// transitions in RideService.swift.
 
 import {
   db, fn,
@@ -47,7 +47,6 @@ export function newRide({
     startedAt: null, completedAt: null, cancelledAt: null,
     cancelledBy: null, cancellationReasonCode: null,
     notes: notes || null,
-    bidCount: 0, selectedBidId: null, latestBidAt: null,
   };
 }
 

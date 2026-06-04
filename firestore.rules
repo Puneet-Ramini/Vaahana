@@ -112,22 +112,6 @@ service cloud.firestore {
           ]);
       }
 
-      function isBidSelectionAccept() {
-        return resource.data.riderId == request.auth.uid
-          && resource.data.status == 'posted'
-          && request.resource.data.status == 'accepted'
-          && rideChangedKeysOnly([
-            'status',
-            'driverId',
-            'driverName',
-            'driverPhone',
-            'driverWhatsapp',
-            'selectedBidId',
-            'acceptedAt',
-            'updatedAt'
-          ]);
-      }
-
       function isAssignedDriverStatusUpdate() {
         return resource.data.driverId == request.auth.uid
           && (
@@ -180,7 +164,6 @@ service cloud.firestore {
                         && (
                           isRiderRideEdit()
                           || isDirectDriverAccept()
-                          || isBidSelectionAccept()
                           || isAssignedDriverStatusUpdate()
                           || isCancellationUpdate()
                           || isClientExpiryUpdate()
@@ -189,37 +172,8 @@ service cloud.firestore {
                     && resource.data.status == 'posted';
 
       match /bids/{bidId} {
-        function bidChangedKeysOnly(keys) {
-          return request.resource.data.diff(resource.data).changedKeys().hasOnly(keys);
-        }
-
-        function parentRide() {
-          return get(/databases/$(database)/documents/rides/$(rideId)).data;
-        }
-
-        allow read: if isAdmin()
-                    || (isSignedIn() && (
-                      parentRide().riderId == request.auth.uid
-                      || parentRide().driverId == request.auth.uid
-                      || resource.data.driverId == request.auth.uid
-                    ));
-        allow create: if isSignedIn()
-                      && request.auth.uid == request.resource.data.driverId
-                      && parentRide().status == 'posted';
-        allow update: if isAdmin()
-                      || (isSignedIn() && (
-                        (resource.data.driverId == request.auth.uid
-                          && (
-                            (resource.data.status == 'active'
-                              && request.resource.data.status == 'withdrawn'
-                              && bidChangedKeysOnly(['status', 'updatedAt']))
-                            || bidChangedKeysOnly(['message', 'updatedAt'])
-                          ))
-                        || (parentRide().riderId == request.auth.uid
-                          && request.resource.data.status in ['selected', 'rejected']
-                          && bidChangedKeysOnly(['status', 'updatedAt']))
-                      ));
-        allow delete: if false;
+        allow read: if isAdmin();
+        allow create, update, delete: if false;
       }
     }
 

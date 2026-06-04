@@ -999,7 +999,6 @@ struct DriverView: View {
     @EnvironmentObject private var locationService: LocationService
     @State private var selectedRide: Ride?
     @State private var showingActiveRide = false
-    @State private var showingMyBids = false
     @State private var ratingRide: Ride?
 
     @AppStorage("filterRadius") private var filterRadius = 5.0
@@ -1080,30 +1079,6 @@ struct DriverView: View {
                             .buttonStyle(.plain)
                         }
 
-                        // My Bids
-                        Button { showingMyBids = true } label: {
-                            HStack(spacing: 12) {
-                                ZStack {
-                                    Circle().fill(Color.purple.opacity(0.12)).frame(width: 44, height: 44)
-                                    Image(systemName: "list.bullet.rectangle.portrait")
-                                        .font(.system(size: 18, weight: .semibold))
-                                        .foregroundStyle(.purple)
-                                }
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("My Bids").font(.subheadline).fontWeight(.semibold)
-                                    Text("Track bids you've placed").font(.caption).foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(.tertiary)
-                            }
-                            .padding(14)
-                            .background(Color(UIColor.secondarySystemGroupedBackground))
-                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                        }
-                        .buttonStyle(.plain)
-
                         // Section header
                         HStack(alignment: .firstTextBaseline) {
                             Text("Hot Requests")
@@ -1150,7 +1125,6 @@ struct DriverView: View {
                 ActiveRideView(ride: active, role: .driver)
             }
         }
-        .sheet(isPresented: $showingMyBids) { DriverBidsView() }
         .sheet(item: $ratingRide) { ride in
             RatingView(ride: ride, raterRole: .driver, targetUid: ride.riderId)
                 .onDisappear {
@@ -2198,7 +2172,6 @@ struct RideCard: View {
     let isDriverMode: Bool
     var onEdit: (() -> Void)? = nil
     var onDelete: (() -> Void)? = nil
-    var onViewBids: (() -> Void)? = nil
     @EnvironmentObject var storage: RideStorage
     
     var body: some View {
@@ -2298,25 +2271,6 @@ struct RideCard: View {
             
             Divider()
             
-            // Bid count button (rider mode, posted rides)
-            if !isDriverMode && ride.status == .posted && ride.bidCount > 0 {
-                Button { onViewBids?() } label: {
-                    HStack {
-                        Image(systemName: "person.2.fill")
-                        Text("\(ride.bidCount) driver bid\(ride.bidCount == 1 ? "" : "s")")
-                            .fontWeight(.semibold)
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                    }
-                    .font(.subheadline)
-                    .foregroundStyle(.white)
-                    .padding()
-                    .background(Color.blue)
-                    .cornerRadius(12)
-                }
-                .buttonStyle(.plain)
-            }
-
             // Actions
             if ride.status == .posted {
                 if isDriverMode {
@@ -2343,46 +2297,25 @@ struct RideCard: View {
                     }
                 } else {
                     // Rider mode - show edit/delete buttons
-                    if ride.bidCount > 0 {
-                        // Edit locked — drivers have placed bids
-                        VStack(spacing: 6) {
-                            Label("Editing locked — \(ride.bidCount) driver bid\(ride.bidCount == 1 ? "" : "s") placed", systemImage: "lock.fill")
-                                .font(.caption).fontWeight(.semibold)
-                                .foregroundStyle(.orange)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            Button {
-                                onDelete?()
-                            } label: {
-                                Label("Cancel Ride", systemImage: "xmark")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.red)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 8)
-                                    .background(Color.red.opacity(0.1))
-                                    .cornerRadius(8)
-                            }
+                    HStack(spacing: 12) {
+                        Button {
+                            onEdit?()
+                        } label: {
+                            Label("Edit", systemImage: "pencil")
+                                .font(.subheadline)
+                                .foregroundStyle(.blue)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
                         }
-                    } else {
-                        HStack(spacing: 12) {
-                            Button {
-                                onEdit?()
-                            } label: {
-                                Label("Edit", systemImage: "pencil")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.blue)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 8)
-                            }
 
-                            Button {
-                                onDelete?()
-                            } label: {
-                                Label("Cancel", systemImage: "xmark")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.red)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 8)
-                            }
+                        Button {
+                            onDelete?()
+                        } label: {
+                            Label("Cancel", systemImage: "xmark")
+                                .font(.subheadline)
+                                .foregroundStyle(.red)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
                         }
                     }
                 }
@@ -2761,7 +2694,7 @@ struct SwitchRoleTab: View {
                     roleOption(
                         icon: "figure.wave",
                         title: "Rider",
-                        description: "Post ride requests and let drivers bid to help you.",
+                        description: "Post ride requests and let drivers claim them directly.",
                         isActive: userState.role == .rider,
                         color: .blue,
                         onSelect: { switchRole(to: .rider) }
@@ -2769,7 +2702,7 @@ struct SwitchRoleTab: View {
                     roleOption(
                         icon: "car.fill",
                         title: "Driver",
-                        description: "Browse nearby requests and place offers to help riders.",
+                        description: "Browse nearby requests and claim the ones you can help with.",
                         isActive: userState.role == .driver,
                         color: .primary,
                         onSelect: { switchRole(to: .driver) }

@@ -21,3 +21,16 @@ Priority order. Each item gets struck through only after the code change is in p
 - [x] ~~Fix admin dashboard metrics so “24h” and live counts are not computed from truncated snapshots.~~
 - [x] ~~Remove the public `/admin` link from the marketing site.~~
 - [x] ~~Clean up duplicate prototype files (`design/*`, extra `LocationService` copies) or clearly separate them from production code.~~
+
+# Additional Review Findings
+
+New issues found after the first hardening pass. These are still open.
+
+- [x] ~~Fix `reconcileDriverAssignments` so it does not clear rider `activeRideId` values created by the server-side ride-request flow.~~
+- [x] ~~Fix web auth redirect handling so `/login?next=/admin` returns signed-in admins to `/admin` instead of always sending them to `/app.html`.~~
+- [x] ~~Update `/Users/pranav/Vaahana/README.md` to remove stale background-location, coins, and outdated reconciliation documentation.~~
+- [x] ~~Update `/Users/pranav/Vaahana/functions/README.md` to match the current server-side ride lifecycle and no-pricing flow.~~
+- [x] ~~Update `/Users/pranav/Vaahana/VAAHANA_PROJECT_REPORT.txt` to remove stale “Always” location-permission behavior.~~
+- [x] ~~Remove the bid flow entirely; drivers now claim posted rides directly and bids are no longer part of the product workflow.~~
+- [ ] Remove remaining legacy `whatsapp` field fallbacks from the iOS app after confirming all existing user documents are migrated.
+- [ ] Clean up current iOS build warnings: Swift 6 `Sendable` captures, deprecated MapKit/CoreLocation APIs, and minor unused values.

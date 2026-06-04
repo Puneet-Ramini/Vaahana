@@ -156,10 +156,18 @@
       return String(s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" })[c]);
     }
 
-    // ---- Auth state: if already signed-in + verified, go to app.
+    function getPostAuthTarget(rawNext) {
+      if (!rawNext || typeof rawNext !== "string") return "/app.html";
+      if (!rawNext.startsWith("/") || rawNext.startsWith("//")) return "/app.html";
+      return rawNext;
+    }
+
+    // ---- Auth state: if already signed-in + verified, go to target.
     let initialAuthResolved = false;
+    const params = new URLSearchParams(location.search);
     // Deep-link: homepage CTAs can pass ?action=signup|login to skip the landing step.
-    const initialAction = new URLSearchParams(location.search).get("action");
+    const initialAction = params.get("action");
+    const nextTarget = getPostAuthTarget(params.get("next"));
 
     onAuthStateChanged(auth, async (user) => {
       if (!initialAuthResolved) initialAuthResolved = true;
@@ -176,7 +184,7 @@
       }
       // Signed in and verified — ensure user doc then go to app.
       await ensureUserDoc(user);
-      window.location.href = "/app.html";
+      window.location.href = nextTarget;
     });
 
     async function ensureUserDoc(user) {
@@ -301,7 +309,7 @@
         await reload(auth.currentUser);
         if (auth.currentUser.emailVerified) {
           await ensureUserDoc(auth.currentUser);
-          window.location.href = "/app.html";
+          window.location.href = nextTarget;
         } else {
           alertBox("warn", "Still not verified. Check your inbox (and spam).");
         }
@@ -351,7 +359,7 @@
         await reload(auth.currentUser);
         if (auth.currentUser.emailVerified) {
           await ensureUserDoc(auth.currentUser);
-          window.location.href = "/app.html";
+          window.location.href = nextTarget;
         }
       } catch {}
     }, 4000);

@@ -9,12 +9,12 @@ WHAT THE APP IS
 Vaahana is a community ride-sharing platform for the South Asian diaspora in
 the US. People post ride requests (e.g., "need a ride from Nashua to Boston
 this Sunday") and drivers contact them directly. It's not Uber — there's no
-dynamic pricing, no payment processing. It runs on community coins (virtual
-currency) and WhatsApp-style direct contact.
+dynamic pricing, no payment processing, and no in-app checkout. The current
+flow is direct contact plus managed ride-state tracking.
 
-Current status: V1, rider-only. The driver side is fully built but disabled.
-All users are assigned the "rider" role on signup. The priority right now is
-getting riders to post requests and building the feed.
+Current status: the rider posting flow, WhatsApp ingestion, driver assignment
+flow, and admin tooling are all live. The product is still evolving, with
+some older docs lagging behind the current implementation.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -25,7 +25,7 @@ There are two paths:
 
 1. IN-APP POSTING
    A rider opens the app, taps "+", fills in pickup / destination / date /
-   time / seat count / notes / coin offer, and posts. The ride appears in
+   time / seat count / notes / contact details, and posts. The ride appears in
    everyone's feed instantly.
 
 2. WHATSAPP INGESTION
@@ -65,13 +65,13 @@ MAP TAB
 RIDE DETAIL SHEET
   - Drawn route on a map (pickup pin + destination)
   - Distance and estimated drive time via MKDirections
-  - Rider name, phone, seat count, notes, coin offer
+  - Rider name, phone, seat count, notes
   - "Contact on WhatsApp" button — opens WhatsApp with a pre-filled message
   - Rider can cancel/expire their own ride from here
 
 SETTINGS TAB
   - Sign out
-  - Driver controls scaffolded but hidden
+  - Profile and role controls
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -80,7 +80,7 @@ ENGINEERING — iOS APP
 
 STACK
   - SwiftUI (iOS 17+), no UIKit
-  - Firebase (Firestore, Auth, FCM)
+  - Firebase (Firestore, Auth, FCM, callable Functions)
   - MapKit (iOS 17 Map API with Annotation, MKDirections, MKLocalSearch)
   - CoreLocation (CLLocationManager, Always permission)
 
@@ -88,10 +88,8 @@ KEY FILES
   ContentView.swift      Everything: Ride model, RideStorage, RiderView,
                          MapTabView, PostRideSheet, RideDetailSheet,
                          CompactRideRow
-  VaahanaApp.swift       Entry point, LocationService, auth state, FCM,
-                         daily coin grant
-  RideService.swift      Atomic Firestore transactions (accept, bid, cancel,
-                         complete)
+  VaahanaApp.swift       Entry point, LocationService, auth state, FCM
+  RideService.swift      Managed ride lifecycle calls
   LocationPickerView.swift  Address autocomplete with current-location support
   PhoneAuthView.swift    Firebase phone number auth + OTP
   ProfileView.swift      Account dashboard
@@ -116,9 +114,8 @@ RIDESTORAGE — OFFLINE-FIRST DATA LAYER
 
 LOCATION
   LocationService wraps CLLocationManager:
-  - Calls requestAlwaysAuthorization() on first launch
-  - Info.plist declares NSLocationAlwaysAndWhenInUseUsageDescription +
-    UIBackgroundModes:location — required for iOS to show the "Always" option
+  - Requests location only when nearby-ride sorting or map centering needs it
+  - Uses standard foreground location access for the current product flow
   - Map tab re-center button checks current auth status and either flies
     the map, starts the permission dialog, or shows a Settings deeplink alert
 
@@ -170,19 +167,20 @@ WHATSAPP INGESTION PIPELINE (ingestWhatsAppMessages)
 SCHEDULED FUNCTIONS
   expireStaleRides          Every 1 min   Marks rides as expired when
                                           createdAt + hotDuration passes
-  reconcileRecentRides      Every 5 min   Auto-repairs coin locks, bid
-                                          states, driver assignments
-  reconcileUserLocks        Every 5 min   Validates coinsLocked vs. active
-                                          rides
+  reconcileRecentRides      Every 5 min   Auto-repairs stale legacy response
+                                          and ride state on active/final rides
+  reconcileUserLocks        Every 5 min   Legacy no-op kept for stable
+                                          deploy surface
   reconcileDriverAssignments Every 5 min  Clears stale activeRideId links
-  grantDailyCoins           Midnight UTC  100 coins/day per user
+                                          for users no longer tied to rides
+  grantDailyCoins           Midnight UTC  Legacy no-op kept for stable
+                                          deploy surface
 
 FIRESTORE DATA MODEL
-  users/{uid}               Profile, role, coins, coinsLocked, fcmToken
-  rides/{rideId}            Full ride document (status, route, coins,
-                            timestamps)
-    bids/{bidId}            Driver bids
-  coinTransactions/         Immutable audit log
+  users/{uid}               Profile, role, contact info, availability,
+                            activeRideId, fcmToken
+  rides/{rideId}            Full ride document (status, route, riders,
+                            drivers, timestamps)
   ratings/                  Post-ride star ratings
   whatsappRiders/           Phone-hashed placeholders
   whatsappIngestionLogs/    Per-message parse audit trail
@@ -190,10 +188,6 @@ FIRESTORE DATA MODEL
 RIDE STATE MACHINE
   posted → accepted → driver_enroute → driver_arrived → ride_started → completed
      └────────────────────── cancelled / expired ───────────────────────────┘
-
-  Coins: locked from rider on acceptance → transferred to driver on
-  completion → refunded on cancel.
-
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BUGS FIXED (THIS SESSION)
@@ -248,11 +242,9 @@ KNOWN LIMITATIONS
     so messages sent while the bot is offline are permanently missed.
     Workaround: manually re-ingest via the raw export API endpoint.
 
-  - Driver mode disabled: fully built (bid placement, assignment, coin
-    transfer, ride tracking) but hidden behind role check pending driver
-    onboarding.
-
-  - No real money: coins are community currency only; no payment integration.
+  - Some older docs and archived prototype assets still describe removed
+    pricing/background-location behavior and should not be treated as source
+    of truth over the current app + functions code.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

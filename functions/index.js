@@ -14,7 +14,7 @@
  *
  *  reconcileRecentRides       — scheduled every 5 min
  *    Scans non-final rides and recently-finalized rides (last 7 days).
- *    Repairs: stale active bids, posted-ride stale fields.
+ *    Repairs: stale legacy response data, posted-ride stale fields.
  *    Logs:    missing drivers on active rides.
  *
  *  reconcileUserLocks         — scheduled every 5 min
@@ -31,7 +31,7 @@
 
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { onCall, HttpsError, onRequest } = require("firebase-functions/v2/https");
-const { onDocumentCreated, onDocumentUpdated } = require("firebase-functions/v2/firestore");
+const { onDocumentUpdated } = require("firebase-functions/v2/firestore");
 const { initializeApp } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
@@ -416,8 +416,9 @@ exports.reconcileDriverAssignments = onSchedule(
           continue;
         }
 
-        // Case 3: this user is not the driver on that ride
-        if (rideData.driverId !== uid) {
+        // Case 3: this user is no longer a participant on that ride
+        const isRideParticipant = rideData.driverId === uid || rideData.riderId === uid;
+        if (!isRideParticipant) {
           await userDoc.ref.update({ activeRideId: FieldValue.delete() });
           clears++;
           await writeLog({
@@ -428,13 +429,14 @@ exports.reconcileDriverAssignments = onSchedule(
             details: {
               activeRideId,
               rideStatus,
-              reason:          "driver_mismatch",
+              reason:          "participant_mismatch",
               actualDriverId:  rideData.driverId || null,
+              actualRiderId:   rideData.riderId || null,
             },
           });
         }
 
-        // All good — ride is active and belongs to this driver
+        // All good — ride is active and this user is still linked to it
       } catch (err) {
         console.error(`[reconcileDriverAssignments] Error on user ${userDoc.id}:`, err.message);
       }
@@ -1366,11 +1368,6 @@ exports.ingestWhatsAppMessages = onRequest(
           hotDuration:         rideData.hotDuration,
           pickupDate:          rideData.pickupDate,
 
-          // Bid marketplace
-          bidCount:            0,
-          selectedBidId:       null,
-          latestBidAt:         null,
-
           // Driver (empty until accepted)
           driverId:            null,
           driverName:          null,
@@ -1509,34 +1506,6 @@ exports.expireStaleRides = onSchedule(
   }
 );
 
-// ─── Function 7: onBidPlaced ──────────────────────────────────────────────────
-
-/**
- * Fires when a driver places a new bid on a ride.
- * Notifies the rider so they don't have to keep the app open.
- */
-exports.onBidPlaced = onDocumentCreated(
-  { document: "rides/{rideId}/bids/{bidId}" },
-  async (event) => {
-    const bid    = event.data.data();
-    const rideId = event.params.rideId;
-
-    const rideDoc = await db.collection("rides").doc(rideId).get();
-    if (!rideDoc.exists) return;
-    const ride = rideDoc.data();
-    if (ride.status !== "posted") return;
-
-    const driverName = bid.driverName || "A driver";
-
-    await sendToUser(
-      ride.riderId,
-      "New driver response",
-      `${driverName} responded to your request for ${ride.from} → ${ride.to}`,
-      { type: "new_bid", rideId }
-    );
-  }
-);
-
 // ─── Function 7: onRideStatusChanged ─────────────────────────────────────────
 
 /**
@@ -1556,13 +1525,12 @@ exports.onRideStatusChanged = onDocumentUpdated(
 
     switch (after.status) {
       case "accepted":
-        // Rider selected a bid — notify the driver they've been chosen
         if (driverId) {
           await sendToUser(
             driverId,
-            "Your bid was accepted!",
+            "Ride accepted",
             `Head to ${from} to pick up ${name || "your rider"}`,
-            { type: "bid_accepted", rideId }
+            { type: "ride_accepted", rideId }
           );
         }
         break;
@@ -1605,7 +1573,7 @@ exports.onRideStatusChanged = onDocumentUpdated(
           await sendToUser(
             driverId,
             "Ride completed",
-            "Coins have been transferred. Rate your rider!",
+            "Ride complete. Rate your rider!",
             { type: "ride_completed", rideId }
           );
         }
@@ -1788,9 +1756,6 @@ exports.createRideRequest = onCall(
         cancelledAt: null,
         cancelledBy: null,
         cancellationReasonCode: null,
-        bidCount: 0,
-        selectedBidId: null,
-        latestBidAt: null,
       });
       transaction.set(userRef, {
         activeRideId: rideId,
@@ -1977,95 +1942,6 @@ exports.cancelManagedRide = onCall(
     });
 
     return { cancelled: true };
-  }
-);
-
-exports.selectRideBid = onCall(
-  { enforceAppCheck: false },
-  async (request) => {
-    const uid = request.auth?.uid;
-    const rideId = String(request.data?.rideId || "").trim();
-    const bidId = String(request.data?.bidId || "").trim();
-    if (!uid) {
-      throw new HttpsError("unauthenticated", "Must be signed in.");
-    }
-    if (!rideId || !bidId) {
-      throw new HttpsError("invalid-argument", "rideId and bidId are required.");
-    }
-
-    const rideRef = db.collection("rides").doc(rideId);
-    const bidRef = rideRef.collection("bids").doc(bidId);
-
-    let driverId = null;
-    await db.runTransaction(async (transaction) => {
-      const [rideSnap, bidSnap] = await Promise.all([
-        transaction.get(rideRef),
-        transaction.get(bidRef),
-      ]);
-
-      if (!rideSnap.exists || !bidSnap.exists) {
-        throw new HttpsError("not-found", "Ride or bid not found.");
-      }
-
-      const ride = rideSnap.data();
-      const bid = bidSnap.data();
-      if (ride.riderId !== uid) {
-        throw new HttpsError("permission-denied", "Only the rider can select a bid.");
-      }
-      if (ride.status !== "posted") {
-        throw new HttpsError("failed-precondition", "Ride is no longer accepting bids.");
-      }
-      if (bid.status !== "active") {
-        throw new HttpsError("failed-precondition", "That bid is no longer available.");
-      }
-
-      driverId = bid.driverId;
-      const driverRef = db.collection("users").doc(driverId);
-      const driverSnap = await transaction.get(driverRef);
-      if (driverSnap.data()?.activeRideId) {
-        throw new HttpsError("failed-precondition", "This driver is already on another ride.");
-      }
-
-      transaction.update(rideRef, {
-        status: "accepted",
-        driverId: bid.driverId,
-        driverName: bid.driverName,
-        driverPhone: bid.driverPhone,
-        driverWhatsapp: bid.driverWhatsapp,
-        selectedBidId: bidId,
-        acceptedAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
-      });
-      transaction.update(bidRef, {
-        status: "selected",
-        updatedAt: FieldValue.serverTimestamp(),
-      });
-      transaction.set(driverRef, {
-        activeRideId: rideId,
-        updatedAt: FieldValue.serverTimestamp(),
-      }, { merge: true });
-    });
-
-    const [otherBids, otherDriverBids] = await Promise.all([
-      rideRef.collection("bids").where("status", "==", "active").get(),
-      db.collectionGroup("bids")
-        .where("driverId", "==", driverId)
-        .where("status", "==", "active")
-        .get(),
-    ]);
-
-    const batch = db.batch();
-    for (const doc of otherBids.docs) {
-      batch.update(doc.ref, { status: "rejected", updatedAt: FieldValue.serverTimestamp() });
-    }
-    for (const doc of otherDriverBids.docs) {
-      if (doc.ref.path !== bidRef.path) {
-        batch.update(doc.ref, { status: "autoClosed", updatedAt: FieldValue.serverTimestamp() });
-      }
-    }
-    await batch.commit();
-
-    return { selected: true };
   }
 );
 
