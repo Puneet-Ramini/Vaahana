@@ -165,9 +165,6 @@ private struct UserInspectorTab: View {
     @State private var userData: [String: Any]?
     @State private var isLoading = false
     @State private var errorMessage: String?
-    @State private var adjustAmount = ""
-    @State private var isAdjusting = false
-    @State private var adjustMessage: String?
 
     private let db = Firestore.firestore()
 
@@ -200,23 +197,9 @@ private struct UserInspectorTab: View {
                     }
                 }
 
-                Section("Coins") {
-                    infoRow("Balance",     "\(data["coins"]       as? Int ?? 0)")
-                    infoRow("Locked",      "\(data["coinsLocked"] as? Int ?? 0)")
-                    infoRow("Last Grant",  data["lastDailyCoinDate"] as? String ?? "—")
+                Section("Ride Activity") {
+                    infoRow("Open Requests", "\(data["activeRideId"] == nil ? 0 : 1)")
                     infoRow("Active Ride", data["activeRideId"] as? String ?? "—")
-                }
-
-                Section("Adjust Balance") {
-                    HStack {
-                        TextField("±amount (e.g. 50 or -20)", text: $adjustAmount)
-                            .keyboardType(.numbersAndPunctuation)
-                        Button("Apply") { Task { await adjustCoins() } }
-                            .disabled(adjustAmount.isEmpty || isAdjusting)
-                    }
-                    if let msg = adjustMessage {
-                        Text(msg).font(.caption).foregroundStyle(.green)
-                    }
                 }
             }
         }
@@ -245,23 +228,6 @@ private struct UserInspectorTab: View {
         }
     }
 
-    private func adjustCoins() async {
-        guard let amount = Int(adjustAmount.trimmingCharacters(in: .whitespaces)) else { return }
-        isAdjusting = true
-        adjustMessage = nil
-        let uid = uidInput.trimmingCharacters(in: .whitespaces)
-        do {
-            try await db.collection("users").document(uid).updateData([
-                "coins": FieldValue.increment(Int64(amount))
-            ])
-            adjustMessage = "Adjusted by \(amount > 0 ? "+" : "")\(amount) coins."
-            adjustAmount = ""
-            await lookup()
-        } catch {
-            adjustMessage = "Error: \(error.localizedDescription)"
-        }
-        isAdjusting = false
-    }
 }
 
 // MARK: - Ride Inspector Tab
@@ -301,21 +267,18 @@ private struct RideInspectorTab: View {
                     infoRow("From",     data["from"]     as? String ?? "—")
                     infoRow("To",       data["to"]       as? String ?? "—")
                 }
-                Section("Coins") {
-                    infoRow("Offered",     "\(data["coins"]            as? Int ?? 0)")
-                    infoRow("Final",       "\(data["finalCoins"]       as? Int ?? 0)")
-                    infoRow("Locked",      "\(data["coinsLocked"]      as? Int ?? 0)")
-                    infoRow("Transferred", "\(data["coinsTransferred"] as? Int ?? 0)")
-                    infoRow("CoinStatus",  data["coinStatus"] as? String ?? "—")
+                Section("Request Details") {
+                    infoRow("Needed", formattedDate(data["pickupDate"]))
+                    infoRow("Created", formattedDate(data["createdAt"]))
                 }
                 if !bidsData.isEmpty {
-                    Section("Bids (\(bidsData.count))") {
+                    Section("Responses (\(bidsData.count))") {
                         ForEach(Array(bidsData.enumerated()), id: \.offset) { _, bid in
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(bid["driverName"] as? String ?? "Driver")
                                     .font(.subheadline).fontWeight(.medium)
                                 HStack {
-                                    Text("\(bid["bidCoins"] as? Int ?? 0) coins")
+                                    Text(bid["message"] as? String ?? "No message")
                                     Spacer()
                                     Text(bid["status"] as? String ?? "")
                                         .font(.caption).foregroundStyle(.secondary)
@@ -344,6 +307,11 @@ private struct RideInspectorTab: View {
             Spacer()
             Text(value).fontWeight(.medium).lineLimit(1)
         }
+    }
+
+    private func formattedDate(_ value: Any?) -> String {
+        guard let timestamp = value as? Timestamp else { return "—" }
+        return timestamp.dateValue().formatted(date: .abbreviated, time: .shortened)
     }
 
     private func lookupRide() async {

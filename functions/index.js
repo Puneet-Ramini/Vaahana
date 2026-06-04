@@ -14,12 +14,11 @@
  *
  *  reconcileRecentRides       — scheduled every 5 min
  *    Scans non-final rides and recently-finalized rides (last 7 days).
- *    Repairs: stale active bids, locked-coin leaks, posted-ride stale fields.
- *    Logs:    missing drivers on active rides, missing coin transactions.
+ *    Repairs: stale legacy response data, posted-ride stale fields.
+ *    Logs:    missing drivers on active rides.
  *
  *  reconcileUserLocks         — scheduled every 5 min
- *    For every user with coinsLocked > 0, recomputes the expected lock amount
- *    from their active rides and patches any mismatch.
+ *    Legacy placeholder after pricing removal.
  *
  *  reconcileDriverAssignments — scheduled every 5 min
  *    For every user whose activeRideId is set, verifies the referenced ride
@@ -32,23 +31,61 @@
 
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { onCall, HttpsError, onRequest } = require("firebase-functions/v2/https");
-const { onDocumentCreated, onDocumentUpdated } = require("firebase-functions/v2/firestore");
+const { onDocumentUpdated } = require("firebase-functions/v2/firestore");
 const { initializeApp } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const { getMessaging } = require("firebase-admin/messaging");
 const { defineSecret } = require("firebase-functions/params");
 const crypto = require("crypto");
 const https  = require("https");
-
 const WHATSAPP_API_KEY = defineSecret("WHATSAPP_INGEST_API_KEY");
+const GROQ_API_KEY     = defineSecret("GROQ_API_KEY");
+
+const { extractRideDataLLM } = require("./lib/groq");
+const tzlookup = require("tz-lookup");
+const { DateTime } = require("luxon");
+
+const DEFAULT_TZ = "America/New_York";
+
+/** coord → IANA tz like "America/New_York" (DEFAULT_TZ on failure). */
+function tzFromCoord(lat, lng) {
+  if (typeof lat !== "number" || typeof lng !== "number") return DEFAULT_TZ;
+  try { return tzlookup(lat, lng) || DEFAULT_TZ; }
+  catch { return DEFAULT_TZ; }
+}
+
+/** Convert naive local datetime "YYYY-MM-DDTHH:mm:ss" in `tz` → UTC Date. */
+function naiveLocalToUtc(naiveIso, tz) {
+  if (!naiveIso) return null;
+  try {
+    const dt = DateTime.fromISO(naiveIso, { zone: tz });
+    if (!dt.isValid) return null;
+    return dt.toJSDate();
+  } catch { return null; }
+}
 
 initializeApp();
 const db = getFirestore();
+const auth = getAuth();
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const FINAL_STATUSES  = ["completed", "cancelled", "expired"];
 const ACTIVE_STATUSES = ["accepted", "driver_enroute", "driver_arrived", "ride_started"];
+const FIREBASE_WEB_API_KEY = "AIzaSyBrlq9vEjWgWt6vwrS00HQUJoSWfpAuTFk";
+const PASSWORD_RESET_LIMIT_PER_MONTH = 2;
+const ACTIVE_RIDE_STATUSES = [
+  "posted",
+  "accepted",
+  "driver_enroute",
+  "driver_arrived",
+  "ride_started",
+  "driverEnroute",
+  "driverArrived",
+  "rideStarted",
+];
+const PASSWORD_RESET_HANDLER_URL = "https://vaahana-fb9b8.web.app/reset-password";
 
 const Severity = {
   INFO:     "info",
@@ -70,6 +107,62 @@ const IssueCode = {
 };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function getMonthKeyInNewYork(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+  }).formatToParts(date);
+
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  return `${year}-${month}`;
+}
+
+function passwordFingerprint(uid, password) {
+  return crypto
+    .scryptSync(password, `vaahana-password-history:${uid}`, 32)
+    .toString("hex");
+}
+
+async function callIdentityToolkit(path, payload) {
+  const response = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/${path}?key=${FIREBASE_WEB_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }
+  );
+
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(json.error?.message || "IDENTITY_TOOLKIT_ERROR");
+  }
+  return json;
+}
+
+function mapPasswordResetError(error) {
+  const code = typeof error?.message === "string" ? error.message : "";
+
+  switch (code) {
+    case "EMAIL_NOT_FOUND":
+      return new HttpsError("not-found", "No account was found for that email.");
+    case "INVALID_EMAIL":
+      return new HttpsError("invalid-argument", "Please enter a valid email address.");
+    case "EXPIRED_OOB_CODE":
+    case "INVALID_OOB_CODE":
+      return new HttpsError("failed-precondition", "This reset link is invalid or has expired. Request a new one.");
+    case "WEAK_PASSWORD":
+      return new HttpsError("invalid-argument", "Password must be at least 6 characters.");
+    default:
+      if (code.startsWith("WEAK_PASSWORD")) {
+        return new HttpsError("invalid-argument", "Password must be at least 6 characters.");
+      }
+      return new HttpsError("internal", "Password reset failed. Please try again.");
+  }
+}
 
 /**
  * Writes one entry to the reconciliationLogs collection.
@@ -126,12 +219,10 @@ async function sendToUser(uid, title, body, data = {}) {
  *
  * Safe auto-repairs applied here:
  *   - Close active bids on final rides
- *   - Refund locked coins on cancelled/expired rides
- *   - Clear stale driver/bid/finalCoins fields on posted rides
+ *   - Clear stale driver/bid fields on posted rides
  *
  * Log-only (not auto-repaired):
  *   - Missing driver on active ride
- *   - Missing coin transaction on completed ride
  */
 async function inspectRide(rideDoc) {
   const ride    = rideDoc.data();
@@ -141,7 +232,7 @@ async function inspectRide(rideDoc) {
   const isFinal = FINAL_STATUSES.includes(status);
   const issues  = [];
 
-  // ── A1 & A5: Final rides — close active bids & refund locked coins ─────────
+  // ── A1: Final rides — close active bids ───────────────────────────────────
 
   if (isFinal) {
     // Close any bids still marked active
@@ -169,53 +260,6 @@ async function inspectRide(rideDoc) {
       await writeLog({ entityType: "ride", entityId: rideId, severity: Severity.WARNING, ...issue });
     }
 
-    // Refund locked coins on cancelled/expired rides
-    const coinsLocked = ride.coinsLocked || 0;
-    const needsRefund  = (status === "cancelled" || status === "expired") && coinsLocked > 0;
-
-    if (needsRefund && ride.riderId) {
-      const riderRef = db.collection("users").doc(ride.riderId);
-      const batch    = db.batch();
-      batch.update(riderRef, {
-        coins:       FieldValue.increment(coinsLocked),
-        coinsLocked: FieldValue.increment(-coinsLocked),
-      });
-      batch.update(rideRef, {
-        coinStatus:  "refunded",
-        coinsLocked: 0,
-        updatedAt:   FieldValue.serverTimestamp(),
-      });
-      await batch.commit();
-
-      const issue = {
-        code:       IssueCode.LOCKED_COINS_ON_CANCELLED_RIDE,
-        actionTaken: "auto_refunded",
-        details: { rideStatus: status, riderId: ride.riderId, coinsLocked },
-      };
-      issues.push(issue);
-      await writeLog({ entityType: "ride", entityId: rideId, severity: Severity.WARNING, ...issue });
-    }
-
-    // Log completed rides missing a coin transaction (manual review only)
-    if (status === "completed") {
-      const txSnap = await db.collection("coinTransactions")
-        .where("rideId", "==", rideId)
-        .limit(1)
-        .get();
-
-      if (txSnap.empty) {
-        const issue = {
-          code:       IssueCode.MISSING_COIN_TRANSACTION,
-          actionTaken: "logged_for_manual_review",
-          details: {
-            driverId:        ride.driverId || null,
-            coinsTransferred: ride.coinsTransferred || 0,
-          },
-        };
-        issues.push(issue);
-        await writeLog({ entityType: "ride", entityId: rideId, severity: Severity.ERROR, ...issue });
-      }
-    }
   }
 
   // ── A2: Active rides must have a driver ────────────────────────────────────
@@ -236,8 +280,6 @@ async function inspectRide(rideDoc) {
     const staleFields = {};
     if (ride.driverId)      staleFields.driverId      = FieldValue.delete();
     if (ride.selectedBidId) staleFields.selectedBidId = FieldValue.delete();
-    if (ride.finalCoins)    staleFields.finalCoins    = FieldValue.delete();
-    if (ride.coinsLocked && ride.coinsLocked > 0) staleFields.coinsLocked = 0;
 
     if (Object.keys(staleFields).length > 0) {
       staleFields.updatedAt = FieldValue.serverTimestamp();
@@ -306,7 +348,7 @@ exports.reconcileRecentRides = onSchedule(
   }
 );
 
-// ─── Function 2: reconcileUserLocks ──────────────────────────────────────────
+// ─── Function 2: reconcileUserLocks (legacy no-op) ──────────────────────────
 
 exports.reconcileUserLocks = onSchedule(
   {
@@ -315,59 +357,7 @@ exports.reconcileUserLocks = onSchedule(
     memory:         "256MiB",
   },
   async () => {
-    // All users who have locked coins
-    const usersSnap = await db.collection("users")
-      .where("coinsLocked", ">", 0)
-      .get();
-
-    console.log(`[reconcileUserLocks] Checking ${usersSnap.size} users with coinsLocked > 0`);
-    let corrections = 0;
-
-    for (const userDoc of usersSnap.docs) {
-      try {
-        const uid           = userDoc.id;
-        const currentLocked = userDoc.data().coinsLocked || 0;
-
-        // Fetch all rides where this rider has coins in locked state
-        const lockedRidesSnap = await db.collection("rides")
-          .where("riderId", "==", uid)
-          .where("coinStatus", "==", "locked")
-          .get();
-
-        // Only count coins from non-final rides
-        let expectedLocked = 0;
-        for (const rideDoc of lockedRidesSnap.docs) {
-          const rideData = rideDoc.data();
-          if (!FINAL_STATUSES.includes(rideData.status)) {
-            expectedLocked += rideData.coinsLocked || 0;
-          }
-        }
-
-        if (currentLocked !== expectedLocked) {
-          await db.collection("users").doc(uid).update({
-            coinsLocked: expectedLocked,
-            updatedAt:   FieldValue.serverTimestamp(),
-          });
-          corrections++;
-          await writeLog({
-            entityType: "user",
-            entityId:   uid,
-            severity:   Severity.WARNING,
-            issueCode:  IssueCode.LOCKED_COINS_MISMATCH,
-            actionTaken: "auto_corrected",
-            details: {
-              wasLocked:       currentLocked,
-              nowLocked:       expectedLocked,
-              lockedRideCount: lockedRidesSnap.size,
-            },
-          });
-        }
-      } catch (err) {
-        console.error(`[reconcileUserLocks] Error on user ${userDoc.id}:`, err.message);
-      }
-    }
-
-    console.log(`[reconcileUserLocks] Done. Users checked: ${usersSnap.size}, Corrected: ${corrections}`);
+    console.log("[reconcileUserLocks] skipped; pricing flow removed");
   }
 );
 
@@ -426,8 +416,9 @@ exports.reconcileDriverAssignments = onSchedule(
           continue;
         }
 
-        // Case 3: this user is not the driver on that ride
-        if (rideData.driverId !== uid) {
+        // Case 3: this user is no longer a participant on that ride
+        const isRideParticipant = rideData.driverId === uid || rideData.riderId === uid;
+        if (!isRideParticipant) {
           await userDoc.ref.update({ activeRideId: FieldValue.delete() });
           clears++;
           await writeLog({
@@ -438,13 +429,14 @@ exports.reconcileDriverAssignments = onSchedule(
             details: {
               activeRideId,
               rideStatus,
-              reason:          "driver_mismatch",
+              reason:          "participant_mismatch",
               actualDriverId:  rideData.driverId || null,
+              actualRiderId:   rideData.riderId || null,
             },
           });
         }
 
-        // All good — ride is active and belongs to this driver
+        // All good — ride is active and this user is still linked to it
       } catch (err) {
         console.error(`[reconcileDriverAssignments] Error on user ${userDoc.id}:`, err.message);
       }
@@ -454,15 +446,11 @@ exports.reconcileDriverAssignments = onSchedule(
   }
 );
 
-// ─── Function 4: grantDailyCoins ─────────────────────────────────────────────
+// ─── Function 4: grantDailyCoins (legacy no-op) ─────────────────────────────
 
 /**
- * Runs at midnight UTC every day.
- * Grants 100 coins to every user who hasn't already received them today
- * (checked via the `lastDailyCoinDate` field — "YYYY-MM-DD" string).
- *
- * The iOS app also does a client-side grant on launch as a failsafe,
- * but this function covers users who don't open the app that day.
+ * Retained as a scheduled placeholder so existing deployments keep a stable
+ * function surface after pricing removal.
  */
 exports.grantDailyCoins = onSchedule(
   {
@@ -471,34 +459,7 @@ exports.grantDailyCoins = onSchedule(
     memory:         "512MiB",
   },
   async () => {
-    const today        = new Date().toISOString().split("T")[0]; // "2026-04-10"
-    const allUsersSnap = await db.collection("users").get();
-
-    const BATCH_SIZE = 450;
-    let batch        = db.batch();
-    let opCount      = 0;
-    let grantCount   = 0;
-
-    for (const userDoc of allUsersSnap.docs) {
-      const lastGrant = userDoc.data().lastDailyCoinDate || "";
-      if (lastGrant === today) continue; // already granted today
-
-      batch.update(userDoc.ref, {
-        coins:             FieldValue.increment(100),
-        lastDailyCoinDate: today,
-      });
-      opCount++;
-      grantCount++;
-
-      if (opCount >= BATCH_SIZE) {
-        await batch.commit();
-        batch   = db.batch();
-        opCount = 0;
-      }
-    }
-
-    if (opCount > 0) await batch.commit();
-    console.log(`[grantDailyCoins] Granted 100 coins to ${grantCount}/${allUsersSnap.size} users on ${today}`);
+    console.log("[grantDailyCoins] skipped; pricing flow removed");
   }
 );
 
@@ -518,6 +479,10 @@ exports.reconcileRide = onCall(
   async (request) => {
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "Must be signed in.");
+    }
+    const caller = await db.collection("users").doc(request.auth.uid).get();
+    if (caller.data()?.isAdmin !== true) {
+      throw new HttpsError("permission-denied", "Admin access required.");
     }
 
     const rideId = request.data && request.data.rideId;
@@ -552,6 +517,69 @@ exports.reconcileRide = onCall(
       status:  rideDoc.data().status,
       issues:  issues.map((i) => ({ code: i.code, actionTaken: i.actionTaken })),
       clean:   issues.length === 0,
+    };
+  }
+);
+
+exports.getAdminDashboardStats = onCall(
+  { enforceAppCheck: false },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) {
+      throw new HttpsError("unauthenticated", "Must be signed in.");
+    }
+    const caller = await db.collection("users").doc(uid).get();
+    if (caller.data()?.isAdmin !== true) {
+      throw new HttpsError("permission-denied", "Admin access required.");
+    }
+
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const logsSnap = await db.collection("whatsappIngestionLogs")
+      .where("createdAt", ">=", cutoff)
+      .get();
+
+    let ingested = 0;
+    let skipped = 0;
+    let duplicate = 0;
+    let errors = 0;
+    let linked = 0;
+    const groupCounts = {};
+
+    for (const doc of logsSnap.docs) {
+      const data = doc.data();
+      const outcome = data.outcome || (data.rideId ? "ingested" : "skipped");
+      if (outcome === "ingested") ingested += 1;
+      else if (outcome === "skipped") skipped += 1;
+      else if (outcome === "duplicate") duplicate += 1;
+      else if (outcome === "error") errors += 1;
+      if (data.linkedUser) linked += 1;
+      const groupName = data.groupName || "Unknown";
+      groupCounts[groupName] = (groupCounts[groupName] || 0) + 1;
+    }
+
+    const postedRidesSnap = await db.collection("rides")
+      .where("status", "==", "posted")
+      .get();
+    let liveWhatsapp = 0;
+    let liveApp = 0;
+    for (const doc of postedRidesSnap.docs) {
+      if (doc.data().source === "whatsapp") liveWhatsapp += 1;
+      else liveApp += 1;
+    }
+
+    const placeholdersSnap = await db.collection("whatsappRiders").count().get();
+
+    return {
+      ingested,
+      skipped,
+      duplicate,
+      errors,
+      linked,
+      liveWhatsapp,
+      liveApp,
+      placeholders: placeholdersSnap.data().count,
+      groupCounts,
+      generatedAt: new Date().toISOString(),
     };
   }
 );
@@ -713,8 +741,8 @@ const FROM_ONLY_PATTERN = new RegExp(`\\bfrom\\s+${LOC}${LOC_STOP}`, "i");
 // "in X at TIME" (no explicit from/to like "Need ride in Lowell at 8am")
 const IN_LOCATION_PATTERN = /\brides?\s+in\s+([A-Za-z0-9\s,./]+?)(?:\s+(?:at|by|around|on|tomorrow|tonight|today|\d)|[,.]|$)/i;
 
-// Time patterns
-const TIME_PATTERN = /\b(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)|midnight|noon)\b/i;
+// Time patterns — numeric + named periods
+const TIME_PATTERN = /\b(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)|midnight|noon|morning|afternoon|evening|night)\b/i;
 
 // Urgency keywords for hotDuration inference
 const URGENCY_TONIGHT   = /\b(tonight|right now|asap|urgent|immediately|now)\b/i;
@@ -886,12 +914,14 @@ function inferPickupDate(text, timeStr, msgTimestamp) {
 function parseTimeString(timeStr, baseDate) {
   try {
     const t = timeStr.toLowerCase().trim();
-    if (t === "midnight") {
-      const d = new Date(baseDate); d.setHours(0, 0, 0, 0); return d;
-    }
-    if (t === "noon") {
-      const d = new Date(baseDate); d.setHours(12, 0, 0, 0); return d;
-    }
+    // Named time periods
+    if (t === "midnight")   { const d = new Date(baseDate); d.setHours(0,  0, 0, 0); return d; }
+    if (t === "noon")       { const d = new Date(baseDate); d.setHours(12, 0, 0, 0); return d; }
+    if (t === "morning")    { const d = new Date(baseDate); d.setHours(9,  0, 0, 0); return d; }
+    if (t === "afternoon")  { const d = new Date(baseDate); d.setHours(14, 0, 0, 0); return d; }
+    if (t === "evening")    { const d = new Date(baseDate); d.setHours(18, 0, 0, 0); return d; }
+    if (t === "night")      { const d = new Date(baseDate); d.setHours(20, 0, 0, 0); return d; }
+
     const m = t.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/);
     if (!m) return null;
     let h = parseInt(m[1]);
@@ -923,16 +953,14 @@ function inferHotDuration(text, pickupDate, msgTimestamp) {
   if (URGENCY_VAGUE.test(text))    return 2880;
   // Explicit date: stay hot until the pickup day arrives (max 48h cap)
   if (extractExplicitDate(text))   return 2880;
-  // No date cue — rider needs a ride soon, keep visible for 24h
-  return 1440;
-
-  // Fallback: compare pickup date to message date
+  // No date cue — use time-until-pickup as a guide
   const msUntilPickup = pickupDate.getTime() - new Date(msgTimestamp).getTime();
   const hoursUntil = msUntilPickup / (1000 * 60 * 60);
 
-  if (hoursUntil <= 6)  return 60;
-  if (hoursUntil <= 24) return 240;
-  if (hoursUntil <= 72) return 480;
+  if (hoursUntil <= 1)  return 60;
+  if (hoursUntil <= 6)  return 120;
+  if (hoursUntil <= 24) return 480;
+  if (hoursUntil <= 72) return 1440;
   return 2880;
 }
 
@@ -945,25 +973,36 @@ function inferHotDuration(text, pickupDate, msgTimestamp) {
  * Tries both the normalized phone and common variants (+1 vs. without country code).
  */
 async function findUserByPhone(phone) {
-  const snap = await db.collection("users")
-    .where("phone", "==", phone)
-    .limit(1)
-    .get();
+  const normalizedDigits = String(phone || "").replace(/[^\d]/g, "");
+  const withoutLeadingOne = normalizedDigits.startsWith("1") ? normalizedDigits.slice(1) : normalizedDigits;
 
-  if (!snap.empty) {
-    const doc = snap.docs[0];
-    return { uid: doc.id, displayName: doc.data().displayName || "Rider" };
+  const candidates = Array.from(new Set([
+    String(phone || "").trim(),
+    normalizedDigits,
+    withoutLeadingOne,
+    normalizedDigits ? `+${normalizedDigits}` : null,
+    normalizedDigits.length === 10 ? `+1${normalizedDigits}` : null,
+  ].filter(Boolean)));
+
+  async function lookupByField(fieldName) {
+    for (const candidate of candidates) {
+      const snap = await db.collection("users")
+        .where(fieldName, "==", candidate)
+        .limit(1)
+        .get();
+      if (!snap.empty) {
+        const doc = snap.docs[0];
+        return { uid: doc.id, displayName: doc.data().displayName || "Rider" };
+      }
+    }
+    return null;
   }
 
-  // Also try whatsapp field
-  const snap2 = await db.collection("users")
-    .where("whatsapp", "==", phone)
-    .limit(1)
-    .get();
-
-  if (!snap2.empty) {
-    const doc = snap2.docs[0];
-    return { uid: doc.id, displayName: doc.data().displayName || "Rider" };
+  for (const fieldName of ["phone", "whatsappPhone", "whatsapp"]) {
+    const match = await lookupByField(fieldName);
+    if (match) {
+      return match;
+    }
   }
 
   return null;
@@ -1134,11 +1173,45 @@ function geocodeAddress(address) {
   });
 }
 
+/** Great-circle distance (miles) between two {lat,lng} points. */
+function haversineMiles(a, b) {
+  const R = 3958.8;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const s =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+/**
+ * Driving distance in miles via OSRM public demo; falls back to haversine.
+ * Returns a number > 0 or null.
+ */
+async function drivingMiles(a, b) {
+  if (!a || !b) return null;
+  const url = `https://router.project-osrm.org/route/v1/driving/${a.lng},${a.lat};${b.lng},${b.lat}?overview=false`;
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 4000);
+    const res = await fetch(url, { signal: ctl.signal });
+    clearTimeout(timer);
+    if (res.ok) {
+      const data = await res.json();
+      const meters = data?.routes?.[0]?.distance;
+      if (typeof meters === "number" && meters > 0) return meters / 1609.344;
+    }
+  } catch { /* fallthrough to haversine */ }
+  const h = haversineMiles(a, b);
+  return h > 0 ? h : null;
+}
+
 // ── 8. HTTP endpoint ──────────────────────────────────────────────────────────
 
 exports.ingestWhatsAppMessages = onRequest(
   {
-    secrets: [WHATSAPP_API_KEY],
+    secrets: [WHATSAPP_API_KEY, GROQ_API_KEY],
     cors: false,
     timeoutSeconds: 120,
     memory: "512MiB",
@@ -1190,27 +1263,62 @@ exports.ingestWhatsAppMessages = onRequest(
       rides:     [],   // IDs of created ride docs
     };
 
+    const groqKey = GROQ_API_KEY.value();
+
     for (const msg of rawMessages) {
       try {
-        // 1. Extract ride data
-        const rideData = extractRideData(msg.text, msg.timestamp);
+        // 1. Extract ride data — LLM first, regex fallback.
+        let rideData = null;
+        let parseSource = null;
+        if (groqKey) {
+          try {
+            rideData = await extractRideDataLLM(msg.text, msg.timestamp, groqKey);
+            if (rideData) parseSource = "llm";
+          } catch (err) {
+            console.warn(`[ingest] groq threw: ${err.message}`);
+          }
+        }
+        if (!rideData) {
+          rideData = extractRideData(msg.text, msg.timestamp);
+          if (rideData) parseSource = "regex";
+        }
         if (!rideData) {
           console.log(`[ingest] SKIP not_ride_request | ${msg.phone} | "${msg.text.slice(0,80)}"`);
           results.skipped++; continue;
         }
 
-        // 2. Skip if pickup date is in the past (more than 1 hour ago)
+        // 2. Geocode both pickup + drop-off (best-effort).
+        const [geoFrom, geoTo] = await Promise.all([
+          geocodeAddress(rideData.from),
+          geocodeAddress(rideData.to),
+        ]);
+        console.log(`[ingest] geo from="${rideData.from}" → ${geoFrom ? `${geoFrom.lat},${geoFrom.lng}` : "null"} | to="${rideData.to}" → ${geoTo ? `${geoTo.lat},${geoTo.lng}` : "null"}`);
+
+        // 3. Timezone of pickup location, so "tomorrow 7am" means 7am local.
+        const pickupTz = geoFrom ? tzFromCoord(geoFrom.lat, geoFrom.lng) : DEFAULT_TZ;
+
+        // 4. Resolve LLM's naive local wall-clock time → UTC Date using pickup tz
+        // before we do any time-based validation or duplicate detection.
+        if (rideData.pickupLocalDateTime) {
+          const asUtc = naiveLocalToUtc(rideData.pickupLocalDateTime, pickupTz);
+          if (asUtc) {
+            rideData.pickupDate = asUtc;
+            console.log(`[ingest] pickup resolved: "${rideData.pickupLocalDateTime}" in ${pickupTz} → ${asUtc.toISOString()}`);
+          }
+        }
+
+        // 5. Skip if pickup date is in the past (more than 1 hour ago)
         const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
         if (rideData.pickupDate < oneHourAgo) {
           console.log(`[ingest] SKIP past_pickup | ${msg.phone} | pickup=${rideData.pickupDate.toISOString()} | "${msg.text.slice(0,80)}"`);
           results.skipped++; continue;
         }
 
-        // 3. Dedup
+        // 6. Dedup
         const dup = await isDuplicate(msg.phone, rideData.from, rideData.to, rideData.pickupDate);
         if (dup) { results.duplicate++; continue; }
 
-        // 4. Resolve rider identity
+        // 7. Resolve rider identity
         const vaahanaUser = await findUserByPhone(msg.phone);
         let riderId, riderName;
 
@@ -1222,12 +1330,12 @@ exports.ingestWhatsAppMessages = onRequest(
           riderName = msg.name || "WhatsApp Rider";
         }
 
-        // 5. Geocode pickup location (best-effort, non-blocking failure)
-        const geo = await geocodeAddress(rideData.from);
-        if (geo) {
-          console.log(`[ingest] geocoded "${rideData.from}" → ${geo.lat},${geo.lng}`);
-        } else {
-          console.log(`[ingest] geocode failed for "${rideData.from}" — ride saved without coords`);
+        // 8. Miles via OSRM (haversine fallback).
+        let miles = 0;
+        if (geoFrom && geoTo) {
+          const d = await drivingMiles(geoFrom, geoTo);
+          if (typeof d === "number" && d > 0) miles = Math.round(d * 10) / 10;
+          console.log(`[ingest] miles=${miles}`);
         }
 
         // 6. Build ride document
@@ -1250,26 +1358,15 @@ exports.ingestWhatsAppMessages = onRequest(
           // Route
           from:                rideData.from,
           to:                  rideData.to,
-          miles:               0,
-          pickupLat:           geo ? geo.lat : null,
-          pickupLng:           geo ? geo.lng : null,
+          miles:               miles,
+          pickupLat:           geoFrom ? geoFrom.lat : null,
+          pickupLng:           geoFrom ? geoFrom.lng : null,
+          dropoffLat:          geoTo   ? geoTo.lat   : null,
+          dropoffLng:          geoTo   ? geoTo.lng   : null,
 
           // Timing
-          coins:               0,            // driver makes an offer via bid
           hotDuration:         rideData.hotDuration,
           pickupDate:          rideData.pickupDate,
-
-          // Coin state
-          coinStatus:          "none",
-          coinsLocked:         0,
-          coinsTransferred:    0,
-
-          // Bid marketplace
-          bidCount:            0,
-          selectedBidId:       null,
-          finalCoins:          null,
-          lowestBidCoins:      null,
-          latestBidAt:         null,
 
           // Driver (empty until accepted)
           driverId:            null,
@@ -1280,6 +1377,12 @@ exports.ingestWhatsAppMessages = onRequest(
           // Metadata
           rawText:             msg.text,
           rawTimeHint:         rideData.rawTimeHint,
+          parseSource:         parseSource,                      // "llm" | "regex"
+          intent:              rideData.intent || "rider_request", // "rider_request" | "driver_offer"
+          pickupTimezone:      geoFrom ? pickupTz : null,
+          llmModel:            rideData._llm?.model || null,
+          llmConfidence:       rideData._llm?.confidence ?? null,
+          llmReasoning:        rideData._llm?.reasoning || null,
           createdAt:           FieldValue.serverTimestamp(),
           updatedAt:           FieldValue.serverTimestamp(),
         };
@@ -1297,6 +1400,9 @@ exports.ingestWhatsAppMessages = onRequest(
           parsedTo:      rideData.to,
           parsedPickup:  rideData.pickupDate,
           linkedUser:    !!vaahanaUser,
+          parseSource,
+          llmConfidence: rideData._llm?.confidence ?? null,
+          llmReasoning:  rideData._llm?.reasoning  || null,
           createdAt:     FieldValue.serverTimestamp(),
         });
 
@@ -1358,8 +1464,32 @@ exports.expireStaleRides = onSchedule(
         status:    "expired",
         updatedAt: FieldValue.serverTimestamp(),
       });
+      if (data.riderId) {
+        batch.set(db.collection("users").doc(data.riderId), {
+          activeRideId: FieldValue.delete(),
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+        opCount++;
+      }
       opCount++;
       expired++;
+
+      const activeBids = await doc.ref.collection("bids")
+        .where("status", "==", "active")
+        .get();
+      for (const bidDoc of activeBids.docs) {
+        batch.update(bidDoc.ref, {
+          status: "expired",
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        opCount++;
+
+        if (opCount >= BATCH_SIZE) {
+          await batch.commit();
+          batch   = db.batch();
+          opCount = 0;
+        }
+      }
 
       if (opCount >= BATCH_SIZE) {
         await batch.commit();
@@ -1373,35 +1503,6 @@ exports.expireStaleRides = onSchedule(
     if (expired > 0) {
       console.log(`[expireStaleRides] Expired ${expired} stale posted rides`);
     }
-  }
-);
-
-// ─── Function 7: onBidPlaced ──────────────────────────────────────────────────
-
-/**
- * Fires when a driver places a new bid on a ride.
- * Notifies the rider so they don't have to keep the app open.
- */
-exports.onBidPlaced = onDocumentCreated(
-  { document: "rides/{rideId}/bids/{bidId}" },
-  async (event) => {
-    const bid    = event.data.data();
-    const rideId = event.params.rideId;
-
-    const rideDoc = await db.collection("rides").doc(rideId).get();
-    if (!rideDoc.exists) return;
-    const ride = rideDoc.data();
-    if (ride.status !== "posted") return;
-
-    const driverName = bid.driverName || "A driver";
-    const coins      = bid.bidCoins   || 0;
-
-    await sendToUser(
-      ride.riderId,
-      "New bid on your ride",
-      `${driverName} offered ${coins} coins for ${ride.from} → ${ride.to}`,
-      { type: "new_bid", rideId }
-    );
   }
 );
 
@@ -1424,13 +1525,12 @@ exports.onRideStatusChanged = onDocumentUpdated(
 
     switch (after.status) {
       case "accepted":
-        // Rider selected a bid — notify the driver they've been chosen
         if (driverId) {
           await sendToUser(
             driverId,
-            "Your bid was accepted!",
+            "Ride accepted",
             `Head to ${from} to pick up ${name || "your rider"}`,
-            { type: "bid_accepted", rideId }
+            { type: "ride_accepted", rideId }
           );
         }
         break;
@@ -1473,7 +1573,7 @@ exports.onRideStatusChanged = onDocumentUpdated(
           await sendToUser(
             driverId,
             "Ride completed",
-            "Coins have been transferred. Rate your rider!",
+            "Ride complete. Rate your rider!",
             { type: "ride_completed", rideId }
           );
         }
@@ -1500,5 +1600,499 @@ exports.onRideStatusChanged = onDocumentUpdated(
       default:
         break;
     }
+  }
+);
+
+// ─── checkPhoneUnique ─────────────────────────────────────────────────────────
+// Callable: returns whether a phone number is already registered.
+// Called before account creation so the client gets a clear error early.
+
+exports.checkPhoneUnique = onCall(async (request) => {
+  const { phone } = request.data || {};
+  if (!phone) throw new HttpsError("invalid-argument", "Phone is required.");
+
+  const snap = await db.collection("users")
+    .where("phone", "==", phone.trim())
+    .limit(1)
+    .get();
+
+  if (!snap.empty) {
+    throw new HttpsError("already-exists", "An account with this phone number already exists.");
+  }
+  return { unique: true };
+});
+
+exports.setUserRole = onCall(
+  { enforceAppCheck: false },
+  async (request) => {
+    const uid = request.auth?.uid;
+    const role = String(request.data?.role || "").trim().toLowerCase();
+    if (!uid) {
+      throw new HttpsError("unauthenticated", "Must be signed in.");
+    }
+    if (!["rider", "driver"].includes(role)) {
+      throw new HttpsError("invalid-argument", "Role must be rider or driver.");
+    }
+
+    await db.collection("users").doc(uid).set({
+      role,
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return { role };
+  }
+);
+
+exports.setDriverAvailability = onCall(
+  { enforceAppCheck: false },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) {
+      throw new HttpsError("unauthenticated", "Must be signed in.");
+    }
+
+    const isAvailable = request.data?.isAvailable;
+    if (typeof isAvailable !== "boolean") {
+      throw new HttpsError("invalid-argument", "isAvailable must be a boolean.");
+    }
+
+    const userRef = db.collection("users").doc(uid);
+    const userSnap = await userRef.get();
+    const role = String(userSnap.data()?.role || "").toLowerCase();
+    if (role && role !== "driver") {
+      throw new HttpsError("failed-precondition", "Only drivers can change driver availability.");
+    }
+
+    await userRef.set({
+      isAvailable,
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return { isAvailable };
+  }
+);
+
+exports.createRideRequest = onCall(
+  { enforceAppCheck: false },
+  async (request) => {
+    const uid = request.auth?.uid;
+    if (!uid) {
+      throw new HttpsError("unauthenticated", "Must be signed in.");
+    }
+
+    const data = request.data || {};
+    const name = String(data.name || "").trim();
+    const phone = String(data.phone || "").trim();
+    const phoneCountryCode = String(data.phoneCountryCode || "+1").trim() || "+1";
+    const whatsappPhone = String(data.whatsappPhone || "").trim();
+    const whatsappCountryCode = String(data.whatsappCountryCode || phoneCountryCode).trim() || phoneCountryCode;
+    const from = String(data.from || "").trim();
+    const to = String(data.to || "").trim();
+    const notes = String(data.notes || "").trim();
+    const source = String(data.source || "app").trim() || "app";
+    const miles = Number(data.miles || 0);
+    const hotDuration = Number(data.hotDuration || 30);
+    const pickupDate = new Date(data.pickupDate || "");
+    const pickupLat = data.pickupLat == null ? null : Number(data.pickupLat);
+    const pickupLng = data.pickupLng == null ? null : Number(data.pickupLng);
+    const dropoffLat = data.dropoffLat == null ? null : Number(data.dropoffLat);
+    const dropoffLng = data.dropoffLng == null ? null : Number(data.dropoffLng);
+
+    if (!name || !phone || !whatsappPhone || !from || !to || !(miles > 0) || Number.isNaN(pickupDate.getTime())) {
+      throw new HttpsError("invalid-argument", "Missing required ride fields.");
+    }
+
+    const activeRideSnap = await db.collection("rides")
+      .where("riderId", "==", uid)
+      .where("status", "in", ACTIVE_RIDE_STATUSES)
+      .limit(1)
+      .get();
+    if (!activeRideSnap.empty) {
+      throw new HttpsError("failed-precondition", "You already have an active ride request.");
+    }
+
+    const rideId = crypto.randomUUID();
+    const rideRef = db.collection("rides").doc(rideId);
+    const userRef = db.collection("users").doc(uid);
+
+    await db.runTransaction(async (transaction) => {
+      const userSnap = await transaction.get(userRef);
+      const activeRideId = userSnap.data()?.activeRideId;
+      if (activeRideId) {
+        throw new HttpsError("failed-precondition", "You already have an active ride request.");
+      }
+
+      transaction.set(rideRef, {
+        id: rideId,
+        riderId: uid,
+        status: "posted",
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: null,
+        source,
+        name,
+        phone,
+        phoneCountryCode,
+        whatsappPhone,
+        whatsappCountryCode,
+        from,
+        to,
+        miles,
+        pickupLat,
+        pickupLng,
+        dropoffLat,
+        dropoffLng,
+        hotDuration,
+        pickupDate,
+        notes: notes || null,
+        driverId: null,
+        driverName: null,
+        driverPhone: null,
+        driverWhatsapp: null,
+        acceptedAt: null,
+        driverEnrouteAt: null,
+        arrivedAt: null,
+        startedAt: null,
+        completedAt: null,
+        cancelledAt: null,
+        cancelledBy: null,
+        cancellationReasonCode: null,
+      });
+      transaction.set(userRef, {
+        activeRideId: rideId,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+    });
+
+    return { rideId };
+  }
+);
+
+exports.claimRideAsDriver = onCall(
+  { enforceAppCheck: false },
+  async (request) => {
+    const uid = request.auth?.uid;
+    const rideId = String(request.data?.rideId || "").trim();
+    const displayName = String(request.data?.displayName || "").trim();
+    const phone = String(request.data?.phone || "").trim();
+    const whatsapp = String(request.data?.whatsapp || "").trim();
+
+    if (!uid) {
+      throw new HttpsError("unauthenticated", "Must be signed in.");
+    }
+    if (!rideId) {
+      throw new HttpsError("invalid-argument", "rideId is required.");
+    }
+    if (!phone || !whatsapp) {
+      throw new HttpsError("failed-precondition", "Driver contact details are required.");
+    }
+
+    const rideRef = db.collection("rides").doc(rideId);
+    const userRef = db.collection("users").doc(uid);
+
+    await db.runTransaction(async (transaction) => {
+      const [rideSnap, userSnap] = await Promise.all([
+        transaction.get(rideRef),
+        transaction.get(userRef),
+      ]);
+
+      if (!rideSnap.exists) {
+        throw new HttpsError("not-found", "Ride no longer exists.");
+      }
+
+      const ride = rideSnap.data();
+      if (ride.status !== "posted") {
+        throw new HttpsError("failed-precondition", "Ride is no longer available.");
+      }
+
+      const userData = userSnap.exists ? userSnap.data() : {};
+      if (userData?.isAvailable === false) {
+        throw new HttpsError("failed-precondition", "Go online before accepting a ride.");
+      }
+      if (userData?.activeRideId) {
+        throw new HttpsError("failed-precondition", "Finish your current ride before accepting another.");
+      }
+
+      transaction.update(rideRef, {
+        status: "accepted",
+        driverId: uid,
+        driverName: displayName,
+        driverPhone: phone,
+        driverWhatsapp: whatsapp,
+        acceptedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      transaction.set(userRef, {
+        activeRideId: rideId,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+    });
+
+    return { accepted: true };
+  }
+);
+
+exports.advanceRideStatus = onCall(
+  { enforceAppCheck: false },
+  async (request) => {
+    const uid = request.auth?.uid;
+    const rideId = String(request.data?.rideId || "").trim();
+    const status = String(request.data?.status || "").trim();
+    if (!uid) {
+      throw new HttpsError("unauthenticated", "Must be signed in.");
+    }
+    if (!rideId || !status) {
+      throw new HttpsError("invalid-argument", "rideId and status are required.");
+    }
+
+    const rideRef = db.collection("rides").doc(rideId);
+    const driverRef = db.collection("users").doc(uid);
+    const timestampField = {
+      driverEnroute: "driverEnrouteAt",
+      driver_enroute: "driverEnrouteAt",
+      driverArrived: "arrivedAt",
+      driver_arrived: "arrivedAt",
+      rideStarted: "startedAt",
+      ride_started: "startedAt",
+      completed: "completedAt",
+    }[status];
+
+    if (!timestampField) {
+      throw new HttpsError("invalid-argument", "Unsupported status transition.");
+    }
+
+    await db.runTransaction(async (transaction) => {
+      const rideSnap = await transaction.get(rideRef);
+      if (!rideSnap.exists) {
+        throw new HttpsError("not-found", "Ride not found.");
+      }
+      const ride = rideSnap.data();
+      if (ride.driverId !== uid) {
+        throw new HttpsError("permission-denied", "Only the assigned driver can update this ride.");
+      }
+
+      const patch = {
+        status,
+        updatedAt: FieldValue.serverTimestamp(),
+        [timestampField]: FieldValue.serverTimestamp(),
+      };
+      transaction.update(rideRef, patch);
+
+      if (status === "completed") {
+        transaction.set(driverRef, {
+          activeRideId: FieldValue.delete(),
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+        transaction.set(db.collection("users").doc(ride.riderId), {
+          activeRideId: FieldValue.delete(),
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+      }
+    });
+
+    return { ok: true };
+  }
+);
+
+exports.cancelManagedRide = onCall(
+  { enforceAppCheck: false },
+  async (request) => {
+    const uid = request.auth?.uid;
+    const rideId = String(request.data?.rideId || "").trim();
+    const reason = request.data?.reason ? String(request.data.reason).trim() : null;
+    if (!uid) {
+      throw new HttpsError("unauthenticated", "Must be signed in.");
+    }
+    if (!rideId) {
+      throw new HttpsError("invalid-argument", "rideId is required.");
+    }
+
+    const rideRef = db.collection("rides").doc(rideId);
+    await db.runTransaction(async (transaction) => {
+      const rideSnap = await transaction.get(rideRef);
+      if (!rideSnap.exists) {
+        throw new HttpsError("not-found", "Ride not found.");
+      }
+      const ride = rideSnap.data();
+      const isRider = ride.riderId === uid;
+      const isDriver = ride.driverId === uid;
+      if (!isRider && !isDriver) {
+        throw new HttpsError("permission-denied", "Not allowed to cancel this ride.");
+      }
+      if (["completed", "cancelled", "expired"].includes(String(ride.status || ""))) {
+        throw new HttpsError("failed-precondition", "This ride is already closed.");
+      }
+
+      transaction.update(rideRef, {
+        status: "cancelled",
+        cancelledBy: uid,
+        cancelledAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+        ...(reason ? { cancellationReasonCode: reason } : {}),
+      });
+      transaction.set(db.collection("users").doc(ride.riderId), {
+        activeRideId: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      if (ride.driverId) {
+        transaction.set(db.collection("users").doc(ride.driverId), {
+          activeRideId: FieldValue.delete(),
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+      }
+    });
+
+    return { cancelled: true };
+  }
+);
+
+// ─── Password reset management ───────────────────────────────────────────────
+
+exports.recordCurrentPassword = onCall(
+  { enforceAppCheck: false },
+  async (request) => {
+    if (!request.auth?.uid) {
+      throw new HttpsError("unauthenticated", "Must be signed in.");
+    }
+
+    const password = String(request.data?.password || "");
+    if (password.length < 6) {
+      throw new HttpsError("invalid-argument", "Password must be at least 6 characters.");
+    }
+
+    await db.collection("passwordResetMeta").doc(request.auth.uid).set({
+      lastPasswordHash: passwordFingerprint(request.auth.uid, password),
+      lastPasswordChangedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return { recorded: true };
+  }
+);
+
+exports.sendManagedPasswordResetEmail = onCall(
+  { enforceAppCheck: false },
+  async (request) => {
+    const email = String(request.data?.email || "").trim().toLowerCase();
+    if (!email) {
+      throw new HttpsError("invalid-argument", "Email is required.");
+    }
+
+    let userRecord;
+    try {
+      userRecord = await auth.getUserByEmail(email);
+    } catch (error) {
+      if (error?.code === "auth/user-not-found") {
+        return { sent: true };
+      }
+      throw new HttpsError("internal", "Unable to process password reset right now.");
+    }
+
+    const metaRef = db.collection("passwordResetMeta").doc(userRecord.uid);
+    const monthKey = getMonthKeyInNewYork();
+
+    await db.runTransaction(async (transaction) => {
+      const metaDoc = await transaction.get(metaRef);
+      const meta = metaDoc.exists ? metaDoc.data() : {};
+      const currentMonth = meta.resetRequestMonth === monthKey ? monthKey : null;
+      const requestCount = currentMonth ? (meta.resetRequestCount || 0) : 0;
+
+      if (requestCount >= PASSWORD_RESET_LIMIT_PER_MONTH) {
+        throw new HttpsError(
+          "resource-exhausted",
+          "You can request a password reset only twice per month."
+        );
+      }
+
+      transaction.set(metaRef, {
+        resetRequestMonth: monthKey,
+        resetRequestCount: requestCount + 1,
+        lastResetRequestAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+    });
+
+    try {
+      await callIdentityToolkit("accounts:sendOobCode", {
+        requestType: "PASSWORD_RESET",
+        email,
+        continueUrl: PASSWORD_RESET_HANDLER_URL,
+      });
+    } catch (error) {
+      if (error?.message === "EMAIL_NOT_FOUND") {
+        return { sent: true };
+      }
+      await metaRef.set({
+        resetRequestMonth: monthKey,
+        resetRequestCount: FieldValue.increment(-1),
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      throw mapPasswordResetError(error);
+    }
+
+    return { sent: true };
+  }
+);
+
+exports.finalizeManagedPasswordReset = onCall(
+  { enforceAppCheck: false },
+  async (request) => {
+    const oobCode = String(request.data?.oobCode || "").trim();
+    const newPassword = String(request.data?.newPassword || "");
+
+    if (!oobCode) {
+      throw new HttpsError("invalid-argument", "Reset code is required.");
+    }
+    if (newPassword.length < 6) {
+      throw new HttpsError("invalid-argument", "Password must be at least 6 characters.");
+    }
+
+    let resetInfo;
+    try {
+      resetInfo = await callIdentityToolkit("accounts:resetPassword", { oobCode });
+    } catch (error) {
+      throw mapPasswordResetError(error);
+    }
+
+    const email = String(resetInfo?.email || "").trim().toLowerCase();
+    if (!email) {
+      throw new HttpsError("failed-precondition", "This reset link is invalid or has expired. Request a new one.");
+    }
+
+    let userRecord;
+    try {
+      userRecord = await auth.getUserByEmail(email);
+    } catch {
+      throw new HttpsError("not-found", "No account was found for that reset link.");
+    }
+
+    const metaRef = db.collection("passwordResetMeta").doc(userRecord.uid);
+    const metaDoc = await metaRef.get();
+    const lastPasswordHash = metaDoc.exists ? metaDoc.data().lastPasswordHash : null;
+    const newPasswordHash = passwordFingerprint(userRecord.uid, newPassword);
+
+    if (lastPasswordHash && lastPasswordHash === newPasswordHash) {
+      throw new HttpsError(
+        "failed-precondition",
+        "New password must be different from your previous password."
+      );
+    }
+
+    try {
+      await callIdentityToolkit("accounts:resetPassword", {
+        oobCode,
+        newPassword,
+      });
+    } catch (error) {
+      throw mapPasswordResetError(error);
+    }
+
+    await metaRef.set({
+      lastPasswordHash: newPasswordHash,
+      lastPasswordChangedAt: FieldValue.serverTimestamp(),
+      lastResetCompletedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return { success: true };
   }
 );

@@ -4,6 +4,7 @@
 import SwiftUI
 import FirebaseAuth
 import FirebaseFirestore
+import FirebaseFunctions
 
 struct RoleSelectionView: View {
     let onRoleSelected: (UserRole) -> Void
@@ -11,6 +12,7 @@ struct RoleSelectionView: View {
     @State private var isSaving = false
     @State private var errorMessage: String?
     private let db = Firestore.firestore()
+    private let functions = Functions.functions()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -36,7 +38,7 @@ struct RoleSelectionView: View {
                     RoleCard(
                         icon: "figure.wave",
                         title: "I need a ride",
-                        subtitle: "Post ride requests. Earn coins when drivers help you.",
+                        subtitle: "Post ride requests and get matched with nearby drivers.",
                         color: .blue,
                         isLoading: isSaving,
                         onSelect: { save(.rider) }
@@ -45,7 +47,7 @@ struct RoleSelectionView: View {
                     RoleCard(
                         icon: "car.fill",
                         title: "I'm a driver",
-                        subtitle: "Browse nearby hot requests. Help your community, earn coins.",
+                        subtitle: "Browse nearby hot requests and help your community.",
                         color: .black,
                         isLoading: isSaving,
                         onSelect: { save(.driver) }
@@ -56,7 +58,7 @@ struct RoleSelectionView: View {
 
             Spacer()
 
-            Text("Your role is permanent and cannot be changed.")
+            Text("You can change this later in Settings.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -73,16 +75,7 @@ struct RoleSelectionView: View {
         errorMessage = nil
         Task {
             do {
-                var userData: [String: Any] = ["role": role.rawValue]
-                if role == .rider {
-                    // New riders start with 100 coins; don't overwrite if doc already has coins
-                    let existing = try? await db.collection("users").document(uid).getDocument()
-                    if existing?.data()?["coins"] == nil {
-                        userData["coins"] = 100
-                        userData["coinsLocked"] = 0
-                    }
-                }
-                try await db.collection("users").document(uid).setData(userData, merge: true)
+                _ = try await functions.httpsCallable("setUserRole").call(["role": role.rawValue])
                 await MainActor.run {
                     isSaving = false
                     onRoleSelected(role)

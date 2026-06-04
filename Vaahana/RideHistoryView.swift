@@ -66,16 +66,9 @@ struct RideHistoryView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
-                if ride.coinsTransferred > 0 {
-                    Text("🪙 \(ride.coinsTransferred) earned")
-                        .font(.caption)
-                        .fontWeight(.semibold)
-                        .foregroundStyle(.green)
-                } else {
-                    Text("🪙 \(ride.coins)")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
+                Text("Posted \(ride.postedAtShort)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             if let name = ride.driverName, role == .rider {
                 Text("Driver: \(name)")

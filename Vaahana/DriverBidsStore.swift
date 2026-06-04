@@ -18,7 +18,6 @@ struct DriverBidEntry: Identifiable {
     var rideId: String
     var rideFrom: String
     var rideTo: String
-    var rideCoins: Int      // rider's original offer
 }
 
 final class DriverBidsStore: ObservableObject {
@@ -53,8 +52,7 @@ final class DriverBidsStore: ObservableObject {
                         bid: bid,
                         rideId: rideId,
                         rideFrom: data["rideFrom"] as? String ?? "",
-                        rideTo: data["rideTo"]   as? String ?? "",
-                        rideCoins: data["rideCoins"] as? Int ?? 0
+                        rideTo: data["rideTo"]   as? String ?? ""
                     )
                 }
                 DispatchQueue.main.async {
@@ -81,10 +79,9 @@ final class DriverBidsStore: ObservableObject {
                 result.append(entry)
                 continue
             }
-            let coins = snap.data()?["coins"] as? Int ?? 0
             var enriched = entry
             enriched = DriverBidEntry(bid: entry.bid, rideId: entry.rideId,
-                                      rideFrom: from, rideTo: to, rideCoins: coins)
+                                      rideFrom: from, rideTo: to)
             result.append(enriched)
         }
         return result

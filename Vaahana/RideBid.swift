@@ -42,7 +42,6 @@ struct RideBid: Identifiable, Codable, Equatable {
     var driverName: String
     var driverPhone: String
     var driverWhatsapp: String
-    var bidCoins: Int
     var message: String?
     var status: BidStatus
     var createdAt: Date
@@ -72,7 +71,6 @@ struct RideBid: Identifiable, Codable, Equatable {
         driverName     = (try? c.decodeIfPresent(String.self, forKey: .driverName))     ?? ""
         driverPhone    = (try? c.decodeIfPresent(String.self, forKey: .driverPhone))    ?? ""
         driverWhatsapp = (try? c.decodeIfPresent(String.self, forKey: .driverWhatsapp)) ?? ""
-        bidCoins       = (try? c.decodeIfPresent(Int.self, forKey: .bidCoins))          ?? 0
         message        = try? c.decodeIfPresent(String.self, forKey: .message)
         status         = (try? c.decodeIfPresent(BidStatus.self, forKey: .status))      ?? .active
         createdAt      = (try? c.decodeIfPresent(Date.self, forKey: .createdAt))        ?? Date()

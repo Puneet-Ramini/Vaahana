@@ -8,6 +8,7 @@ import Combine
 import FirebaseCore
 import FirebaseAuth
 import FirebaseFirestore
+import FirebaseFunctions
 import UserNotifications
 #if canImport(FirebaseMessaging)
 import FirebaseMessaging
@@ -96,8 +97,9 @@ class UserState: ObservableObject {
     init() {
         handle = Auth.auth().addStateDidChangeListener { [weak self] _, user in
             DispatchQueue.main.async {
-                self?.isSignedIn = user != nil
-                if let uid = user?.uid {
+                // Only treat as signed in if email is verified
+                self?.isSignedIn = user?.isEmailVerified == true
+                if let uid = user?.uid, user?.isEmailVerified == true {
                     self?.fetchRole(uid: uid)
                 } else {
                     self?.role              = nil
@@ -114,12 +116,17 @@ class UserState: ObservableObject {
                 guard let self else { return }
                 let data = doc?.data()
 
-                // Resolve role
+                // Resolve role — new accounts created via OTP flow already have role set
                 if let rawRole = data?["role"] as? String,
                    let role = UserRole(rawValue: rawRole) {
                     self.role = role
                 } else {
-                    self.role = nil
+                    self.role = .rider
+                    Task {
+                        try? await Functions.functions()
+                            .httpsCallable("setUserRole")
+                            .call(["role": "rider"])
+                    }
                 }
 
                 // Cache profile fields and decide if setup sheet is needed
@@ -138,21 +145,6 @@ class UserState: ObservableObject {
                     self.db.collection("users").document(uid).setData(["fcmToken": token], merge: true)
                 }
                 #endif
-
-                // Daily coin grant: 100 coins per day to every user
-                let formatter = DateFormatter()
-                formatter.dateFormat = "yyyy-MM-dd"
-                let today = formatter.string(from: Date())
-                let lastGrant = data?["lastDailyCoinDate"] as? String ?? ""
-                if lastGrant != today {
-                    var grant: [String: Any] = [
-                        "coins":             FieldValue.increment(Int64(100)),
-                        "lastDailyCoinDate": today,
-                    ]
-                    // Ensure coinsLocked exists for users created before we added it
-                    if data?["coinsLocked"] == nil { grant["coinsLocked"] = 0 }
-                    self.db.collection("users").document(uid).setData(grant, merge: true)
-                }
 
                 self.isLoadingRole = false
             }
@@ -192,7 +184,6 @@ class LocationService: NSObject, ObservableObject, CLLocationManagerDelegate {
         manager.desiredAccuracy = kCLLocationAccuracyBest
         authorizationStatus = manager.authorizationStatus
 
-        // Keep legacy app behavior: ask early so map-based screens can center quickly.
         if authorizationStatus == .notDetermined {
             manager.requestWhenInUseAuthorization()
         } else if authorizationStatus == .authorizedWhenInUse || authorizationStatus == .authorizedAlways {
@@ -253,6 +244,16 @@ class LocationService: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     func requestWhenInUseAuthorization() {
         manager.requestWhenInUseAuthorization()
+    }
+
+    /// Ensure location updates are running (safe to call multiple times)
+    func startUpdatingIfAuthorized() {
+        let status = manager.authorizationStatus
+        if status == .authorizedWhenInUse || status == .authorizedAlways {
+            manager.startUpdatingLocation()
+        } else if status == .notDetermined {
+            manager.requestWhenInUseAuthorization()
+        }
     }
 
     func openAppSettings() {
@@ -396,13 +397,15 @@ struct VaahanaApp: App {
     @ViewBuilder
     private var mainContent: some View {
         if !userState.isSignedIn {
-            AuthView()
+            AuthFlowView()
                 .environmentObject(locationService)
         } else if userState.isLoadingRole {
             ProgressView()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color(UIColor.systemGroupedBackground))
-        } else if let role = userState.role {
+        } else {
+            // Always use rider role for V1
+            let role = userState.role ?? .rider
             ContentView(role: role)
                 .id(role)
                 .environmentObject(userState)
@@ -410,10 +413,6 @@ struct VaahanaApp: App {
                 .sheet(isPresented: $userState.showProfileSetup) {
                     ProfileSetupView(userState: userState)
                 }
-        } else {
-            RoleSelectionView { selectedRole in
-                userState.role = selectedRole
-            }
         }
     }
 }
@@ -525,9 +524,11 @@ struct ProfileSetupView: View {
 
                 // Save to Firestore
                 try await db.collection("users").document(uid).setData([
-                    "displayName": trimmedName,
-                    "phone":       phone,
-                    "whatsapp":    phone,
+                    "displayName":         trimmedName,
+                    "phone":               phone,
+                    "phoneCountryCode":    "+1",
+                    "whatsappPhone":       phone,
+                    "whatsappCountryCode": "+1",
                 ], merge: true)
 
                 await MainActor.run {

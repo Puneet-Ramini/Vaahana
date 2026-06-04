@@ -10,6 +10,7 @@ import Combine
 import MapKit
 import FirebaseFirestore
 import FirebaseAuth
+import FirebaseFunctions
 import CoreLocation
 
 // MARK: - Data Models
@@ -74,14 +75,6 @@ enum RideStatus: String, Codable {
     }
 }
 
-// MARK: CoinStatus — lifecycle of coins for a ride
-enum CoinStatus: String, Codable {
-    case none
-    case locked       // locked from rider at acceptance
-    case transferred  // transferred to driver at completion
-    case refunded     // unlocked back to rider on cancellation
-}
-
 // MARK: UserRole
 enum UserRole: String, Codable {
     case rider
@@ -113,7 +106,6 @@ struct Ride: Identifiable, Codable, Equatable {
     var source: String?
 
     // Details
-    var coins: Int
     var hotDuration: Int       // minutes the request stays visible
     var pickupDate: Date
 
@@ -122,11 +114,6 @@ struct Ride: Identifiable, Codable, Equatable {
     var driverName: String?
     var driverPhone: String?
     var driverWhatsapp: String?
-
-    // Coin lifecycle
-    var coinStatus: CoinStatus
-    var coinsLocked: Int
-    var coinsTransferred: Int
 
     // State timestamps
     var acceptedAt: Date?
@@ -146,8 +133,6 @@ struct Ride: Identifiable, Codable, Equatable {
     // Bid marketplace summary (denormalized for quick display)
     var bidCount: Int
     var selectedBidId: String?
-    var finalCoins: Int?          // agreed coin amount after bid selection
-    var lowestBidCoins: Int?
     var latestBidAt: Date?
 
     // MARK: Computed
@@ -182,6 +167,12 @@ struct Ride: Identifiable, Codable, Equatable {
         return f.string(from: pickupDate)
     }
 
+    var postedAtShort: String {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d, h:mm a"
+        return f.string(from: createdAt)
+    }
+
     // MARK: Convenience init (for creating new rides)
 
     init(
@@ -198,7 +189,6 @@ struct Ride: Identifiable, Codable, Equatable {
         pickupLat: Double? = nil,
         pickupLng: Double? = nil,
         source: String? = "app",
-        coins: Int,
         hotDuration: Int = 30,
         pickupDate: Date,
         notes: String? = nil,
@@ -221,7 +211,6 @@ struct Ride: Identifiable, Codable, Equatable {
         self.pickupLat = pickupLat
         self.pickupLng = pickupLng
         self.source = source
-        self.coins = coins
         self.hotDuration = hotDuration
         self.pickupDate = pickupDate
         self.notes = notes
@@ -229,9 +218,6 @@ struct Ride: Identifiable, Codable, Equatable {
         self.driverName = nil
         self.driverPhone = nil
         self.driverWhatsapp = nil
-        self.coinStatus = .none
-        self.coinsLocked = 0
-        self.coinsTransferred = 0
         self.acceptedAt = nil
         self.driverEnrouteAt = nil
         self.arrivedAt = nil
@@ -242,8 +228,6 @@ struct Ride: Identifiable, Codable, Equatable {
         self.cancellationReasonCode = nil
         self.bidCount = 0
         self.selectedBidId = nil
-        self.finalCoins = nil
-        self.lowestBidCoins = nil
         self.latestBidAt = nil
     }
 
@@ -275,17 +259,14 @@ struct Ride: Identifiable, Codable, Equatable {
         pickupLat              = try? c.decodeIfPresent(Double.self, forKey: .pickupLat)
         pickupLng              = try? c.decodeIfPresent(Double.self, forKey: .pickupLng)
         source                 = try? c.decodeIfPresent(String.self, forKey: .source)
-        coins                  = (try? c.decodeIfPresent(Int.self, forKey: .coins))                    ?? 0
-        hotDuration            = (try? c.decodeIfPresent(Int.self, forKey: .hotDuration))              ?? 5
+        // Default to 1440 min (24 h) so WhatsApp rides without an explicit duration stay visible
+        hotDuration            = (try? c.decodeIfPresent(Int.self, forKey: .hotDuration))              ?? 1440
         pickupDate             = (try? c.decodeIfPresent(Date.self, forKey: .pickupDate))              ?? Date()
         notes                  = try? c.decodeIfPresent(String.self, forKey: .notes)
         driverId               = try? c.decodeIfPresent(String.self, forKey: .driverId)
         driverName             = try? c.decodeIfPresent(String.self, forKey: .driverName)
         driverPhone            = try? c.decodeIfPresent(String.self, forKey: .driverPhone)
         driverWhatsapp         = try? c.decodeIfPresent(String.self, forKey: .driverWhatsapp)
-        coinStatus             = (try? c.decodeIfPresent(CoinStatus.self, forKey: .coinStatus))        ?? .none
-        coinsLocked            = (try? c.decodeIfPresent(Int.self, forKey: .coinsLocked))              ?? 0
-        coinsTransferred       = (try? c.decodeIfPresent(Int.self, forKey: .coinsTransferred))         ?? 0
         acceptedAt             = try? c.decodeIfPresent(Date.self, forKey: .acceptedAt)
         driverEnrouteAt        = try? c.decodeIfPresent(Date.self, forKey: .driverEnrouteAt)
         arrivedAt              = try? c.decodeIfPresent(Date.self, forKey: .arrivedAt)
@@ -296,8 +277,6 @@ struct Ride: Identifiable, Codable, Equatable {
         cancellationReasonCode = try? c.decodeIfPresent(String.self, forKey: .cancellationReasonCode)
         bidCount               = (try? c.decodeIfPresent(Int.self, forKey: .bidCount))         ?? 0
         selectedBidId          = try? c.decodeIfPresent(String.self, forKey: .selectedBidId)
-        finalCoins             = try? c.decodeIfPresent(Int.self, forKey: .finalCoins)
-        lowestBidCoins         = try? c.decodeIfPresent(Int.self, forKey: .lowestBidCoins)
         latestBidAt            = try? c.decodeIfPresent(Date.self, forKey: .latestBidAt)
     }
 
@@ -311,8 +290,10 @@ struct Ride: Identifiable, Codable, Equatable {
 class RideStorage: ObservableObject {
     /// Rider's own rides (all statuses), sorted newest first
     @Published var myRides: [Ride] = []
-    /// Posted rides visible to drivers (status == .posted)
+    /// Posted rides visible to all riders (status == .posted), sorted newest first
     @Published var postedRides: [Ride] = []
+    /// Geocoded pickup coordinates keyed by ride ID — used for distance sorting
+    @Published var geocodedCoordinates: [UUID: CLLocationCoordinate2D] = [:]
     /// Current active ride for either role (non-final, non-posted status)
     @Published var activeRide: Ride? = nil
     @Published var isLoading = true
@@ -329,9 +310,58 @@ class RideStorage: ObservableObject {
     let uid: String
     let role: UserRole
 
+    // MARK: - Disk cache
+
+    private static var cacheURL: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("vaahana_posted_rides.json")
+    }
+
+    private func loadCachedRides() -> [Ride] {
+        guard let data = try? Data(contentsOf: Self.cacheURL),
+              let rides = try? JSONDecoder().decode([Ride].self, from: data) else { return [] }
+        return rides
+    }
+
+    private func saveToDisk(_ rides: [Ride]) {
+        guard let data = try? JSONEncoder().encode(rides) else { return }
+        try? data.write(to: Self.cacheURL, options: .atomic)
+    }
+
+    // MARK: - Geocoding
+
+    /// Geocode pickup locations in the background for rides that don't have stored coords.
+    /// Results are stored in `geocodedCoordinates` so RiderView and MapTabView can use them.
+    func geocodeRides(_ rides: [Ride]) {
+        Task {
+            for ride in rides {
+                guard geocodedCoordinates[ride.id] == nil else { continue }
+                let coord: CLLocationCoordinate2D?
+                if let lat = ride.pickupLat, let lng = ride.pickupLng {
+                    coord = CLLocationCoordinate2D(latitude: lat, longitude: lng)
+                } else {
+                    let req = MKLocalSearch.Request()
+                    req.naturalLanguageQuery = ride.from
+                    req.resultTypes = .address
+                    coord = try? await MKLocalSearch(request: req).start().mapItems.first?.placemark.coordinate
+                }
+                if let c = coord {
+                    await MainActor.run { self.geocodedCoordinates[ride.id] = c }
+                }
+            }
+        }
+    }
+
     init(role: UserRole) {
         self.role = role
         self.uid = Auth.auth().currentUser?.uid ?? ""
+        // Show cached rides instantly before the first network snapshot arrives
+        let cached = loadCachedRides()
+        if !cached.isEmpty {
+            self.postedRides = cached
+            self.isLoading = false
+            geocodeRides(cached)
+        }
         startListening()
     }
 
@@ -341,7 +371,7 @@ class RideStorage: ObservableObject {
 
     private func startListening() {
         if role == .rider {
-            // Rider sees their own rides, keyed by riderId
+            // Rider: own rides (for managing their own requests)
             let l = db.collection("rides")
                 .whereField("riderId", isEqualTo: uid)
                 .addSnapshotListener { [weak self] snapshot, _ in
@@ -349,7 +379,6 @@ class RideStorage: ObservableObject {
                     let rides = snapshot.documents.compactMap { try? $0.data(as: Ride.self) }
                     self.myRides = rides.sorted { $0.createdAt > $1.createdAt }
                     self.activeRide = rides.first { $0.status.isActive }
-                    self.isLoading = false
 
                     // Detect rides that just completed → trigger rating prompt
                     for ride in rides {
@@ -365,6 +394,40 @@ class RideStorage: ObservableObject {
                     }
                 }
             listeners.append(l)
+
+            // Rider: all posted rides from community feed (WhatsApp + app)
+            let l2 = db.collection("rides")
+                .whereField("status", isEqualTo: "posted")
+                .addSnapshotListener { [weak self] snapshot, error in
+                    guard let self else { return }
+                    if let error {
+                        print("[RideStorage] feed snapshot error: \(error)")
+                        self.isLoading = false  // don't spin forever on error
+                        return
+                    }
+                    guard let snapshot else { return }
+                    var decoded: [Ride] = []
+                    for doc in snapshot.documents {
+                        do {
+                            let ride = try doc.data(as: Ride.self)
+                            decoded.append(ride)
+                        } catch {
+                            print("[RideStorage] decode failed docID=\(doc.documentID) error=\(error)")
+                        }
+                    }
+                    // Don't wipe existing data with an empty cached snapshot —
+                    // wait for real server data before clearing the list
+                    if !decoded.isEmpty || !snapshot.metadata.isFromCache {
+                        let sorted = self.deduplicatePostedRides(decoded)
+                            .sorted { $0.createdAt > $1.createdAt }
+                        self.postedRides = sorted
+                        self.isLoading = false
+                        self.saveToDisk(sorted)
+                        self.geocodeRides(sorted)
+                        self.backfillMissingMilesIfNeeded(in: sorted)
+                    }
+                }
+            listeners.append(l2)
         } else {
             // Driver sees all posted (hot) rides
             let l = db.collection("rides")
@@ -386,9 +449,15 @@ class RideStorage: ObservableObject {
                             print("[RideStorage] decode failed docID=\(doc.documentID) from=\(doc.data()["from"] ?? "?") error=\(error)")
                         }
                     }
-                    self.postedRides = self.deduplicatePostedRides(decoded)
-                    self.isLoading = false
-                    self.backfillMissingMilesIfNeeded(in: self.postedRides)
+                    if !decoded.isEmpty || !snapshot.metadata.isFromCache {
+                        let sorted = self.deduplicatePostedRides(decoded)
+                            .sorted { $0.createdAt > $1.createdAt }
+                        self.postedRides = sorted
+                        self.isLoading = false
+                        self.saveToDisk(sorted)
+                        self.geocodeRides(sorted)
+                        self.backfillMissingMilesIfNeeded(in: sorted)
+                    }
                 }
             listeners.append(l)
 
@@ -504,24 +573,21 @@ class RideStorage: ObservableObject {
 enum MainTab: String, CaseIterable {
     case rides = "Rides"
     case map = "Map"
-    case switchRole = "Switch"
     case settings = "Settings"
 
     var icon: String {
         switch self {
-        case .rides:      return "car.fill"
-        case .map:        return "map"
-        case .switchRole: return "arrow.triangle.2.circlepath"
-        case .settings:   return "gearshape"
+        case .rides:    return "car.side.fill"
+        case .map:      return "map"
+        case .settings: return "gearshape"
         }
     }
 
     var selectedIcon: String {
         switch self {
-        case .rides:      return "car.fill"
-        case .map:        return "map.fill"
-        case .switchRole: return "arrow.triangle.2.circlepath"
-        case .settings:   return "gearshape.fill"
+        case .rides:    return "car.side.fill"
+        case .map:      return "map.fill"
+        case .settings: return "gearshape.fill"
         }
     }
 }
@@ -553,15 +619,9 @@ struct ContentView: View {
                 Group {
                     switch selectedTab {
                     case .rides:
-                        if role == .rider {
-                            RiderView()
-                        } else {
-                            DriverView()
-                        }
+                        RiderView()
                     case .map:
-                        MapTabView(role: role)
-                    case .switchRole:
-                        SwitchRoleTab()
+                        MapTabView(role: .rider)
                     case .settings:
                         SettingsTab()
                     }
@@ -608,9 +668,6 @@ struct ContentView: View {
     // MARK: - Floating Tab Bar (Sixt-style)
 
     private var visibleTabs: [MainTab] {
-        if role == .rider {
-            return MainTab.allCases.filter { $0 != .map }
-        }
         return MainTab.allCases
     }
 
@@ -654,25 +711,73 @@ struct ContentView: View {
 // MARK: - Rider View
 
 struct RiderView: View {
+    private enum RadiusOption: Int, CaseIterable, Identifiable {
+        case miles50 = 50
+        case miles100 = 100
+        case miles200 = 200
+
+        var id: Int { rawValue }
+        var label: String { "\(rawValue) mi" }
+        var distanceMiles: Double { Double(rawValue) }
+    }
+
     @EnvironmentObject var storage: RideStorage
+    @EnvironmentObject var locationService: LocationService
     @State private var showingPostSheet = false
-    @State private var editingRide: Ride?
-    @State private var showingActiveRide = false
-    @State private var viewingBidsRide: Ride?
-    @State private var ratingRide: Ride?
-    @State private var showExpired = false
-    @State private var showPast = false
+    @State private var selectedRide: Ride?
+    @State private var showMyRequests = false
+    @State private var showExpiredRequests = false
+    @State private var searchText = ""
+    @State private var selectedRadius: RadiusOption = .miles100
 
-    var expiredRides: [Ride] {
-        storage.myRides.filter { $0.status == .expired }
-    }
-
-    var pastRides: [Ride] {
-        storage.myRides.filter { $0.status == .completed || $0.status == .cancelled }
-    }
-
-    var postedRides: [Ride] {
+    var myActiveRides: [Ride] {
         storage.myRides.filter { $0.status == .posted }
+    }
+
+    var myExpiredRides: [Ride] {
+        storage.myRides.filter { $0.status == .expired || $0.status == .cancelled }
+    }
+
+    /// Rides filtered by search and sorted: nearest pickup first, then newest within same distance bucket.
+    var displayedRides: [Ride] {
+        let base: [Ride] = searchText.isEmpty
+            ? storage.postedRides
+            : storage.postedRides.filter { $0.from.localizedCaseInsensitiveContains(searchText) }
+
+        guard let userLoc = locationService.location else {
+            // No location yet — radius filtering cannot be applied.
+            return base.sorted { $0.createdAt > $1.createdAt }
+        }
+        let userCL = CLLocation(latitude: userLoc.coordinate.latitude, longitude: userLoc.coordinate.longitude)
+
+        let maxDistanceMeters = selectedRadius.distanceMiles * 1609.34
+
+        return base
+            .compactMap { ride -> (ride: Ride, distanceMeters: Double)? in
+                let coordinate: CLLocationCoordinate2D?
+                if let lat = ride.pickupLat, let lng = ride.pickupLng {
+                    coordinate = CLLocationCoordinate2D(latitude: lat, longitude: lng)
+                } else {
+                    coordinate = storage.geocodedCoordinates[ride.id]
+                }
+
+                guard let coordinate else { return nil }
+
+                let distanceMeters = CLLocation(
+                    latitude: coordinate.latitude,
+                    longitude: coordinate.longitude
+                ).distance(from: userCL)
+
+                guard distanceMeters <= maxDistanceMeters else { return nil }
+                return (ride, distanceMeters)
+            }
+            .sorted { a, b in
+                if abs(a.distanceMeters - b.distanceMeters) > 1609 {
+                    return a.distanceMeters < b.distanceMeters
+                }
+                return a.ride.createdAt > b.ride.createdAt
+            }
+            .map(\.ride)
     }
 
     var body: some View {
@@ -684,254 +789,197 @@ struct RiderView: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 10) {
-                        // Active ride banner
-                        if let active = storage.activeRide {
-                            activeRideBanner(active)
-                        }
-
-                        // Posted rides
-                        if postedRides.isEmpty && storage.activeRide == nil {
-                            emptyState
-                        } else {
-                            if !postedRides.isEmpty {
-                                HStack(alignment: .firstTextBaseline) {
-                                    Text("Active Requests")
-                                        .font(.title3).fontWeight(.bold)
-                                    Text("\(postedRides.count)")
-                                        .font(.subheadline).fontWeight(.semibold)
-                                        .foregroundStyle(.secondary)
-                                    Spacer()
-                                }
-                                .padding(.top, 4)
-                            }
-
-                            ForEach(postedRides) { ride in
-                                CompactRideRow(ride: ride) {
-                                    viewingBidsRide = ride
-                                }
-                                .contextMenu {
-                                    Button { editingRide = ride } label: {
-                                        Label("Edit", systemImage: "pencil")
-                                    }
-                                    Button(role: .destructive) { storage.deleteRide(ride) } label: {
-                                        Label("Delete", systemImage: "trash")
-                                    }
-                                }
-                                .swipeActions(edge: .trailing) {
-                                    Button(role: .destructive) { storage.deleteRide(ride) } label: {
-                                        Label("Delete", systemImage: "trash")
-                                    }
-                                }
-                                .swipeActions(edge: .leading) {
-                                    Button { editingRide = ride } label: {
-                                        Label("Edit", systemImage: "pencil")
-                                    }
-                                    .tint(.blue)
-                                }
-                            }
-                        }
-
-                        // Expired rides — collapsible
-                        if !expiredRides.isEmpty {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Button {
-                                    withAnimation(.easeInOut(duration: 0.25)) { showExpired.toggle() }
-                                } label: {
-                                    HStack {
-                                        Text("Expired")
-                                            .font(.subheadline).fontWeight(.semibold)
-                                        Text("\(expiredRides.count)")
-                                            .font(.caption).fontWeight(.medium)
-                                            .foregroundStyle(.secondary)
-                                        Spacer()
-                                        Image(systemName: "chevron.right")
-                                            .font(.system(size: 12, weight: .semibold))
-                                            .foregroundStyle(.tertiary)
-                                            .rotationEffect(.degrees(showExpired ? 90 : 0))
-                                    }
-                                    .foregroundStyle(.primary)
-                                    .padding(.vertical, 6)
-                                }
-                                .buttonStyle(.plain)
-
-                                if showExpired {
-                                    ForEach(expiredRides) { ride in
-                                        HStack(spacing: 6) {
-                                            CompactRideRow(ride: ride) { }
-                                            Button {
-                                                repostRide(ride)
-                                            } label: {
-                                                VStack(spacing: 2) {
-                                                    Image(systemName: "arrow.clockwise")
-                                                        .font(.system(size: 13, weight: .semibold))
-                                                    Text("Re-post")
-                                                        .font(.system(size: 9, weight: .medium))
-                                                }
-                                                .foregroundStyle(.blue)
-                                                .frame(width: 54)
-                                                .frame(maxHeight: .infinity)
-                                                .background(Color.blue.opacity(0.08))
-                                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                                            }
-                                            .buttonStyle(.plain)
+                        // Section header
+                        HStack(alignment: .firstTextBaseline) {
+                            Text("Available Rides")
+                                .font(.title3).fontWeight(.bold)
+                            Text("\(displayedRides.count)")
+                                .font(.subheadline).fontWeight(.semibold)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Menu {
+                                ForEach(RadiusOption.allCases) { option in
+                                    Button {
+                                        selectedRadius = option
+                                    } label: {
+                                        if option == selectedRadius {
+                                            Label(option.label, systemImage: "checkmark")
+                                        } else {
+                                            Text(option.label)
                                         }
                                     }
                                 }
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Text(selectedRadius.label)
+                                        .font(.caption).fontWeight(.semibold)
+                                    Image(systemName: "slider.horizontal.3")
+                                        .font(.system(size: 11, weight: .semibold))
+                                }
+                                .foregroundStyle(.primary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                                .background(Color(UIColor.secondarySystemGroupedBackground))
+                                .clipShape(Capsule())
                             }
-                            .padding(.top, 4)
                         }
+                        .padding(.top, 4)
 
-                        // Past rides — collapsible
-                        if !pastRides.isEmpty {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Button {
-                                    withAnimation(.easeInOut(duration: 0.25)) { showPast.toggle() }
-                                } label: {
-                                    HStack {
-                                        Text("Past Rides")
-                                            .font(.subheadline).fontWeight(.semibold)
-                                        Text("\(pastRides.count)")
-                                            .font(.caption).fontWeight(.medium)
-                                            .foregroundStyle(.secondary)
-                                        Spacer()
-                                        Image(systemName: "chevron.right")
-                                            .font(.system(size: 12, weight: .semibold))
-                                            .foregroundStyle(.tertiary)
-                                            .rotationEffect(.degrees(showPast ? 90 : 0))
-                                    }
-                                    .foregroundStyle(.primary)
-                                    .padding(.vertical, 6)
+                        // Search bar
+                        HStack(spacing: 8) {
+                            Image(systemName: "magnifyingglass")
+                                .foregroundStyle(.secondary)
+                                .font(.system(size: 14))
+                            TextField("Search by pickup location...", text: $searchText)
+                                .font(.subheadline)
+                                .autocorrectionDisabled()
+                            if !searchText.isEmpty {
+                                Button { searchText = "" } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundStyle(.secondary)
+                                        .font(.system(size: 14))
                                 }
                                 .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 9)
+                        .background(.quaternary.opacity(0.5))
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
-                                if showPast {
-                                    ForEach(pastRides) { ride in
-                                        CompactRideRow(ride: ride) { }
-                                    }
+                        // Community feed: sorted & filtered rides
+                        if displayedRides.isEmpty {
+                            emptyState
+                        } else {
+                            ForEach(displayedRides) { ride in
+                                CompactRideRow(ride: ride) {
+                                    selectedRide = ride
                                 }
                             }
-                            .padding(.top, 4)
+                        }
+
+                        // My Active Requests — collapsible
+                        if !myActiveRides.isEmpty {
+                            collapsibleSection(
+                                title: "My Requests",
+                                count: myActiveRides.count,
+                                isExpanded: $showMyRequests,
+                                accentColor: .blue
+                            ) {
+                                ForEach(myActiveRides) { ride in
+                                    CompactRideRow(ride: ride) { selectedRide = ride }
+                                        .swipeActions(edge: .trailing) {
+                                            Button(role: .destructive) { storage.deleteRide(ride) } label: {
+                                                Label("Delete", systemImage: "trash")
+                                            }
+                                        }
+                                }
+                            }
+                        }
+
+                        // Expired Requests — collapsible, muted
+                        if !myExpiredRides.isEmpty {
+                            collapsibleSection(
+                                title: "Expired",
+                                count: myExpiredRides.count,
+                                isExpanded: $showExpiredRequests,
+                                accentColor: .secondary
+                            ) {
+                                ForEach(myExpiredRides) { ride in
+                                    CompactRideRow(ride: ride) { selectedRide = ride }
+                                        .opacity(0.55)
+                                        .swipeActions(edge: .trailing) {
+                                            Button(role: .destructive) { storage.deleteRide(ride) } label: {
+                                                Label("Delete", systemImage: "trash")
+                                            }
+                                        }
+                                }
+                            }
                         }
                     }
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
-                    .padding(.bottom, 100)  // More space for floating tab bar
+                    .padding(.bottom, 120)
                 }
             }
         }
         .background(Color(UIColor.systemGroupedBackground))
         .overlay(alignment: .bottom) {
-            if storage.activeRide == nil {
-                Button {
-                    showingPostSheet = true
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 15, weight: .bold))
-                        Text("Request a Ride")
-                            .font(.system(size: 16, weight: .semibold))
-                    }
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                    .background(Color.blue)
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            Button {
+                showingPostSheet = true
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 15, weight: .bold))
+                    Text("Post a Ride Request")
+                        .font(.system(size: 16, weight: .semibold))
                 }
-                .padding(.horizontal, 20)
-                .padding(.bottom, 84)  // More space for floating tab bar
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(Color.blue)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 84)
         }
         .sheet(isPresented: $showingPostSheet) { PostRideSheet() }
-        .sheet(item: $editingRide) { ride in PostRideSheet(editingRide: ride) }
-        .sheet(isPresented: $showingActiveRide) {
-            if let active = storage.activeRide {
-                ActiveRideView(ride: active, role: .rider)
-            }
-        }
-        .sheet(item: $viewingBidsRide) { ride in
-            BidListView(ride: ride)
-        }
-        .sheet(item: $ratingRide) { ride in
-            RatingView(ride: ride, raterRole: .rider, targetUid: ride.driverId ?? "")
-                .onDisappear {
-                    UserDefaults.standard.set(true, forKey: "rated_rider_\(ride.id.uuidString)")
-                    storage.recentlyCompletedRide = nil
-                }
-        }
-        .onChange(of: storage.recentlyCompletedRide) { _, ride in
-            guard let ride, let driverId = ride.driverId, !driverId.isEmpty else { return }
-            let key = "rated_rider_\(ride.id.uuidString)"
-            if !UserDefaults.standard.bool(forKey: key) { ratingRide = ride }
-        }
+        .sheet(item: $selectedRide) { ride in RideDetailSheet(ride: ride) }
     }
 
-    private func activeRideBanner(_ ride: Ride) -> some View {
-        Button { showingActiveRide = true } label: {
-            HStack(spacing: 12) {
-                ZStack {
-                    Circle().fill(Color.blue.opacity(0.12)).frame(width: 44, height: 44)
-                    Image(systemName: "car.fill")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(.blue)
+    @ViewBuilder
+    private func collapsibleSection<Content: View>(
+        title: String,
+        count: Int,
+        isExpanded: Binding<Bool>,
+        accentColor: Color,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.25)) { isExpanded.wrappedValue.toggle() }
+            } label: {
+                HStack {
+                    Text(title)
+                        .font(.subheadline).fontWeight(.semibold)
+                        .foregroundStyle(accentColor)
+                    Text("\(count)")
+                        .font(.caption).fontWeight(.medium)
+                        .foregroundStyle(accentColor.opacity(0.6))
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(isExpanded.wrappedValue ? 90 : 0))
                 }
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Ride in Progress").font(.caption).foregroundStyle(.secondary)
-                    Text(ride.status.riderDisplayText)
-                        .font(.subheadline).fontWeight(.semibold).foregroundStyle(.blue)
-                    Text("\(ride.from) → \(ride.to)")
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                }
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.tertiary)
+                .padding(.vertical, 6)
             }
-            .padding(14)
-            .background(Color.blue.opacity(0.06))
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.blue.opacity(0.15)))
+            .buttonStyle(.plain)
+
+            if isExpanded.wrappedValue {
+                content()
+            }
         }
-        .buttonStyle(.plain)
+        .padding(.top, 4)
     }
 
     private var emptyState: some View {
         VStack(spacing: 16) {
-            Image(systemName: "car.2.fill")
+            Image(systemName: locationService.location == nil ? "location.slash" : "car.2.fill")
                 .font(.system(size: 48))
                 .foregroundStyle(.quaternary)
-            Text("No ride requests yet")
+            Text(locationService.location == nil ? "Location needed" : "No rides in range")
                 .font(.headline)
-            Text("Post your first ride request and\nnearby drivers will reach out.")
+            Text(
+                locationService.location == nil
+                ? "Turn on location access to filter rides by pickup radius."
+                : "No rides with pickup locations are within \(selectedRadius.rawValue) miles right now."
+            )
                 .font(.subheadline).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 60)
-    }
-
-    private func repostRide(_ ride: Ride) {
-        // Prevent duplicate: only allow if no posted ride exists with same route
-        let alreadyPosted = storage.myRides.contains {
-            $0.status == .posted && $0.from == ride.from && $0.to == ride.to
-        }
-        guard !alreadyPosted else { return }
-
-        var newRide = ride
-        newRide.id = UUID()
-        newRide.status = .posted
-        newRide.createdAt = Date()
-        newRide.hotDuration = ride.hotDuration
-        newRide.bidCount = 0
-        newRide.selectedBidId = nil
-        newRide.lowestBidCoins = nil
-        newRide.latestBidAt = nil
-        newRide.driverId = nil
-        newRide.driverName = nil
-        newRide.driverPhone = nil
-        newRide.driverWhatsapp = nil
-        storage.addRide(newRide)
-        // Remove expired original
-        storage.deleteRide(ride)
     }
 }
 
@@ -951,7 +999,6 @@ struct DriverView: View {
     @EnvironmentObject private var locationService: LocationService
     @State private var selectedRide: Ride?
     @State private var showingActiveRide = false
-    @State private var showingMyBids = false
     @State private var ratingRide: Ride?
 
     @AppStorage("filterRadius") private var filterRadius = 5.0
@@ -966,19 +1013,22 @@ struct DriverView: View {
         return locationService.location?.coordinate
     }
 
+    private static let listRadiusMiles = 100.0
+
     var filteredRides: [(ride: Ride, distanceMiles: Double?)] {
         let hot = storage.hotPostedRides
-        guard let center = mapCenter else {
+        guard let userLoc = locationService.location else {
+            // No location yet — show all rides unsorted
             return hot.map { ($0, nil) }
         }
-        let centerLoc = CLLocation(latitude: center.latitude, longitude: center.longitude)
         return hot
             .compactMap { ride -> (ride: Ride, distanceMiles: Double?)? in
                 guard let lat = ride.pickupLat, let lng = ride.pickupLng else {
+                    // No coords — include but distance unknown
                     return (ride, nil)
                 }
-                let dist = centerLoc.distance(from: CLLocation(latitude: lat, longitude: lng)) / 1609.34
-                guard dist <= filterRadius else { return nil }
+                let dist = userLoc.distance(from: CLLocation(latitude: lat, longitude: lng)) / 1609.34
+                guard dist <= Self.listRadiusMiles else { return nil }
                 return (ride, dist)
             }
             .sorted {
@@ -1029,30 +1079,6 @@ struct DriverView: View {
                             .buttonStyle(.plain)
                         }
 
-                        // My Bids
-                        Button { showingMyBids = true } label: {
-                            HStack(spacing: 12) {
-                                ZStack {
-                                    Circle().fill(Color.purple.opacity(0.12)).frame(width: 44, height: 44)
-                                    Image(systemName: "list.bullet.rectangle.portrait")
-                                        .font(.system(size: 18, weight: .semibold))
-                                        .foregroundStyle(.purple)
-                                }
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("My Bids").font(.subheadline).fontWeight(.semibold)
-                                    Text("Track bids you've placed").font(.caption).foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(.tertiary)
-                            }
-                            .padding(14)
-                            .background(Color(UIColor.secondarySystemGroupedBackground))
-                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                        }
-                        .buttonStyle(.plain)
-
                         // Section header
                         HStack(alignment: .firstTextBaseline) {
                             Text("Hot Requests")
@@ -1072,7 +1098,7 @@ struct DriverView: View {
                                     .foregroundStyle(.quaternary)
                                 Text(storage.hotPostedRides.isEmpty
                                      ? "No requests right now"
-                                     : "No requests within \(Int(filterRadius)) mi")
+                                     : "No requests within \(Int(DriverView.listRadiusMiles)) mi")
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                             }
@@ -1099,7 +1125,6 @@ struct DriverView: View {
                 ActiveRideView(ride: active, role: .driver)
             }
         }
-        .sheet(isPresented: $showingMyBids) { DriverBidsView() }
         .sheet(item: $ratingRide) { ride in
             RatingView(ride: ride, raterRole: .driver, targetUid: ride.riderId)
                 .onDisappear {
@@ -1155,15 +1180,32 @@ struct CompactRideRow: View {
                             .lineLimit(1)
                     }
 
-                    // Meta row
-                    HStack(spacing: 6) {
-                        Label(ride.pickupDateShort, systemImage: "calendar")
-                            .font(.caption).foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Text("Needed")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundStyle(.secondary)
+                            Text(ride.pickupDateShort)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
 
-                        if ride.miles > 0 {
-                            Text("·").foregroundStyle(.quaternary)
-                            Text(String(format: "%.1f mi", ride.miles))
-                                .font(.caption).foregroundStyle(.secondary)
+                        HStack(spacing: 6) {
+                            Text("Posted")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundStyle(.secondary)
+                            Text(ride.postedAtShort)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            if ride.miles > 0 {
+                                Text("·").foregroundStyle(.quaternary)
+                                Text(String(format: "%.1f mi", ride.miles))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
 
@@ -1177,10 +1219,6 @@ struct CompactRideRow: View {
                                 .background(Color.green.opacity(0.1))
                                 .clipShape(Capsule())
                         }
-
-                        Text("🪙 \(ride.coins)")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(.orange)
 
                         Spacer()
 
@@ -1212,70 +1250,83 @@ struct CompactRideRow: View {
     }
 }
 
+// MARK: - Ride Detail Map Pin model
+
+private struct RideMapPin: Identifiable {
+    let id: String
+    let coordinate: CLLocationCoordinate2D
+    let isPickup: Bool
+    let label: String
+}
+
 // MARK: - Ride Detail Sheet
 
 struct RideDetailSheet: View {
     let ride: Ride
-    @EnvironmentObject var storage: RideStorage
     @Environment(\.dismiss) var dismiss
-    @State private var showingBidSheet = false
-    @State private var existingBid: RideBid?
-    @State private var isLoadingBid = false
 
-    private var pickupCoord: CLLocationCoordinate2D? {
-        guard let lat = ride.pickupLat, let lng = ride.pickupLng else { return nil }
-        return CLLocationCoordinate2D(latitude: lat, longitude: lng)
-    }
+    @State private var mapPosition: MapCameraPosition = .automatic
+    @State private var mapPins: [RideMapPin] = []
+    @State private var routeMinutes: Int? = nil
+    @State private var routeDistanceMiles: Double? = nil
+    @State private var isCalculatingRoute = false
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 0) {
-                    // MARK: Map
-                    if let coord = pickupCoord {
-                        Map(initialPosition: .region(MKCoordinateRegion(
-                            center: coord,
-                            span: MKCoordinateSpan(latitudeDelta: 0.04, longitudeDelta: 0.04)
-                        ))) {
-                            Annotation(ride.from, coordinate: coord) {
+                    // MARK: Map — pickup (green) + drop-off (red) once geocoded
+                    Map(position: $mapPosition) {
+                        ForEach(mapPins) { pin in
+                            Annotation(pin.label, coordinate: pin.coordinate) {
                                 ZStack {
-                                    Circle().fill(Color.blue).frame(width: 32, height: 32)
-                                    Image(systemName: "mappin")
-                                        .font(.system(size: 14, weight: .bold))
+                                    Circle()
+                                        .fill(pin.isPickup ? Color.green : Color.red)
+                                        .frame(width: 36, height: 36)
+                                    Image(systemName: pin.isPickup ? "circle.fill" : "mappin")
+                                        .font(.system(size: pin.isPickup ? 12 : 14, weight: .bold))
                                         .foregroundStyle(.white)
                                 }
-                                .shadow(color: .black.opacity(0.2), radius: 4)
+                                .shadow(color: .black.opacity(0.25), radius: 4)
                             }
                         }
-                        .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
-                        .frame(height: 180)
-                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                        .onTapGesture { openAppleMaps() }
-                        .overlay(alignment: .bottomTrailing) {
+                    }
+                    .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
+                    .frame(height: 220)
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .overlay(alignment: .bottomTrailing) {
+                        Button { openAppleMaps() } label: {
                             Label("Open in Maps", systemImage: "arrow.up.right.square")
                                 .font(.caption2).fontWeight(.medium)
                                 .foregroundStyle(.blue)
                                 .padding(.horizontal, 8).padding(.vertical, 5)
                                 .background(.ultraThinMaterial)
                                 .clipShape(Capsule())
-                                .padding(8)
+                                .padding(10)
                         }
-                        .padding(.horizontal, 16)
-                        .padding(.top, 12)
                     }
+                    .overlay(alignment: .topLeading) {
+                        if isCalculatingRoute {
+                            ProgressView()
+                                .padding(10)
+                                .background(.ultraThinMaterial)
+                                .clipShape(Circle())
+                                .padding(10)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 14)
 
-                    VStack(spacing: 14) {
+                    VStack(spacing: 12) {
                         // MARK: Route card
                         VStack(spacing: 14) {
-                            // From → To
                             HStack(spacing: 12) {
-                                VStack(spacing: 8) {
+                                VStack(spacing: 6) {
                                     Circle().fill(.green).frame(width: 10, height: 10)
-                                    Rectangle().fill(Color(UIColor.separator)).frame(width: 1.5, height: 20)
+                                    Rectangle().fill(Color(UIColor.separator)).frame(width: 1.5, height: 22)
                                     Image(systemName: "mappin.circle.fill").font(.system(size: 14)).foregroundStyle(.red)
                                 }
-
-                                VStack(alignment: .leading, spacing: 12) {
+                                VStack(alignment: .leading, spacing: 14) {
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text("Pickup").font(.caption).foregroundStyle(.secondary)
                                         Text(ride.from).font(.subheadline).fontWeight(.semibold)
@@ -1293,11 +1344,53 @@ struct RideDetailSheet: View {
                             // Stats row
                             HStack(spacing: 0) {
                                 detailStat(icon: "calendar", label: "Pickup", value: ride.pickupDateShort)
-                                Divider().frame(height: 30)
-                                detailStat(icon: "road.lanes", label: "Distance", value: String(format: "%.1f mi", ride.miles))
-                                Divider().frame(height: 30)
-                                detailStat(icon: "centsign.circle", label: "Coins", value: "🪙 \(ride.coins)")
+                                Divider().frame(height: 34)
+                                detailStat(
+                                    icon: "road.lanes",
+                                    label: "Distance",
+                                    value: routeDistanceMiles.map { String(format: "%.1f mi", $0) }
+                                        ?? (ride.miles > 0 ? String(format: "%.1f mi", ride.miles) : "—")
+                                )
+                                Divider().frame(height: 34)
+                                detailStat(
+                                    icon: "clock",
+                                    label: "Drive time",
+                                    value: routeMinutes.map { formatMinutes($0) } ?? "—"
+                                )
                             }
+                        }
+                        .padding(14)
+                        .background(Color(UIColor.secondarySystemGroupedBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                        // MARK: Requester + time since posted
+                        HStack(spacing: 14) {
+                            Circle()
+                                .fill(Color.blue.gradient)
+                                .frame(width: 48, height: 48)
+                                .overlay {
+                                    Text(ride.initials)
+                                        .font(.subheadline).fontWeight(.bold)
+                                        .foregroundStyle(.white)
+                                }
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(ride.name.isEmpty ? "Unknown" : ride.name)
+                                    .font(.headline)
+                                HStack(spacing: 6) {
+                                    Image(systemName: "clock")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.orange)
+                                    Text("Posted \(ride.timeAgo)")
+                                        .font(.subheadline).fontWeight(.semibold)
+                                        .foregroundStyle(.orange)
+                                }
+                                if ride.isWhatsAppSource {
+                                    Text("via WhatsApp")
+                                        .font(.caption).foregroundStyle(.green)
+                                }
+                            }
+                            Spacer()
                         }
                         .padding(14)
                         .background(Color(UIColor.secondarySystemGroupedBackground))
@@ -1307,12 +1400,8 @@ struct RideDetailSheet: View {
                         if let notes = ride.notes, !notes.isEmpty {
                             HStack(alignment: .top, spacing: 10) {
                                 Image(systemName: "text.bubble.fill")
-                                    .font(.system(size: 14))
-                                    .foregroundStyle(.blue)
-                                    .padding(.top, 2)
-                                Text(notes)
-                                    .font(.subheadline)
-                                    .foregroundStyle(.primary)
+                                    .font(.system(size: 14)).foregroundStyle(.blue).padding(.top, 2)
+                                Text(notes).font(.subheadline).foregroundStyle(.primary)
                                 Spacer()
                             }
                             .padding(14)
@@ -1320,85 +1409,19 @@ struct RideDetailSheet: View {
                             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                         }
 
-                        // MARK: Rider info
-                        HStack(spacing: 12) {
-                            Circle()
-                                .fill(Color.blue.gradient)
-                                .frame(width: 44, height: 44)
-                                .overlay {
-                                    Text(ride.initials)
-                                        .font(.subheadline).fontWeight(.semibold)
-                                        .foregroundStyle(.white)
-                                }
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(ride.name).font(.subheadline).fontWeight(.semibold)
-                                Text("Posted \(ride.timeAgo)")
-                                    .font(.caption).foregroundStyle(.secondary)
+                        // MARK: WhatsApp CTA
+                        Button { openWhatsApp() } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: "message.fill")
+                                    .font(.system(size: 18, weight: .semibold))
+                                Text("Message on WhatsApp")
+                                    .font(.system(size: 17, weight: .semibold))
                             }
-                            Spacer()
-                            StatusChip(status: ride.status)
-                        }
-                        .padding(14)
-                        .background(Color(UIColor.secondarySystemGroupedBackground))
-                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-
-                        // MARK: Actions
-                        if ride.status == .posted {
-                            VStack(spacing: 10) {
-                                Button { showingBidSheet = true } label: {
-                                    HStack(spacing: 8) {
-                                        if isLoadingBid { ProgressView().tint(.white) }
-                                        Image(systemName: existingBid == nil ? "hand.raised.fill" : "pencil.circle.fill")
-                                        Text(existingBid == nil ? "Place Bid" : "Edit Your Bid")
-                                    }
-                                    .font(.headline).foregroundStyle(.white)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 14)
-                                    .background(Color.blue)
-                                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                                }
-                                .disabled(isLoadingBid)
-
-                                Button { openWhatsApp() } label: {
-                                    HStack(spacing: 8) {
-                                        Image(systemName: "message.fill")
-                                        Text("WhatsApp")
-                                    }
-                                    .font(.subheadline).fontWeight(.semibold)
-                                    .foregroundStyle(.green)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 12)
-                                    .background(Color.green.opacity(0.1))
-                                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                                }
-
-                                if let bid = existingBid {
-                                    HStack(spacing: 6) {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundStyle(.green).font(.subheadline)
-                                        Text("Your bid: 🪙 \(bid.bidCoins)")
-                                            .font(.subheadline).fontWeight(.medium)
-                                        Spacer()
-                                        Text("Waiting for rider")
-                                            .font(.caption).foregroundStyle(.secondary)
-                                    }
-                                    .padding(12)
-                                    .background(Color.green.opacity(0.06))
-                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                                }
-                            }
-                        } else {
-                            Button { openWhatsApp() } label: {
-                                HStack(spacing: 8) {
-                                    Image(systemName: "message.fill")
-                                    Text("Message Rider")
-                                }
-                                .font(.headline).foregroundStyle(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 14)
-                                .background(Color.green)
-                                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                            }
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 16)
+                            .background(Color(red: 0.07, green: 0.69, blue: 0.35))
+                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                         }
                     }
                     .padding(16)
@@ -1413,56 +1436,133 @@ struct RideDetailSheet: View {
                 }
             }
         }
-        .sheet(isPresented: $showingBidSheet) {
-            PlaceBidSheet(ride: ride, existingBid: existingBid)
+        .task { await loadRouteInfo() }
+    }
+
+    // MARK: - Route loading
+
+    /// Geocode a natural-language place name using MKLocalSearch (handles bare city names better than CLGeocoder)
+    private func geocodePlace(_ query: String) async -> CLLocationCoordinate2D? {
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = query
+        request.resultTypes = .address
+        guard let response = try? await MKLocalSearch(request: request).start() else { return nil }
+        return response.mapItems.first?.placemark.coordinate
+    }
+
+    private func loadRouteInfo() async {
+        await MainActor.run { isCalculatingRoute = true }
+
+        // Resolve pickup coordinate — use stored coords if available, else geocode ride.from
+        let pickupCoord: CLLocationCoordinate2D?
+        if let lat = ride.pickupLat, let lng = ride.pickupLng {
+            pickupCoord = CLLocationCoordinate2D(latitude: lat, longitude: lng)
+        } else {
+            pickupCoord = await geocodePlace(ride.from)
         }
-        .task { await loadExistingBid() }
+
+        // Geocode destination
+        let destCoord = await geocodePlace(ride.to)
+
+        await MainActor.run {
+            var pins: [RideMapPin] = []
+            if let p = pickupCoord {
+                pins.append(RideMapPin(id: "pickup", coordinate: p, isPickup: true, label: ride.from))
+            }
+            if let d = destCoord {
+                pins.append(RideMapPin(id: "dest", coordinate: d, isPickup: false, label: ride.to))
+            }
+            mapPins = pins
+
+            // Fit camera to show all pins
+            if let p = pickupCoord, let d = destCoord {
+                let minLat = min(p.latitude, d.latitude)
+                let maxLat = max(p.latitude, d.latitude)
+                let minLng = min(p.longitude, d.longitude)
+                let maxLng = max(p.longitude, d.longitude)
+                let latDelta = max(0.04, (maxLat - minLat) * 1.5)
+                let lngDelta = max(0.04, (maxLng - minLng) * 1.5)
+                mapPosition = .region(MKCoordinateRegion(
+                    center: CLLocationCoordinate2D(
+                        latitude: (minLat + maxLat) / 2,
+                        longitude: (minLng + maxLng) / 2
+                    ),
+                    span: MKCoordinateSpan(latitudeDelta: latDelta, longitudeDelta: lngDelta)
+                ))
+            } else if let p = pickupCoord {
+                mapPosition = .region(MKCoordinateRegion(
+                    center: p,
+                    span: MKCoordinateSpan(latitudeDelta: 0.06, longitudeDelta: 0.06)
+                ))
+            } else if let d = destCoord {
+                mapPosition = .region(MKCoordinateRegion(
+                    center: d,
+                    span: MKCoordinateSpan(latitudeDelta: 0.06, longitudeDelta: 0.06)
+                ))
+            }
+        }
+
+        // Calculate driving route if we have both coordinates
+        if let p = pickupCoord, let d = destCoord {
+            let request = MKDirections.Request()
+            request.source      = MKMapItem(placemark: MKPlacemark(coordinate: p))
+            request.destination = MKMapItem(placemark: MKPlacemark(coordinate: d))
+            request.transportType = .automobile
+            if let response = try? await MKDirections(request: request).calculate(),
+               let route = response.routes.first {
+                await MainActor.run {
+                    routeDistanceMiles = route.distance / 1609.34
+                    routeMinutes = Int(route.expectedTravelTime / 60)
+                }
+            }
+        }
+
+        await MainActor.run { isCalculatingRoute = false }
     }
 
     // MARK: - Helpers
 
+    private func formatMinutes(_ minutes: Int) -> String {
+        if minutes < 60 { return "\(minutes) min" }
+        let h = minutes / 60
+        let m = minutes % 60
+        return m == 0 ? "\(h)h" : "\(h)h \(m)m"
+    }
+
     private func detailStat(icon: String, label: String, value: String) -> some View {
         VStack(spacing: 4) {
             Image(systemName: icon)
-                .font(.system(size: 14)).foregroundStyle(.blue)
+                .font(.system(size: 15)).foregroundStyle(.blue)
             Text(value)
-                .font(.caption).fontWeight(.semibold)
-                .lineLimit(1).minimumScaleFactor(0.8)
+                .font(.subheadline).fontWeight(.semibold)
+                .lineLimit(1).minimumScaleFactor(0.7)
             Text(label)
                 .font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
     }
 
-    private func loadExistingBid() async {
-        guard let uid = Auth.auth().currentUser?.uid, ride.status == .posted else { return }
-        isLoadingBid = true
-        let snapshot = try? await Firestore.firestore()
-            .collection("rides").document(ride.id.uuidString)
-            .collection("bids")
-            .whereField("driverId", isEqualTo: uid)
-            .whereField("status", isEqualTo: "active")
-            .getDocuments()
-        existingBid  = snapshot?.documents.compactMap { try? $0.data(as: RideBid.self) }.first
-        isLoadingBid = false
-    }
-
     private func openWhatsApp() {
-        let cleanedCountryCode = ride.whatsappCountryCode.replacingOccurrences(of: "+", with: "")
-        let message = "Hi \(ride.name)! I saw your ride request on Vaahana (\(ride.from) → \(ride.to), \(ride.coins) coins). I'd love to help — interested?"
+        // Strip everything except digits from both fields
+        let codeDigits = ride.whatsappCountryCode
+            .components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+        let phoneDigits = ride.whatsappPhone
+            .components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+        // whatsappPhone often already contains the full number (e.g. +16176206435)
+        // so avoid prepending the country code if it's already present
+        let fullNumber = phoneDigits.hasPrefix(codeDigits) ? phoneDigits : codeDigits + phoneDigits
+        let message = "Hi \(ride.name)! I saw your ride request (\(ride.from) → \(ride.to)) on Vaahana. Are you still looking for a ride?"
         let encodedMessage = message.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        if let url = URL(string: "https://wa.me/\(cleanedCountryCode)\(ride.whatsappPhone)?text=\(encodedMessage)") {
+        if let url = URL(string: "https://wa.me/\(fullNumber)?text=\(encodedMessage)") {
             UIApplication.shared.open(url)
         }
     }
 
     private func openAppleMaps() {
-        guard let coord = pickupCoord else { return }
-        let destination = MKMapItem(placemark: MKPlacemark(coordinate: coord))
-        destination.name = ride.from
-        destination.openInMaps(launchOptions: [
-            MKLaunchOptionsDirectionsModeKey: MKLaunchOptionsDirectionsModeDriving
-        ])
+        guard let pin = mapPins.first(where: { $0.isPickup }) else { return }
+        let item = MKMapItem(placemark: MKPlacemark(coordinate: pin.coordinate))
+        item.name = ride.from
+        item.openInMaps(launchOptions: [MKLaunchOptionsDirectionsModeKey: MKLaunchOptionsDirectionsModeDriving])
     }
 }
 
@@ -1633,7 +1733,6 @@ struct PostRideSheet: View {
     @State private var routeCoords: [CLLocationCoordinate2D] = []
     @State private var routeETA: String? = nil
     @State private var milesText = ""
-    @State private var coinsText = ""
     @State private var isCalculatingRoute = false
 
     // Location pickers
@@ -1670,14 +1769,11 @@ struct PostRideSheet: View {
     ]
 
     var miles: Double { Double(milesText) ?? 0 }
-    var coins: Int    { Int(coinsText)    ?? 0 }
-    var suggestedCoins: Int { max(1, Int(miles)) }
 
     var isValid: Bool {
         pickupResult != nil &&
         dropoffResult != nil &&
         miles > 0 &&
-        coins > 0 &&
         !name.isEmpty &&
         phone.count >= 6 &&
         (sameNumberForBoth || whatsappPhone.count >= 6) &&
@@ -1726,34 +1822,8 @@ struct PostRideSheet: View {
                             .keyboardType(.decimalPad)
                             .multilineTextAlignment(.trailing)
                             .frame(width: 60)
-                            .onChange(of: milesText) { old, new in
-                                if coinsText.isEmpty || Int(coinsText) == max(1, Int(Double(old) ?? 0)) {
-                                    if let v = Double(new) { coinsText = "\(max(1, Int(v)))" }
-                                }
-                            }
                         Text("mi").foregroundStyle(.secondary).font(.subheadline)
                         if isCalculatingRoute { ProgressView().scaleEffect(0.7) }
-                    }
-
-                    HStack {
-                        Label("Coins", systemImage: "centsign.circle.fill")
-                            .font(.subheadline).foregroundStyle(.orange)
-                        Spacer()
-                        TextField("0", text: $coinsText)
-                            .keyboardType(.numberPad)
-                            .multilineTextAlignment(.trailing)
-                            .frame(width: 60)
-                            .fontWeight(.semibold)
-                        if miles > 0 && suggestedCoins != coins {
-                            Button { coinsText = "\(suggestedCoins)" } label: {
-                                Text("Suggest \(suggestedCoins)")
-                                    .font(.caption2).fontWeight(.medium)
-                                    .padding(.horizontal, 8).padding(.vertical, 4)
-                                    .background(Color.orange.opacity(0.1))
-                                    .clipShape(Capsule())
-                            }
-                            .buttonStyle(.borderless)
-                        }
                     }
 
                     DatePicker("Pickup", selection: $pickupDate, in: Date()...)
@@ -1768,7 +1838,7 @@ struct PostRideSheet: View {
                 } header: {
                     Label("Details", systemImage: "slider.horizontal.3")
                 } footer: {
-                    Text("Coins are community currency — no real money. Request expires after the active duration.")
+                    Text("Your request is shared with nearby drivers. It expires after the selected active duration.")
                 }
 
                 // MARK: Notes
@@ -1927,7 +1997,6 @@ struct PostRideSheet: View {
         guard let ride = editingRide else { return }
         // Restore text fields; coordinates are embedded in the ride
         milesText = String(format: "%.1f", ride.miles)
-        coinsText = "\(ride.coins)"
         hotDuration = ride.hotDuration
         pickupDate = ride.pickupDate
         notes = ride.notes ?? ""
@@ -1954,7 +2023,9 @@ struct PostRideSheet: View {
 
         let savedName     = data["displayName"] as? String ?? Auth.auth().currentUser?.displayName ?? ""
         let savedPhone    = data["phone"]    as? String ?? ""
-        let savedWhatsapp = data["whatsapp"] as? String ?? savedPhone
+        let savedWhatsapp = data["whatsappPhone"] as? String
+                         ?? data["whatsapp"] as? String
+                         ?? savedPhone
 
         await MainActor.run {
             if name.isEmpty          { name          = savedName }
@@ -1977,7 +2048,6 @@ struct PostRideSheet: View {
             updated.from                 = pickupResult?.name ?? editingRide.from
             updated.to                   = dropoffResult?.name ?? editingRide.to
             updated.miles                = miles
-            updated.coins                = coins
             updated.hotDuration          = hotDuration
             updated.pickupDate           = pickupDate
             updated.notes                = notes.isEmpty ? nil : notes
@@ -1990,32 +2060,38 @@ struct PostRideSheet: View {
         } else {
             isSubmitting = true
             let coord = pickupResult?.coordinate
-            let ride = Ride(
-                riderId: Auth.auth().currentUser?.uid ?? "",
-                name: name,
-                phone: phone,
-                phoneCountryCode: phoneCountryCode,
-                whatsappPhone: finalWhatsappPhone,
-                whatsappCountryCode: finalWhatsappCountryCode,
-                from: pickupResult?.name ?? "",
-                to: dropoffResult?.name ?? "",
-                miles: miles,
-                pickupLat: coord?.latitude,
-                pickupLng: coord?.longitude,
-                coins: coins,
-                hotDuration: hotDuration,
-                pickupDate: pickupDate,
-                notes: notes.isEmpty ? nil : notes,
-                status: .posted
-            )
-            storage.addRide(ride)
-            isSubmitting = false
-            dismiss()
+            Task {
+                do {
+                    try await RideService.shared.createRide(
+                        name: name,
+                        phone: phone,
+                        phoneCountryCode: phoneCountryCode,
+                        whatsappPhone: finalWhatsappPhone,
+                        whatsappCountryCode: finalWhatsappCountryCode,
+                        from: pickupResult?.name ?? "",
+                        to: dropoffResult?.name ?? "",
+                        miles: miles,
+                        pickupLat: coord?.latitude,
+                        pickupLng: coord?.longitude,
+                        hotDuration: hotDuration,
+                        pickupDate: pickupDate,
+                        notes: notes.isEmpty ? nil : notes
+                    )
+                    await MainActor.run {
+                        isSubmitting = false
+                        dismiss()
+                    }
+                } catch {
+                    await MainActor.run {
+                        isSubmitting = false
+                    }
+                }
+            }
         }
     }
 
     /// Calculates route between pickup and dropoff using MKDirections.
-    /// Populates routeCoords, milesText, coinsText (if not customised), and routeETA.
+    /// Populates routeCoords, milesText, and routeETA.
     func calculateRoute() {
         guard let pickup = pickupResult, let dropoff = dropoffResult else { return }
         // Skip if dropoff has no real coordinate (editing fallback placeholder)
@@ -2044,14 +2120,9 @@ struct PostRideSheet: View {
                 route.polyline.getCoordinates(&coords, range: NSRange(location: 0, length: count))
                 routeCoords = coords
 
-                // Distance and coins
+                // Distance
                 let calculatedMiles = route.distance / 1609.34
-                let prevSuggested = max(1, Int(Double(milesText) ?? 0))
                 milesText = String(format: "%.1f", calculatedMiles)
-                // Only auto-update coins if user hasn't changed them from the last suggestion
-                if coinsText.isEmpty || Int(coinsText) == prevSuggested {
-                    coinsText = "\(max(1, Int(calculatedMiles)))"
-                }
 
                 // ETA
                 let totalSeconds = Int(route.expectedTravelTime)
@@ -2101,7 +2172,6 @@ struct RideCard: View {
     let isDriverMode: Bool
     var onEdit: (() -> Void)? = nil
     var onDelete: (() -> Void)? = nil
-    var onViewBids: (() -> Void)? = nil
     @EnvironmentObject var storage: RideStorage
     
     var body: some View {
@@ -2151,7 +2221,7 @@ struct RideCard: View {
             HStack(spacing: 8) {
                 StatusChip(status: ride.status)
                 InfoChip(text: String(format: "%.1f mi", ride.miles), color: .gray)
-                InfoChip(text: "🪙 \(ride.coins)", color: .orange)
+                InfoChip(text: "Posted \(ride.postedAtShort)", color: .blue)
             }
 
             // Hot timer
@@ -2201,29 +2271,6 @@ struct RideCard: View {
             
             Divider()
             
-            // Bid count button (rider mode, posted rides)
-            if !isDriverMode && ride.status == .posted && ride.bidCount > 0 {
-                Button { onViewBids?() } label: {
-                    HStack {
-                        Image(systemName: "person.2.fill")
-                        Text("\(ride.bidCount) driver bid\(ride.bidCount == 1 ? "" : "s")")
-                            .fontWeight(.semibold)
-                        if let lowest = ride.lowestBidCoins {
-                            Text("· best 🪙 \(lowest)")
-                                .foregroundStyle(.green)
-                        }
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                    }
-                    .font(.subheadline)
-                    .foregroundStyle(.white)
-                    .padding()
-                    .background(Color.blue)
-                    .cornerRadius(12)
-                }
-                .buttonStyle(.plain)
-            }
-
             // Actions
             if ride.status == .posted {
                 if isDriverMode {
@@ -2250,46 +2297,25 @@ struct RideCard: View {
                     }
                 } else {
                     // Rider mode - show edit/delete buttons
-                    if ride.bidCount > 0 {
-                        // Edit locked — drivers have placed bids
-                        VStack(spacing: 6) {
-                            Label("Editing locked — \(ride.bidCount) driver bid\(ride.bidCount == 1 ? "" : "s") placed", systemImage: "lock.fill")
-                                .font(.caption).fontWeight(.semibold)
-                                .foregroundStyle(.orange)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            Button {
-                                onDelete?()
-                            } label: {
-                                Label("Cancel Ride", systemImage: "xmark")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.red)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 8)
-                                    .background(Color.red.opacity(0.1))
-                                    .cornerRadius(8)
-                            }
+                    HStack(spacing: 12) {
+                        Button {
+                            onEdit?()
+                        } label: {
+                            Label("Edit", systemImage: "pencil")
+                                .font(.subheadline)
+                                .foregroundStyle(.blue)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
                         }
-                    } else {
-                        HStack(spacing: 12) {
-                            Button {
-                                onEdit?()
-                            } label: {
-                                Label("Edit", systemImage: "pencil")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.blue)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 8)
-                            }
 
-                            Button {
-                                onDelete?()
-                            } label: {
-                                Label("Cancel", systemImage: "xmark")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.red)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 8)
-                            }
+                        Button {
+                            onDelete?()
+                        } label: {
+                            Label("Cancel", systemImage: "xmark")
+                                .font(.subheadline)
+                                .foregroundStyle(.red)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
                         }
                     }
                 }
@@ -2335,7 +2361,7 @@ struct RideCard: View {
     
     func openWhatsApp() {
         let cleanedCountryCode = ride.whatsappCountryCode.replacingOccurrences(of: "+", with: "")
-        let message = "Hi \(ride.name)! I saw your ride request on Vaahana (\(ride.from) → \(ride.to), \(ride.coins) coins). I'd love to help — interested?"
+        let message = "Hi \(ride.name)! I saw your ride request on Vaahana (\(ride.from) → \(ride.to)). I'd love to help — interested?"
         let encodedMessage = message.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
         if let url = URL(string: "https://wa.me/\(cleanedCountryCode)\(ride.whatsappPhone)?text=\(encodedMessage)") {
             UIApplication.shared.open(url)
@@ -2426,259 +2452,158 @@ struct InfoChip: View {
 
 // MARK: - Map Tab View
 
+private struct MapRidePin: Identifiable {
+    let id: String
+    let coordinate: CLLocationCoordinate2D
+    let ride: Ride
+}
+
 struct MapTabView: View {
     let role: UserRole
     @EnvironmentObject var storage: RideStorage
     @EnvironmentObject var locationService: LocationService
     @State private var cameraPosition: MapCameraPosition = .automatic
     @State private var selectedRide: Ride?
-    @State private var showControls = true
-    @AppStorage("filterRadius") private var filterRadius = 5.0
-    @AppStorage("driverCenterLat") private var driverCenterLat: Double = 0
-    @AppStorage("driverCenterLon") private var driverCenterLon: Double = 0
-    @AppStorage("driverCenterCustom") private var driverCenterCustom: Bool = false
-
-    private var radiusMeters: CLLocationDistance { filterRadius * 1609.34 }
-
-    private var mapCenter: CLLocationCoordinate2D? {
-        if role == .driver && driverCenterCustom {
-            return CLLocationCoordinate2D(latitude: driverCenterLat, longitude: driverCenterLon)
-        }
-        return locationService.location?.coordinate
-    }
-
-    private var ridesForMap: [Ride] {
-        if role == .rider {
-            return storage.myRides.filter { !$0.status.isFinal && $0.pickupLat != nil && $0.pickupLng != nil }
-        }
-        let hot = storage.hotPostedRides
-        guard let center = mapCenter else { return hot }
-        let centerLoc = CLLocation(latitude: center.latitude, longitude: center.longitude)
-        return hot.filter { ride in
-            guard let lat = ride.pickupLat, let lng = ride.pickupLng else { return true }
-            return centerLoc.distance(from: CLLocation(latitude: lat, longitude: lng)) / 1609.34 <= filterRadius
-        }
-    }
+    @State private var mapRidePins: [MapRidePin] = []
+    @State private var hasCenteredOnUser = false
+    @State private var showLocationDeniedAlert = false
 
     var body: some View {
         ZStack {
-            // Full-screen map
-            MapReader { proxy in
-                Map(position: $cameraPosition) {
-                    // Live location
-                    if let loc = locationService.location {
-                        Annotation("Me", coordinate: loc.coordinate) {
-                            ZStack {
-                                Circle().fill(Color.blue.opacity(0.2)).frame(width: 40, height: 40)
-                                Circle().fill(Color.blue).frame(width: 14, height: 14)
-                                Circle().stroke(Color.white, lineWidth: 2.5).frame(width: 14, height: 14)
-                            }
-                            .shadow(color: .blue.opacity(0.35), radius: 8)
+            Map(position: $cameraPosition) {
+                // Live location
+                if let loc = locationService.location {
+                    Annotation("Me", coordinate: loc.coordinate) {
+                        ZStack {
+                            Circle().fill(Color.blue.opacity(0.2)).frame(width: 40, height: 40)
+                            Circle().fill(Color.blue).frame(width: 14, height: 14)
+                            Circle().stroke(Color.white, lineWidth: 2.5).frame(width: 14, height: 14)
                         }
-                    }
-
-                    // Radius circle (driver only)
-                    if role == .driver, let center = mapCenter {
-                        MapCircle(center: center, radius: radiusMeters)
-                            .foregroundStyle(Color.blue.opacity(0.08))
-                            .stroke(Color.blue.opacity(0.4), lineWidth: 1.5)
-
-                        if driverCenterCustom {
-                            Annotation("Search Center", coordinate: center) {
-                                ZStack {
-                                    Circle().fill(Color.blue).frame(width: 32, height: 32)
-                                    Image(systemName: "scope")
-                                        .font(.system(size: 14, weight: .bold))
-                                        .foregroundStyle(.white)
-                                }
-                                .shadow(color: .black.opacity(0.2), radius: 4)
-                            }
-                        }
-                    }
-
-                    // Ride pins
-                    ForEach(ridesForMap) { ride in
-                        if let lat = ride.pickupLat, let lng = ride.pickupLng {
-                            Annotation(ride.from, coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lng)) {
-                                mapPin(for: ride)
-                            }
-                        }
+                        .shadow(color: .blue.opacity(0.35), radius: 8)
                     }
                 }
-                .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
-                .mapControls {
-                    MapCompass()
-                }
-                .onTapGesture { screenPoint in
-                    guard role == .driver else { return }
-                    if let coord = proxy.convert(screenPoint, from: .local) {
-                        withAnimation(.spring(response: 0.3)) {
-                            driverCenterLat = coord.latitude
-                            driverCenterLon = coord.longitude
-                            driverCenterCustom = true
-                            cameraPosition = .region(MKCoordinateRegion(
-                                center: coord,
-                                latitudinalMeters: radiusMeters * 3,
-                                longitudinalMeters: radiusMeters * 3
-                            ))
-                        }
+
+                // Ride pins — geocoded pickup locations
+                ForEach(mapRidePins) { pin in
+                    Annotation(pin.ride.from, coordinate: pin.coordinate) {
+                        mapPin(for: pin.ride)
                     }
                 }
             }
-
-            // Overlays
-            VStack(spacing: 0) {
-                Spacer()
-
-                // Bottom control card
-                if role == .driver {
-                    driverControlCard
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                } else {
-                    riderInfoCard
-                }
+            .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
+            .mapControls {
+                MapCompass()
             }
-            .padding(.bottom, 8)
 
-            // Top-right buttons
-            VStack(spacing: 10) {
+            // Re-center button
+            VStack {
                 HStack {
                     Spacer()
-                    VStack(spacing: 8) {
-                        // Re-center button
-                        Button {
-                            recenterMap()
-                        } label: {
-                            Image(systemName: "location.fill")
-                                .font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(.blue)
-                                .frame(width: 40, height: 40)
-                                .background(.ultraThickMaterial)
-                                .clipShape(Circle())
-                                .shadow(color: .black.opacity(0.1), radius: 4)
-                        }
+                    Button { handleRecenterTap() } label: {
+                        Image(systemName: locationIconName)
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(locationIconColor)
+                            .frame(width: 40, height: 40)
+                            .background(.ultraThickMaterial)
+                            .clipShape(Circle())
+                            .shadow(color: .black.opacity(0.1), radius: 4)
                     }
+                    .padding(.trailing, 16)
+                    .padding(.top, 8)
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
                 Spacer()
+
+                // Bottom count card
+                let total = storage.postedRides.count
+                HStack(spacing: 6) {
+                    Image(systemName: "mappin.circle.fill")
+                        .foregroundStyle(.red)
+                    Text("\(total) ride\(total == 1 ? "" : "s") available")
+                        .font(.caption).fontWeight(.semibold)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .glassEffect(in: .rect(cornerRadius: 14))
+                .padding(.horizontal, 16)
+                .padding(.bottom, 72)
             }
         }
         .onAppear {
-            recenterMapOnAppear()
+            locationService.startUpdatingIfAuthorized()
+            if locationService.location != nil { recenterMap() }
+            rebuildMapPins()
         }
-        .sheet(item: $selectedRide) { ride in
-            RideDetailSheet(ride: ride)
+        .onChange(of: locationService.location) { _, newLoc in
+            guard !hasCenteredOnUser, newLoc != nil else { return }
+            hasCenteredOnUser = true
+            recenterMap()
+        }
+        .onChange(of: storage.geocodedCoordinates.count) { _, _ in
+            rebuildMapPins()
+        }
+        .sheet(item: $selectedRide) { ride in RideDetailSheet(ride: ride) }
+        .alert("Location Access Required", isPresented: $showLocationDeniedAlert) {
+            Button("Open Settings") { locationService.openAppSettings() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Please enable location access in Settings so the map can center on your position.")
         }
     }
-    
-    // MARK: - Helper Methods
-    
+
+    private var locationIconName: String {
+        switch locationService.authorizationStatus {
+        case .authorizedWhenInUse, .authorizedAlways:
+            return "location.fill"
+        case .denied, .restricted:
+            return "location.slash.fill"
+        default:
+            return "location"
+        }
+    }
+
+    private var locationIconColor: Color {
+        switch locationService.authorizationStatus {
+        case .authorizedWhenInUse, .authorizedAlways:
+            return .blue
+        case .denied, .restricted:
+            return .red
+        default:
+            return .secondary
+        }
+    }
+
+    private func handleRecenterTap() {
+        switch locationService.authorizationStatus {
+        case .authorizedWhenInUse, .authorizedAlways:
+            locationService.startUpdatingIfAuthorized()
+            recenterMap()
+        case .denied, .restricted:
+            showLocationDeniedAlert = true
+        case .notDetermined:
+            locationService.startUpdatingIfAuthorized()
+        @unknown default:
+            break
+        }
+    }
+
+    /// Build map pins from the already-geocoded coordinates in RideStorage (no duplicate geocoding).
+    private func rebuildMapPins() {
+        mapRidePins = storage.postedRides.compactMap { ride in
+            guard let coord = storage.geocodedCoordinates[ride.id] else { return nil }
+            return MapRidePin(id: ride.id.uuidString, coordinate: coord, ride: ride)
+        }
+    }
+
     private func recenterMap() {
         if let loc = locationService.location {
-            driverCenterCustom = false
             withAnimation(.spring(response: 0.3)) {
-                let meters = role == .driver ? radiusMeters * 3 : 5000.0
                 cameraPosition = .region(MKCoordinateRegion(
                     center: loc.coordinate,
-                    latitudinalMeters: meters,
-                    longitudinalMeters: meters
+                    latitudinalMeters: 8000,
+                    longitudinalMeters: 8000
                 ))
             }
-        }
-    }
-    
-    private func recenterMapOnAppear() {
-        if let loc = locationService.location {
-            let center = (role == .driver && driverCenterCustom)
-                ? CLLocationCoordinate2D(latitude: driverCenterLat, longitude: driverCenterLon)
-                : loc.coordinate
-            let meters = role == .driver ? radiusMeters * 3 : 5000.0
-            cameraPosition = .region(MKCoordinateRegion(
-                center: center,
-                latitudinalMeters: meters,
-                longitudinalMeters: meters
-            ))
-        }
-    }
-
-    // MARK: - Driver Control Card
-
-    private var driverControlCard: some View {
-        VStack(spacing: 6) {
-            HStack(spacing: 6) {
-                Image(systemName: "hand.tap")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.blue)
-                Text("Tap map to set location")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text("\(ridesForMap.count) ride\(ridesForMap.count == 1 ? "" : "s")")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-
-            HStack(spacing: 10) {
-                Text("Radius")
-                    .font(.caption).foregroundStyle(.secondary)
-                Slider(value: $filterRadius, in: 1...50, step: 1)
-                    .tint(.blue)
-                    .onChange(of: filterRadius) { _, _ in
-                        if let center = mapCenter {
-                            withAnimation(.spring(response: 0.3)) {
-                                cameraPosition = .region(MKCoordinateRegion(
-                                    center: center,
-                                    latitudinalMeters: radiusMeters * 3,
-                                    longitudinalMeters: radiusMeters * 3
-                                ))
-                            }
-                        }
-                    }
-                Text("\(Int(filterRadius)) mi")
-                    .font(.system(.caption, design: .rounded)).fontWeight(.bold)
-                    .foregroundStyle(.blue)
-                    .frame(width: 36, alignment: .trailing)
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .glassEffect(in: .rect(cornerRadius: 16))
-        .padding(.horizontal, 16)
-        .padding(.bottom, 56)
-    }
-
-    // MARK: - Rider Info Card
-
-    @ViewBuilder
-    private var riderInfoCard: some View {
-        let activeRides = storage.myRides.filter { !$0.status.isFinal }
-        if !activeRides.isEmpty {
-            VStack(spacing: 8) {
-                ForEach(activeRides) { ride in
-                    HStack(spacing: 12) {
-                        ZStack {
-                            Circle().fill(Color.blue.opacity(0.12)).frame(width: 36, height: 36)
-                            Image(systemName: "car.fill")
-                                .font(.system(size: 14, weight: .semibold))
-                                .foregroundStyle(.blue)
-                        }
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(ride.status.riderDisplayText)
-                                .font(.subheadline).fontWeight(.semibold)
-                            Text("\(ride.from) → \(ride.to)")
-                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                        }
-                        Spacer()
-                        StatusChip(status: ride.status)
-                    }
-                }
-            }
-            .padding(14)
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .shadow(color: .black.opacity(0.08), radius: 8, y: 2)
-            .padding(.horizontal, 12)
-            .padding(.bottom, 80)  // Space for floating tab bar
         }
     }
 
@@ -2702,10 +2627,8 @@ struct MapTabView: View {
                 VStack(spacing: 1) {
                     Image(systemName: "figure.wave")
                         .font(.system(size: size * 0.28)).foregroundStyle(.white)
-                    if ride.coins > 0 {
-                        Text("🪙\(ride.coins)")
-                            .font(.system(size: 7, weight: .bold)).foregroundStyle(.white)
-                    }
+                    Text("R")
+                        .font(.system(size: 7, weight: .bold)).foregroundStyle(.white)
                 }
                 if ride.isWhatsAppSource {
                     VStack {
@@ -2737,6 +2660,7 @@ struct SwitchRoleTab: View {
     @State private var errorMessage: String?
 
     private let db = Firestore.firestore()
+    private let functions = Functions.functions()
 
     var body: some View {
         ScrollView {
@@ -2770,7 +2694,7 @@ struct SwitchRoleTab: View {
                     roleOption(
                         icon: "figure.wave",
                         title: "Rider",
-                        description: "Post ride requests and let drivers bid to help you.",
+                        description: "Post ride requests and let drivers claim them directly.",
                         isActive: userState.role == .rider,
                         color: .blue,
                         onSelect: { switchRole(to: .rider) }
@@ -2778,7 +2702,7 @@ struct SwitchRoleTab: View {
                     roleOption(
                         icon: "car.fill",
                         title: "Driver",
-                        description: "Browse nearby requests, place bids, and earn coins.",
+                        description: "Browse nearby requests and claim the ones you can help with.",
                         isActive: userState.role == .driver,
                         color: .primary,
                         onSelect: { switchRole(to: .driver) }
@@ -2861,7 +2785,7 @@ struct SwitchRoleTab: View {
         errorMessage = nil
         Task {
             do {
-                try await db.collection("users").document(uid).setData(["role": newRole.rawValue], merge: true)
+                _ = try await functions.httpsCallable("setUserRole").call(["role": newRole.rawValue])
                 await MainActor.run {
                     userState.role = newRole
                     isSwitching = false
@@ -2883,7 +2807,6 @@ struct SettingsTab: View {
     @State private var displayName = ""
     @State private var phone = ""
     @State private var whatsapp = ""
-    @State private var coins: Int = 0
     @State private var ratingAverage: Double? = nil
     @State private var isSaving = false
     @State private var errorMessage: String?
@@ -2943,8 +2866,6 @@ struct SettingsTab: View {
                                 Label(userState.role == .driver ? "Driver" : "Rider",
                                       systemImage: userState.role == .driver ? "car.fill" : "figure.wave")
                                     .font(.caption).foregroundStyle(.blue)
-                                Label("🪙 \(coins)", systemImage: "")
-                                    .font(.caption).fontWeight(.semibold).foregroundStyle(.orange)
                                 if let avg = ratingAverage {
                                     HStack(spacing: 2) {
                                         Image(systemName: "star.fill")
@@ -3004,9 +2925,11 @@ struct SettingsTab: View {
                         }
                         .tint(.green)
                         .onChange(of: isOnline) { _, online in
-                            guard let uid = Auth.auth().currentUser?.uid else { return }
-                            Firestore.firestore().collection("users").document(uid)
-                                .setData(["isAvailable": online], merge: true)
+                            Task {
+                                try? await Functions.functions()
+                                    .httpsCallable("setDriverAvailability")
+                                    .call(["isAvailable": online])
+                            }
                         }
                     } header: {
                         Text("Availability")
@@ -3123,8 +3046,9 @@ struct SettingsTab: View {
             await MainActor.run {
                 displayName  = data["displayName"] as? String ?? currentUser?.displayName ?? ""
                 phone        = data["phone"]       as? String ?? ""
-                whatsapp     = data["whatsapp"]    as? String ?? ""
-                coins        = data["coins"]       as? Int    ?? 0
+                whatsapp     = data["whatsappPhone"] as? String
+                             ?? data["whatsapp"] as? String
+                             ?? ""
                 vehicleMake  = data["vehicleMake"]  as? String ?? ""
                 vehicleModel = data["vehicleModel"] as? String ?? ""
                 vehicleColor = data["vehicleColor"] as? String ?? ""
@@ -3154,9 +3078,11 @@ struct SettingsTab: View {
                 }
                 if let uid = currentUser?.uid {
                     var payload: [String: Any] = [
-                        "displayName": trimmedName,
-                        "phone":       phone,
-                        "whatsapp":    whatsapp,
+                        "displayName":         trimmedName,
+                        "phone":               phone,
+                        "phoneCountryCode":    "+1",
+                        "whatsappPhone":       whatsapp,
+                        "whatsappCountryCode": "+1",
                     ]
                     if userState.role == .driver {
                         payload["vehicleMake"]  = vehicleMake
