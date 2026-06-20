@@ -4,6 +4,7 @@
 import SwiftUI
 import FirebaseAuth
 import FirebaseFirestore
+import FirebaseFunctions
 
 struct RoleSelectionView: View {
     let onRoleSelected: (UserRole) -> Void
@@ -11,6 +12,7 @@ struct RoleSelectionView: View {
     @State private var isSaving = false
     @State private var errorMessage: String?
     private let db = Firestore.firestore()
+    private let functions = Functions.functions()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -56,7 +58,7 @@ struct RoleSelectionView: View {
 
             Spacer()
 
-            Text("Your role is permanent and cannot be changed.")
+            Text("You can change this later in Settings.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -73,8 +75,7 @@ struct RoleSelectionView: View {
         errorMessage = nil
         Task {
             do {
-                let userData: [String: Any] = ["role": role.rawValue]
-                try await db.collection("users").document(uid).setData(userData, merge: true)
+                _ = try await functions.httpsCallable("setUserRole").call(["role": role.rawValue])
                 await MainActor.run {
                     isSaving = false
                     onRoleSelected(role)

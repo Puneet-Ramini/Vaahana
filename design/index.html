@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0a0a" />
+  <title>Vaahana</title>
+  <link rel="stylesheet" href="/assets/styles.css?v=6" />
+</head>
+<body>
+  <main class="page">
+    <div class="card" id="auth-card">
+      <div class="brand">Vaahana</div>
+      <div class="brand-sub">Post a ride. Find a driver. On your terms.</div>
+
+      <div id="alerts"></div>
+
+      <!-- ===== Landing (choose login vs signup) ===== -->
+      <section id="view-landing">
+        <button class="btn btn-primary mb-12" id="go-signup">Create account</button>
+        <button class="btn btn-secondary" id="go-login">I already have an account</button>
+      </section>
+
+      <!-- ===== Sign up ===== -->
+      <section id="view-signup" class="hidden">
+        <h1 class="mb-16">Create account</h1>
+
+        <div class="field">
+          <label class="field-label">Full name</label>
+          <input class="input" id="su-name" type="text" autocomplete="name" />
+        </div>
+
+        <div class="field">
+          <label class="field-label">Email</label>
+          <input class="input" id="su-email" type="email" autocomplete="email" />
+        </div>
+
+        <div class="field">
+          <label class="field-label">Phone / WhatsApp</label>
+          <div class="input-row">
+            <select class="select" id="su-cc">
+              <option value="+1">🇺🇸 +1</option>
+              <option value="+91">🇮🇳 +91</option>
+              <option value="+44">🇬🇧 +44</option>
+              <option value="+61">🇦🇺 +61</option>
+              <option value="+971">🇦🇪 +971</option>
+            </select>
+            <input class="input" id="su-phone" type="tel" inputmode="numeric" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="field-label">Password</label>
+          <input class="input" id="su-pw" type="password" minlength="6" autocomplete="new-password" />
+        </div>
+
+        <div class="field">
+          <label class="field-label">Confirm password</label>
+          <input class="input" id="su-pw2" type="password" minlength="6" autocomplete="new-password" />
+        </div>
+
+        <button class="btn btn-primary mt-8" id="do-signup">
+          <span class="btn-label">Create account</span>
+        </button>
+        <button class="btn btn-ghost mt-8" id="su-back">Back</button>
+      </section>
+
+      <!-- ===== Login ===== -->
+      <section id="view-login" class="hidden">
+        <h1 class="mb-16">Log in</h1>
+
+        <div class="field">
+          <label class="field-label">Email</label>
+          <input class="input" id="li-email" type="email" autocomplete="email" />
+        </div>
+
+        <div class="field">
+          <label class="field-label">Password</label>
+          <input class="input" id="li-pw" type="password" autocomplete="current-password" />
+        </div>
+
+        <button class="btn btn-primary mt-8" id="do-login">
+          <span class="btn-label">Log in</span>
+        </button>
+        <button class="btn btn-ghost mt-8" id="go-forgot">Forgot password</button>
+        <button class="btn btn-ghost" id="li-back">Back</button>
+      </section>
+
+      <!-- ===== Forgot password ===== -->
+      <section id="view-forgot" class="hidden">
+        <h1 class="mb-16">Reset password</h1>
+        <p class="muted mb-16">We'll email you a link to set a new password.</p>
+
+        <div class="field">
+          <label class="field-label">Email</label>
+          <input class="input" id="fp-email" type="email" autocomplete="email" />
+        </div>
+
+        <button class="btn btn-primary mt-8" id="do-forgot">
+          <span class="btn-label">Send reset email</span>
+        </button>
+        <button class="btn btn-ghost mt-8" id="fp-back">Back</button>
+      </section>
+
+      <!-- ===== Verify email (pending) ===== -->
+      <section id="view-verify" class="hidden center">
+        <div style="font-size:56px;line-height:1;margin:8px 0 16px;">✉️</div>
+        <h1 class="mb-8">Check your email</h1>
+        <p class="muted mb-16" id="verify-subtitle">
+          We sent a verification link to your email. Click it and we'll bring you in.
+        </p>
+        <button class="btn btn-primary" id="do-check-verified">
+          <span class="btn-label">I've verified — continue</span>
+        </button>
+        <button class="btn btn-ghost mt-8" id="do-resend-verify">
+          <span class="btn-label">Resend email</span>
+        </button>
+        <button class="btn btn-ghost" id="do-signout-verify">Sign out</button>
+        <p class="tiny mt-16" id="verify-timer"></p>
+      </section>
+    </div>
+  </main>
+
+  <script type="module">
+    import {
+      auth, db, fn,
+      onAuthStateChanged,
+      createUserWithEmailAndPassword,
+      signInWithEmailAndPassword,
+      signOut,
+      sendEmailVerification,
+      updateProfile,
+      reload,
+      doc, setDoc, getDoc,
+      httpsCallable,
+      Timestamp,
+    } from "/assets/firebase.js";
+    import { toast } from "/assets/util.js";
+
+    // ---- View routing (single-page states) ----
+    const views = ["landing", "signup", "login", "forgot", "verify"];
+    function show(name) {
+      views.forEach((v) => {
+        document.getElementById(`view-${v}`).classList.toggle("hidden", v !== name);
+      });
+      clearAlerts();
+    }
+
+    function clearAlerts() { document.getElementById("alerts").innerHTML = ""; }
+    function alertBox(type, message) {
+      const box = document.getElementById("alerts");
+      box.innerHTML = `<div class="alert alert-${type}">${escapeHtml(message)}</div>`;
+    }
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" })[c]);
+    }
+
+    // ---- Auth state: if already signed-in + verified, go to app.
+    let initialAuthResolved = false;
+    onAuthStateChanged(auth, async (user) => {
+      if (!initialAuthResolved) initialAuthResolved = true;
+      if (!user) return show("landing");
+      if (!user.emailVerified) {
+        document.getElementById("verify-subtitle").textContent =
+          `We sent a verification link to ${user.email}. Click it and we'll bring you in.`;
+        show("verify");
+        return;
+      }
+      // Signed in and verified — ensure user doc then go to app.
+      await ensureUserDoc(user);
+      window.location.href = "/app.html";
+    });
+
+    async function ensureUserDoc(user) {
+      const ref = doc(db, "users", user.uid);
+      const snap = await getDoc(ref);
+      if (!snap.exists()) {
+        await setDoc(ref, {
+          uid: user.uid,
+          email: user.email,
+          displayName: user.displayName || "",
+          createdAt: Timestamp.now(),
+          updatedAt: Timestamp.now(),
+        });
+      }
+    }
+
+    // ---- Landing ----
+    document.getElementById("go-signup").onclick = () => show("signup");
+    document.getElementById("go-login").onclick  = () => show("login");
+    document.getElementById("su-back").onclick   = () => show("landing");
+    document.getElementById("li-back").onclick   = () => show("landing");
+    document.getElementById("fp-back").onclick   = () => show("login");
+    document.getElementById("go-forgot").onclick = () => show("forgot");
+
+    // ---- Sign up ----
+    const suBtn = document.getElementById("do-signup");
+    suBtn.onclick = async () => {
+      const name  = document.getElementById("su-name").value.trim();
+      const email = document.getElementById("su-email").value.trim();
+      const cc    = document.getElementById("su-cc").value;
+      const phone = document.getElementById("su-phone").value.replace(/[^\d]/g, "");
+      const pw    = document.getElementById("su-pw").value;
+      const pw2   = document.getElementById("su-pw2").value;
+
+      if (!name) return alertBox("error", "Please enter your full name.");
+      if (!/^\S+@\S+\.\S+$/.test(email)) return alertBox("error", "Please enter a valid email.");
+      if (phone.length < 6) return alertBox("error", "Please enter a valid phone number.");
+      if (pw.length < 6) return alertBox("error", "Password must be at least 6 characters.");
+      if (pw !== pw2) return alertBox("error", "Passwords don't match.");
+
+      setBtnLoading(suBtn, true, "Creating account…");
+      try {
+        // Phone uniqueness check (same callable used by iOS).
+        try {
+          const check = httpsCallable(fn, "checkPhoneUnique");
+          const res = await check({ phone, countryCode: cc });
+          if (res?.data?.taken) {
+            setBtnLoading(suBtn, false, "Create account");
+            return alertBox("error", "That phone number is already registered.");
+          }
+        } catch (e) {
+          // Non-blocking: if callable is unreachable, let signup proceed.
+          console.warn("checkPhoneUnique failed (non-blocking):", e);
+        }
+
+        const cred = await createUserWithEmailAndPassword(auth, email, pw);
+        await updateProfile(cred.user, { displayName: name });
+
+        // Seed user doc (role will be chosen on first /app.html load).
+        await setDoc(doc(db, "users", cred.user.uid), {
+          uid: cred.user.uid,
+          email,
+          displayName: name,
+          phone,
+          phoneCountryCode: cc,
+          whatsappPhone: phone,
+          whatsappCountryCode: cc,
+          createdAt: Timestamp.now(),
+          updatedAt: Timestamp.now(),
+        }, { merge: true });
+
+        await sendEmailVerification(cred.user);
+        // Auth listener will route us to "verify" view.
+      } catch (err) {
+        alertBox("error", friendlyAuthError(err));
+      } finally {
+        setBtnLoading(suBtn, false, "Create account");
+      }
+    };
+
+    // ---- Log in ----
+    const liBtn = document.getElementById("do-login");
+    liBtn.onclick = async () => {
+      const email = document.getElementById("li-email").value.trim();
+      const pw    = document.getElementById("li-pw").value;
+      if (!email || !pw) return alertBox("error", "Enter email and password.");
+      setBtnLoading(liBtn, true, "Logging in…");
+      try {
+        await signInWithEmailAndPassword(auth, email, pw);
+        // Auth listener will route.
+      } catch (err) {
+        alertBox("error", friendlyAuthError(err));
+      } finally {
+        setBtnLoading(liBtn, false, "Log in");
+      }
+    };
+
+    // ---- Forgot password (uses your managed callable, same as iOS) ----
+    const fpBtn = document.getElementById("do-forgot");
+    fpBtn.onclick = async () => {
+      const email = document.getElementById("fp-email").value.trim();
+      if (!/^\S+@\S+\.\S+$/.test(email)) return alertBox("error", "Enter a valid email.");
+      setBtnLoading(fpBtn, true, "Sending…");
+      try {
+        const send = httpsCallable(fn, "sendManagedPasswordResetEmail");
+        await send({ email });
+        alertBox("success", "If an account exists for that email, a reset link is on its way.");
+      } catch (err) {
+        alertBox("error", err?.message || "Couldn't send reset email.");
+      } finally {
+        setBtnLoading(fpBtn, false, "Send reset email");
+      }
+    };
+
+    // ---- Verify email flow ----
+    const verifyBtn = document.getElementById("do-check-verified");
+    verifyBtn.onclick = async () => {
+      if (!auth.currentUser) return show("landing");
+      setBtnLoading(verifyBtn, true, "Checking…");
+      try {
+        await reload(auth.currentUser);
+        if (auth.currentUser.emailVerified) {
+          await ensureUserDoc(auth.currentUser);
+          window.location.href = "/app.html";
+        } else {
+          alertBox("warn", "Still not verified. Check your inbox (and spam).");
+        }
+      } finally {
+        setBtnLoading(verifyBtn, false, "I've verified — continue");
+      }
+    };
+
+    const resendBtn = document.getElementById("do-resend-verify");
+    let resendCooldownUntil = 0;
+    function updateResendTimer() {
+      const remain = Math.max(0, Math.ceil((resendCooldownUntil - Date.now()) / 1000));
+      const el = document.getElementById("verify-timer");
+      if (remain > 0) {
+        resendBtn.disabled = true;
+        el.textContent = `Resend available in ${remain}s`;
+      } else {
+        resendBtn.disabled = false;
+        el.textContent = "";
+      }
+    }
+    setInterval(updateResendTimer, 1000);
+
+    resendBtn.onclick = async () => {
+      if (!auth.currentUser) return;
+      if (Date.now() < resendCooldownUntil) return;
+      setBtnLoading(resendBtn, true, "Sending…");
+      try {
+        await sendEmailVerification(auth.currentUser);
+        toast("Verification email resent");
+        resendCooldownUntil = Date.now() + 60_000;
+      } catch (err) {
+        alertBox("error", friendlyAuthError(err));
+      } finally {
+        setBtnLoading(resendBtn, false, "Resend email");
+        updateResendTimer();
+      }
+    };
+
+    document.getElementById("do-signout-verify").onclick = () => signOut(auth);
+
+    // Auto-refresh every 4s while on verify view — matches iOS.
+    setInterval(async () => {
+      const onVerify = !document.getElementById("view-verify").classList.contains("hidden");
+      if (!onVerify || !auth.currentUser) return;
+      try {
+        await reload(auth.currentUser);
+        if (auth.currentUser.emailVerified) {
+          await ensureUserDoc(auth.currentUser);
+          window.location.href = "/app.html";
+        }
+      } catch {}
+    }, 4000);
+
+    // ---- Helpers ----
+    function setBtnLoading(btn, loading, label) {
+      btn.disabled = !!loading;
+      const span = btn.querySelector(".btn-label");
+      if (loading) {
+        if (span) span.textContent = label || "Working…";
+        if (!btn.querySelector(".spinner")) {
+          const s = document.createElement("span");
+          s.className = "spinner";
+          btn.prepend(s);
+        }
+      } else {
+        if (span) span.textContent = label || span.textContent;
+        btn.querySelector(".spinner")?.remove();
+      }
+    }
+
+    function friendlyAuthError(err) {
+      const code = err?.code || "";
+      const map = {
+        "auth/email-already-in-use": "That email is already registered. Try logging in.",
+        "auth/invalid-email":        "That email doesn't look right.",
+        "auth/weak-password":        "Password needs to be at least 6 characters.",
+        "auth/user-not-found":       "No account for that email.",
+        "auth/wrong-password":       "Wrong password.",
+        "auth/invalid-credential":   "Email or password is incorrect.",
+        "auth/too-many-requests":    "Too many attempts. Try again in a bit.",
+        "auth/network-request-failed": "Network error. Check your connection.",
+      };
+      return map[code] || err?.message || "Something went wrong.";
+    }
+  </script>
+</body>
+</html>

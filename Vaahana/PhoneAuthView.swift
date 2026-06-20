@@ -196,21 +196,26 @@ struct SignUpView: View {
                 // Save Firestore doc
                 let db = FirestoreService.shared
                 db.collection("users").document(user.uid).setData([
+                    "uid":         user.uid,
+                    "email":       user.email ?? "",
                     "displayName": name.trimmingCharacters(in: .whitespaces),
                     "phone":       phone.trimmingCharacters(in: .whitespaces),
-                    "whatsapp":    phone.trimmingCharacters(in: .whitespaces),
-                    "role":        "rider",
-                    "isAdmin":     false,
+                    "phoneCountryCode": "+1",
+                    "whatsappPhone":    phone.trimmingCharacters(in: .whitespaces),
+                    "whatsappCountryCode": "+1",
                 ], merge: true)
 
-                // Seed password history so reset flow can reject password reuse.
+                let setRole = functions.httpsCallable("setUserRole")
                 let recordPassword = functions.httpsCallable("recordCurrentPassword")
-                recordPassword.call(["password": password]) { _, _ in
-                    // Send Firebase verification email
-                    user.sendEmailVerification { _ in
-                        DispatchQueue.main.async {
-                            isLoading = false
-                            screen = .verifyEmail
+                setRole.call(["role": "rider"]) { _, _ in
+                    // Seed password history so reset flow can reject password reuse.
+                    recordPassword.call(["password": password]) { _, _ in
+                        // Send Firebase verification email
+                        user.sendEmailVerification { _ in
+                            DispatchQueue.main.async {
+                                isLoading = false
+                                screen = .verifyEmail
+                            }
                         }
                     }
                 }

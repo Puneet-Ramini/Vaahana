@@ -1,6 +1,6 @@
 # Vaahana Cloud Functions
 
-Reconciliation and integrity layer for the Vaahana ride marketplace.
+Server-side lifecycle and integrity layer for Vaahana rides.
 
 ## Setup
 
@@ -30,10 +30,15 @@ firebase deploy --only functions
 
 | Function | Trigger | Purpose |
 |---|---|---|
-| `reconcileRecentRides` | Every 5 min | Close stale bids, refund leaked coins, clear posted-ride stale fields |
-| `reconcileUserLocks` | Every 5 min | Recompute `coinsLocked` from actual active rides |
-| `reconcileDriverAssignments` | Every 5 min | Clear stale `activeRideId` links pointing to final or missing rides |
-| `reconcileRide` | Callable (on demand) | Deep single-ride inspection + repair |
+| `createRideRequest` | Callable | Create a rider-owned posted ride with single-active-ride enforcement |
+| `claimRideAsDriver` | Callable | Assign a posted ride to a driver with availability and active-ride checks |
+| `advanceRideStatus` | Callable | Move an assigned ride through its allowed status transitions |
+| `cancelManagedRide` | Callable | Cancel a ride and clear both rider/driver active-ride links |
+| `getAdminDashboardStats` | Callable (admin) | Return real backend counts for the admin dashboard |
+| `reconcileRecentRides` | Every 5 min | Clear stale legacy response data, stale rider/driver state, and repair final rides |
+| `reconcileUserLocks` | Every 5 min | Legacy no-op retained for deploy stability after pricing removal |
+| `reconcileDriverAssignments` | Every 5 min | Clear stale `activeRideId` links for users no longer attached to an active ride |
+| `reconcileRide` | Callable (admin) | Deep single-ride inspection + repair |
 
 ## Calling reconcileRide manually
 
@@ -76,9 +81,6 @@ db.collection("reconciliationLogs")
 | Code | Meaning | Auto-repaired? |
 |---|---|---|
 | `FINAL_RIDE_HAS_ACTIVE_BIDS` | Bids still active on completed/cancelled/expired ride | Yes — closed |
-| `LOCKED_COINS_ON_CANCELLED_RIDE` | Coins still locked after ride cancelled/expired | Yes — refunded |
 | `POSTED_RIDE_HAS_SELECTED_DRIVER` | Posted ride has stale driverId/selectedBidId/finalCoins | Yes — cleared |
 | `STALE_ACTIVE_RIDE_LINK` | User's activeRideId points to missing or final ride | Yes — cleared |
-| `LOCKED_COINS_MISMATCH` | User's coinsLocked doesn't match sum of active ride locks | Yes — corrected |
 | `MISSING_DRIVER_ON_ACTIVE_RIDE` | Active/in-progress ride has no driverId | No — logged only |
-| `MISSING_COIN_TRANSACTION` | Completed ride has no entry in coinTransactions | No — logged only |

@@ -2,7 +2,7 @@
 
 A community ride-sharing platform for the South Asian diaspora. Riders post requests via the app or WhatsApp community groups, drivers browse and contact riders, and the community self-organizes rides.
 
-> **Current status: V1 — Rider-only mode.** The app is in early access for riders. The driver-side (bidding, assignment, coin transfers) is built but disabled pending driver onboarding. All users are assigned the `rider` role on sign-up.
+> **Current status:** active rider posting, WhatsApp ingestion, driver claim/assignment flows, and admin tooling are all present. The product is still evolving, so some older docs and prototype assets may lag behind the shipped workflow.
 
 ---
 
@@ -15,7 +15,7 @@ A community ride-sharing platform for the South Asian diaspora. Riders post requ
 - Collapsible "My Requests" section showing your own active posts
 - Collapsible "Expired" section showing past/expired ride requests
 - Swipe to cancel or delete your own rides
-- Post a new ride request: pickup, destination, date/time, seat count, notes, and a coin offer
+- Post a new ride request: pickup, destination, date/time, seat count, notes, and contact details
 
 ### Ride Detail Sheet
 - Tappable map showing the pickup pin and destination, with a drawn route
@@ -26,12 +26,12 @@ A community ride-sharing platform for the South Asian diaspora. Riders post requ
 ### Map Tab
 - Live map showing all active ride request pickup locations as pins
 - Tap a pin to preview the ride; tap the card to open the full detail sheet
-- Current location button — requests Always location permission, centers the map, and shows an alert with a Settings deeplink if permission was denied
+- Current location button — requests location access when needed, centers the map, and shows a Settings deeplink if permission was denied
 - Ride count badge showing how many active requests are on the map
 
 ### Settings Tab
 - Sign out
-- (Driver controls are scaffolded but hidden in V1)
+- Profile and role controls
 
 ---
 
@@ -44,12 +44,10 @@ Firebase Firestore
     ↕ Cloud Functions (Node.js 22)
         ├── Scheduled: expireStaleRides (every 1 min)
         ├── Scheduled: reconcileRecentRides (every 5 min)
-        ├── Scheduled: reconcileUserLocks (every 5 min)
         ├── Scheduled: reconcileDriverAssignments (every 5 min)
-        ├── Scheduled: grantDailyCoins (midnight UTC daily)
         ├── HTTP:      ingestWhatsAppMessages
-        ├── Callable:  reconcileRide (admin)
-        ├── Trigger:   onBidPlaced → FCM push to rider
+        ├── Callable:  createRideRequest / claimRideAsDriver / advanceRideStatus / cancelManagedRide
+        ├── Callable:  getAdminDashboardStats / reconcileRide (admin)
         └── Trigger:   onRideStatusChanged → FCM push to both parties
 
 WhatsApp Bot (Baileys)
@@ -61,10 +59,8 @@ WhatsApp Bot (Baileys)
 
 | Collection | Purpose |
 |---|---|
-| `users/{uid}` | Profile, role, coins, coinsLocked, fcmToken, vehicle info |
-| `rides/{rideId}` | Full ride lifecycle — status, route, coins, timestamps |
-| `rides/{rideId}/bids/{bidId}` | Per-driver bids on a posted ride |
-| `coinTransactions/{txId}` | Immutable record of every coin transfer |
+| `users/{uid}` | Profile, role, contact info, active ride linkage, availability, and vehicle info |
+| `rides/{rideId}` | Full ride lifecycle — status, route, participants, timestamps, and contact info |
 | `ratings/{ratingId}` | Post-ride star ratings (1–5) with optional comment |
 | `reconciliationLogs/{logId}` | Server-written integrity audit trail |
 | `whatsappRiders/{id}` | Placeholder profiles for WhatsApp-sourced riders without a Vaahana account |
@@ -78,19 +74,16 @@ posted ──► accepted ──► driver_enroute ──► driver_arrived ─�
    └──────────────────────── cancelled / expired ◄────────────────────────────────── ┘
 ```
 
-Coin flow: `posted (none)` → `accepted (locked)` → `completed (transferred)` or `cancelled (refunded)`
-
 ---
 
 ## iOS App — Key Files
 
 | File | Role |
 |---|---|
-| `VaahanaApp.swift` | Entry point, auth state, `LocationService` (Always permission), daily coin grant, FCM setup |
+| `VaahanaApp.swift` | Entry point, auth state, `LocationService`, and FCM setup |
 | `ContentView.swift` | Main router, `Ride` model, `RideStorage` (Firestore listener + disk cache + geocoding), `RiderView`, `MapTabView`, `PostRideSheet`, `RideDetailSheet` |
-| `RideService.swift` | All atomic Firestore transactions (accept, bid, cancel, complete) |
+| `RideService.swift` | Client-side wrappers around the managed ride lifecycle callables |
 | `LocationPickerView.swift` | MKLocalSearchCompleter address picker with current-location support |
-| `DriverBidsStore.swift` | Collection-group query for driver's bids across all rides |
 | `ProfileView.swift` | Account dashboard — name, phone, vehicle info, ride history |
 | `RatingView.swift` | Post-ride star rating — writes to `ratings` and increments user aggregate |
 | `AdminView.swift` | Reconciliation logs, user/ride inspector, manual reconcile trigger |
@@ -106,12 +99,10 @@ Coin flow: `posted (none)` → `accepted (locked)` → `completed (transferred)`
 
 ### Location
 
-`LocationService` requests `requestAlwaysAuthorization()` on first launch. The Map tab's re-center button checks the current authorization status and:
+`LocationService` requests location access only when a feature needs it. The map and nearby-ride flows check the current authorization status and:
 - If authorized: starts location updates and flies to the user's position
 - If denied/restricted: shows an alert with a direct link to Settings
 - If not determined: triggers the system permission dialog
-
-`UIBackgroundModes: location` is declared in `Info.plist` so iOS offers the "Always" option in the permission sheet.
 
 ---
 
@@ -239,7 +230,7 @@ DM me if any leads                                 → no ride keyword or route
 
 **Phone matching:**
 
-If the sender's phone matches an existing Vaahana user's `phone` or `whatsapp` field, the ride is linked to their account. Otherwise, a placeholder entry is created in `whatsappRiders` keyed by a hash of the phone number — so when they sign up, rides can be claimed retroactively.
+If the sender's phone matches an existing Vaahana user's normalized `phone` / `phoneCountryCode` or `whatsappPhone` / `whatsappCountryCode`, the ride is linked to their account. Otherwise, a placeholder entry is created in `whatsappRiders` keyed by a hash of the phone number so the ride can be claimed later.
 
 ### Known Limitations
 
@@ -257,24 +248,20 @@ Marks `posted` rides as `expired` when `createdAt + hotDuration` has passed. Exp
 
 ### `reconcileRecentRides` — every 5 minutes
 Scans all live rides and recently-finalized rides (last 7 days). Auto-repairs:
-- Closes active bids on final rides
-- Refunds locked coins on cancelled/expired rides
-- Clears stale `driverId`/`selectedBidId`/`finalCoins` on re-posted rides
+- Clears stale legacy response data on final rides
+- Clears stale participant fields on posted rides
 
 ### `reconcileUserLocks` — every 5 minutes
-Validates every user's `coinsLocked` against their active rides. Auto-corrects mismatches.
+Legacy no-op retained so older deployments keep a stable function surface after pricing removal.
 
 ### `reconcileDriverAssignments` — every 5 minutes
-Validates every driver's `activeRideId`. Clears links to rides that no longer exist, are final, or belong to a different driver.
+Validates every user's `activeRideId`. Clears links to rides that no longer exist, are final, or no longer reference that user as rider or driver.
 
 ### `grantDailyCoins` — midnight UTC daily
-Grants 100 coins to every user who hasn't received them today. Deduplicated via `lastDailyCoinDate`. The iOS app also does a client-side grant on each login as a failsafe.
+Legacy no-op retained so older deployments keep a stable function surface after pricing removal.
 
 ### `reconcileRide` — callable (admin)
 Deep single-ride inspection. Returns all detected issues and applies safe repairs immediately without waiting for the next cron run. Used from the in-app Admin panel.
-
-### `onBidPlaced` — Firestore trigger
-Sends an FCM push notification to the rider when a new bid is placed on their ride.
 
 ### `onRideStatusChanged` — Firestore trigger
 Routes FCM push notifications to both parties as the ride advances through states.
@@ -283,8 +270,7 @@ Routes FCM push notifications to both parties as the ride advances through state
 
 ## Security
 
-- All Firestore writes from the iOS app go through security rules enforcing ownership
-- Coin movements use atomic Firestore transactions — no partial updates
+- Ride lifecycle mutations now go through managed callable functions that enforce active-ride and ownership constraints server-side
 - Final ride states (`completed`, `cancelled`, `expired`) are immutable
 - The WhatsApp ingestion endpoint is protected by a shared secret stored in Google Secret Manager
 - Admin panel is gated behind a Firestore `isAdmin` flag set server-side

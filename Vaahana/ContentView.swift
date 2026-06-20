@@ -10,6 +10,7 @@ import Combine
 import MapKit
 import FirebaseFirestore
 import FirebaseAuth
+import FirebaseFunctions
 import CoreLocation
 
 // MARK: - Data Models
@@ -998,7 +999,6 @@ struct DriverView: View {
     @EnvironmentObject private var locationService: LocationService
     @State private var selectedRide: Ride?
     @State private var showingActiveRide = false
-    @State private var showingMyBids = false
     @State private var ratingRide: Ride?
 
     @AppStorage("filterRadius") private var filterRadius = 5.0
@@ -1079,30 +1079,6 @@ struct DriverView: View {
                             .buttonStyle(.plain)
                         }
 
-                        // My Bids
-                        Button { showingMyBids = true } label: {
-                            HStack(spacing: 12) {
-                                ZStack {
-                                    Circle().fill(Color.purple.opacity(0.12)).frame(width: 44, height: 44)
-                                    Image(systemName: "list.bullet.rectangle.portrait")
-                                        .font(.system(size: 18, weight: .semibold))
-                                        .foregroundStyle(.purple)
-                                }
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("My Bids").font(.subheadline).fontWeight(.semibold)
-                                    Text("Track bids you've placed").font(.caption).foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(.tertiary)
-                            }
-                            .padding(14)
-                            .background(Color(UIColor.secondarySystemGroupedBackground))
-                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                        }
-                        .buttonStyle(.plain)
-
                         // Section header
                         HStack(alignment: .firstTextBaseline) {
                             Text("Hot Requests")
@@ -1149,7 +1125,6 @@ struct DriverView: View {
                 ActiveRideView(ride: active, role: .driver)
             }
         }
-        .sheet(isPresented: $showingMyBids) { DriverBidsView() }
         .sheet(item: $ratingRide) { ride in
             RatingView(ride: ride, raterRole: .driver, targetUid: ride.riderId)
                 .onDisappear {
@@ -2048,7 +2023,9 @@ struct PostRideSheet: View {
 
         let savedName     = data["displayName"] as? String ?? Auth.auth().currentUser?.displayName ?? ""
         let savedPhone    = data["phone"]    as? String ?? ""
-        let savedWhatsapp = data["whatsapp"] as? String ?? savedPhone
+        let savedWhatsapp = data["whatsappPhone"] as? String
+                         ?? data["whatsapp"] as? String
+                         ?? savedPhone
 
         await MainActor.run {
             if name.isEmpty          { name          = savedName }
@@ -2083,26 +2060,33 @@ struct PostRideSheet: View {
         } else {
             isSubmitting = true
             let coord = pickupResult?.coordinate
-            let ride = Ride(
-                riderId: Auth.auth().currentUser?.uid ?? "",
-                name: name,
-                phone: phone,
-                phoneCountryCode: phoneCountryCode,
-                whatsappPhone: finalWhatsappPhone,
-                whatsappCountryCode: finalWhatsappCountryCode,
-                from: pickupResult?.name ?? "",
-                to: dropoffResult?.name ?? "",
-                miles: miles,
-                pickupLat: coord?.latitude,
-                pickupLng: coord?.longitude,
-                hotDuration: hotDuration,
-                pickupDate: pickupDate,
-                notes: notes.isEmpty ? nil : notes,
-                status: .posted
-            )
-            storage.addRide(ride)
-            isSubmitting = false
-            dismiss()
+            Task {
+                do {
+                    try await RideService.shared.createRide(
+                        name: name,
+                        phone: phone,
+                        phoneCountryCode: phoneCountryCode,
+                        whatsappPhone: finalWhatsappPhone,
+                        whatsappCountryCode: finalWhatsappCountryCode,
+                        from: pickupResult?.name ?? "",
+                        to: dropoffResult?.name ?? "",
+                        miles: miles,
+                        pickupLat: coord?.latitude,
+                        pickupLng: coord?.longitude,
+                        hotDuration: hotDuration,
+                        pickupDate: pickupDate,
+                        notes: notes.isEmpty ? nil : notes
+                    )
+                    await MainActor.run {
+                        isSubmitting = false
+                        dismiss()
+                    }
+                } catch {
+                    await MainActor.run {
+                        isSubmitting = false
+                    }
+                }
+            }
         }
     }
 
@@ -2188,7 +2172,6 @@ struct RideCard: View {
     let isDriverMode: Bool
     var onEdit: (() -> Void)? = nil
     var onDelete: (() -> Void)? = nil
-    var onViewBids: (() -> Void)? = nil
     @EnvironmentObject var storage: RideStorage
     
     var body: some View {
@@ -2288,25 +2271,6 @@ struct RideCard: View {
             
             Divider()
             
-            // Bid count button (rider mode, posted rides)
-            if !isDriverMode && ride.status == .posted && ride.bidCount > 0 {
-                Button { onViewBids?() } label: {
-                    HStack {
-                        Image(systemName: "person.2.fill")
-                        Text("\(ride.bidCount) driver bid\(ride.bidCount == 1 ? "" : "s")")
-                            .fontWeight(.semibold)
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                    }
-                    .font(.subheadline)
-                    .foregroundStyle(.white)
-                    .padding()
-                    .background(Color.blue)
-                    .cornerRadius(12)
-                }
-                .buttonStyle(.plain)
-            }
-
             // Actions
             if ride.status == .posted {
                 if isDriverMode {
@@ -2333,46 +2297,25 @@ struct RideCard: View {
                     }
                 } else {
                     // Rider mode - show edit/delete buttons
-                    if ride.bidCount > 0 {
-                        // Edit locked — drivers have placed bids
-                        VStack(spacing: 6) {
-                            Label("Editing locked — \(ride.bidCount) driver bid\(ride.bidCount == 1 ? "" : "s") placed", systemImage: "lock.fill")
-                                .font(.caption).fontWeight(.semibold)
-                                .foregroundStyle(.orange)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            Button {
-                                onDelete?()
-                            } label: {
-                                Label("Cancel Ride", systemImage: "xmark")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.red)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 8)
-                                    .background(Color.red.opacity(0.1))
-                                    .cornerRadius(8)
-                            }
+                    HStack(spacing: 12) {
+                        Button {
+                            onEdit?()
+                        } label: {
+                            Label("Edit", systemImage: "pencil")
+                                .font(.subheadline)
+                                .foregroundStyle(.blue)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
                         }
-                    } else {
-                        HStack(spacing: 12) {
-                            Button {
-                                onEdit?()
-                            } label: {
-                                Label("Edit", systemImage: "pencil")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.blue)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 8)
-                            }
 
-                            Button {
-                                onDelete?()
-                            } label: {
-                                Label("Cancel", systemImage: "xmark")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.red)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 8)
-                            }
+                        Button {
+                            onDelete?()
+                        } label: {
+                            Label("Cancel", systemImage: "xmark")
+                                .font(.subheadline)
+                                .foregroundStyle(.red)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
                         }
                     }
                 }
@@ -2717,6 +2660,7 @@ struct SwitchRoleTab: View {
     @State private var errorMessage: String?
 
     private let db = Firestore.firestore()
+    private let functions = Functions.functions()
 
     var body: some View {
         ScrollView {
@@ -2750,7 +2694,7 @@ struct SwitchRoleTab: View {
                     roleOption(
                         icon: "figure.wave",
                         title: "Rider",
-                        description: "Post ride requests and let drivers bid to help you.",
+                        description: "Post ride requests and let drivers claim them directly.",
                         isActive: userState.role == .rider,
                         color: .blue,
                         onSelect: { switchRole(to: .rider) }
@@ -2758,7 +2702,7 @@ struct SwitchRoleTab: View {
                     roleOption(
                         icon: "car.fill",
                         title: "Driver",
-                        description: "Browse nearby requests and place offers to help riders.",
+                        description: "Browse nearby requests and claim the ones you can help with.",
                         isActive: userState.role == .driver,
                         color: .primary,
                         onSelect: { switchRole(to: .driver) }
@@ -2841,7 +2785,7 @@ struct SwitchRoleTab: View {
         errorMessage = nil
         Task {
             do {
-                try await db.collection("users").document(uid).setData(["role": newRole.rawValue], merge: true)
+                _ = try await functions.httpsCallable("setUserRole").call(["role": newRole.rawValue])
                 await MainActor.run {
                     userState.role = newRole
                     isSwitching = false
@@ -2981,9 +2925,11 @@ struct SettingsTab: View {
                         }
                         .tint(.green)
                         .onChange(of: isOnline) { _, online in
-                            guard let uid = Auth.auth().currentUser?.uid else { return }
-                            Firestore.firestore().collection("users").document(uid)
-                                .setData(["isAvailable": online], merge: true)
+                            Task {
+                                try? await Functions.functions()
+                                    .httpsCallable("setDriverAvailability")
+                                    .call(["isAvailable": online])
+                            }
                         }
                     } header: {
                         Text("Availability")
@@ -3100,7 +3046,9 @@ struct SettingsTab: View {
             await MainActor.run {
                 displayName  = data["displayName"] as? String ?? currentUser?.displayName ?? ""
                 phone        = data["phone"]       as? String ?? ""
-                whatsapp     = data["whatsapp"]    as? String ?? ""
+                whatsapp     = data["whatsappPhone"] as? String
+                             ?? data["whatsapp"] as? String
+                             ?? ""
                 vehicleMake  = data["vehicleMake"]  as? String ?? ""
                 vehicleModel = data["vehicleModel"] as? String ?? ""
                 vehicleColor = data["vehicleColor"] as? String ?? ""
@@ -3130,9 +3078,11 @@ struct SettingsTab: View {
                 }
                 if let uid = currentUser?.uid {
                     var payload: [String: Any] = [
-                        "displayName": trimmedName,
-                        "phone":       phone,
-                        "whatsapp":    whatsapp,
+                        "displayName":         trimmedName,
+                        "phone":               phone,
+                        "phoneCountryCode":    "+1",
+                        "whatsappPhone":       whatsapp,
+                        "whatsappCountryCode": "+1",
                     ]
                     if userState.role == .driver {
                         payload["vehicleMake"]  = vehicleMake
