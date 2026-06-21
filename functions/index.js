@@ -31,7 +31,7 @@
 
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { onCall, HttpsError, onRequest } = require("firebase-functions/v2/https");
-const { onDocumentUpdated } = require("firebase-functions/v2/firestore");
+const { onDocumentUpdated, onDocumentCreated } = require("firebase-functions/v2/firestore");
 const { initializeApp } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
@@ -1906,6 +1906,10 @@ exports.cancelManagedRide = onCall(
       throw new HttpsError("invalid-argument", "rideId is required.");
     }
 
+    // Admin check before transaction — isAdmin is server-controlled and cannot be self-set
+    const callerSnap = await db.collection("users").doc(uid).get();
+    const isCallerAdmin = callerSnap.data()?.isAdmin === true;
+
     const rideRef = db.collection("rides").doc(rideId);
     await db.runTransaction(async (transaction) => {
       const rideSnap = await transaction.get(rideRef);
@@ -1915,7 +1919,7 @@ exports.cancelManagedRide = onCall(
       const ride = rideSnap.data();
       const isRider = ride.riderId === uid;
       const isDriver = ride.driverId === uid;
-      if (!isRider && !isDriver) {
+      if (!isRider && !isDriver && !isCallerAdmin) {
         throw new HttpsError("permission-denied", "Not allowed to cancel this ride.");
       }
       if (["completed", "cancelled", "expired"].includes(String(ride.status || ""))) {
@@ -2030,6 +2034,33 @@ exports.sendManagedPasswordResetEmail = onCall(
     }
 
     return { sent: true };
+  }
+);
+
+// ─── Function: onRatingCreated ────────────────────────────────────────────────
+//
+// Updates ratingSum and ratingCount on the rated user doc whenever a new
+// rating document is created. The iOS client writes only to /ratings/ —
+// this function handles the aggregate so the client never needs to update
+// another user's document directly (which Firestore rules correctly block).
+
+exports.onRatingCreated = onDocumentCreated(
+  { document: "ratings/{ratingId}" },
+  async (event) => {
+    const rating = event.data?.data();
+    if (!rating) return;
+
+    const { ratedUid, stars } = rating;
+    if (!ratedUid || typeof stars !== "number" || stars < 1 || stars > 5) return;
+
+    try {
+      await db.collection("users").doc(ratedUid).update({
+        ratingSum:   FieldValue.increment(stars),
+        ratingCount: FieldValue.increment(1),
+      });
+    } catch (err) {
+      console.error(`[onRatingCreated] Failed to update aggregate for ${ratedUid}:`, err.message);
+    }
   }
 );
 
