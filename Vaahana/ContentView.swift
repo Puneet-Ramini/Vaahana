@@ -3026,6 +3026,15 @@ struct SettingsTab: View {
                     .disabled(isSaving)
                 }
                 
+                // MARK: - About
+                Section {
+                    NavigationLink {
+                        AboutView()
+                    } label: {
+                        Label("About & Contact", systemImage: "info.circle")
+                    }
+                }
+
                 // MARK: - Sign Out
                 Section {
                     Button(role: .destructive) {
