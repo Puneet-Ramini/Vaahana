@@ -9,6 +9,7 @@
 import SwiftUI
 import FirebaseAuth
 import FirebaseFirestore
+import FirebaseFunctions
 
 // MARK: - ReconciliationLog model
 
@@ -333,12 +334,14 @@ private struct RideInspectorTab: View {
 
     private func cancelRide() async {
         let trimmed = rideIdInput.trimmingCharacters(in: .whitespaces)
-        try? await db.collection("rides").document(trimmed).updateData([
-            "status":       "cancelled",
-            "cancelledBy":  Auth.auth().currentUser?.uid ?? "admin",
-            "cancellationReasonCode": "admin_force_cancel",
-            "updatedAt":    FieldValue.serverTimestamp(),
-        ])
+        do {
+            _ = try await Functions.functions().httpsCallable("cancelManagedRide").call([
+                "rideId": trimmed,
+                "reason": "admin_force_cancel",
+            ])
+        } catch {
+            errorMessage = error.localizedDescription
+        }
         await lookupRide()
     }
 }

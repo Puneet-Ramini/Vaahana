@@ -85,8 +85,10 @@ struct ProfileView: View {
                 Section {
                     TextField("Phone number", text: $phone)
                         .keyboardType(.phonePad)
-                    TextField("WhatsApp number", text: $whatsapp)
-                        .keyboardType(.phonePad)
+                    if FeatureFlags.whatsappEnabled {
+                        TextField("WhatsApp number", text: $whatsapp)
+                            .keyboardType(.phonePad)
+                    }
                 } header: {
                     Text("Contact Numbers")
                 } footer: {
