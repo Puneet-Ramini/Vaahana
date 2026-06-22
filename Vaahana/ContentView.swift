@@ -903,6 +903,7 @@ struct RiderView: View {
                 }
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(UIColor.systemGroupedBackground))
         .overlay(alignment: .bottom) {
             Button {
@@ -920,6 +921,7 @@ struct RiderView: View {
                 .background(Color.blue)
                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
+            .frame(maxWidth: .infinity)
             .padding(.horizontal, 20)
             .padding(.bottom, 84)
         }
@@ -1133,6 +1135,7 @@ struct DriverView: View {
                 }
         }
         .onChange(of: storage.recentlyCompletedRide) { _, ride in
+            guard FeatureFlags.ratingsEnabled else { return }
             guard let ride else { return }
             let key = "rated_driver_\(ride.id.uuidString)"
             if !UserDefaults.standard.bool(forKey: key) { ratingRide = ride }
@@ -1211,7 +1214,7 @@ struct CompactRideRow: View {
 
                     // Tags row
                     HStack(spacing: 6) {
-                        if ride.isWhatsAppSource {
+                        if FeatureFlags.whatsappEnabled && ride.isWhatsAppSource {
                             Text("WhatsApp")
                                 .font(.system(size: 9, weight: .bold))
                                 .foregroundStyle(.green)
@@ -1385,7 +1388,7 @@ struct RideDetailSheet: View {
                                         .font(.subheadline).fontWeight(.semibold)
                                         .foregroundStyle(.orange)
                                 }
-                                if ride.isWhatsAppSource {
+                                if FeatureFlags.whatsappEnabled && ride.isWhatsAppSource {
                                     Text("via WhatsApp")
                                         .font(.caption).foregroundStyle(.green)
                                 }
@@ -1410,18 +1413,20 @@ struct RideDetailSheet: View {
                         }
 
                         // MARK: WhatsApp CTA
-                        Button { openWhatsApp() } label: {
-                            HStack(spacing: 10) {
-                                Image(systemName: "message.fill")
-                                    .font(.system(size: 18, weight: .semibold))
-                                Text("Message on WhatsApp")
-                                    .font(.system(size: 17, weight: .semibold))
+                        if FeatureFlags.whatsappEnabled {
+                            Button { openWhatsApp() } label: {
+                                HStack(spacing: 10) {
+                                    Image(systemName: "message.fill")
+                                        .font(.system(size: 18, weight: .semibold))
+                                    Text("Message on WhatsApp")
+                                        .font(.system(size: 17, weight: .semibold))
+                                }
+                                .foregroundStyle(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 16)
+                                .background(Color(red: 0.07, green: 0.69, blue: 0.35))
+                                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                             }
-                            .foregroundStyle(.white)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 16)
-                            .background(Color(red: 0.07, green: 0.69, blue: 0.35))
-                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                         }
                     }
                     .padding(16)
@@ -1869,25 +1874,27 @@ struct PostRideSheet: View {
                         TextField("Phone number", text: $phone).keyboardType(.numberPad)
                     }
 
-                    Toggle(isOn: $sameNumberForBoth) {
-                        Text("Same for WhatsApp").font(.subheadline)
-                    }
+                    if FeatureFlags.whatsappEnabled {
+                        Toggle(isOn: $sameNumberForBoth) {
+                            Text("Same for WhatsApp").font(.subheadline)
+                        }
 
-                    if !sameNumberForBoth {
-                        HStack(spacing: 8) {
-                            Picker("Code", selection: $whatsappCountryCode) {
-                                ForEach(countryCodes, id: \.1) { flag, code in
-                                    Text("\(flag) \(code)").tag(code)
+                        if !sameNumberForBoth {
+                            HStack(spacing: 8) {
+                                Picker("Code", selection: $whatsappCountryCode) {
+                                    ForEach(countryCodes, id: \.1) { flag, code in
+                                        Text("\(flag) \(code)").tag(code)
+                                    }
                                 }
+                                .labelsHidden().frame(width: 100)
+                                TextField("WhatsApp number", text: $whatsappPhone).keyboardType(.numberPad)
                             }
-                            .labelsHidden().frame(width: 100)
-                            TextField("WhatsApp number", text: $whatsappPhone).keyboardType(.numberPad)
                         }
                     }
                 } header: {
                     Label("Contact", systemImage: "phone.fill")
                 } footer: {
-                    Text("Drivers will reach out via WhatsApp")
+                    Text(FeatureFlags.whatsappEnabled ? "Drivers will reach out via WhatsApp" : "Drivers will contact you via phone")
                 }
             }
             .navigationTitle(editingRide == nil ? "Request a Ride" : "Edit Request")
@@ -2275,16 +2282,18 @@ struct RideCard: View {
             if ride.status == .posted {
                 if isDriverMode {
                     HStack(spacing: 12) {
-                        Button {
-                            openWhatsApp()
-                        } label: {
-                            Label("Text on WhatsApp", systemImage: "message.fill")
-                                .font(.subheadline)
-                                .foregroundStyle(.blue)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 8)
+                        if FeatureFlags.whatsappEnabled {
+                            Button {
+                                openWhatsApp()
+                            } label: {
+                                Label("Text on WhatsApp", systemImage: "message.fill")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.blue)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                            }
                         }
-                        
+
                         Button {
                             acceptRide()
                         } label: {
@@ -2630,7 +2639,7 @@ struct MapTabView: View {
                     Text("R")
                         .font(.system(size: 7, weight: .bold)).foregroundStyle(.white)
                 }
-                if ride.isWhatsAppSource {
+                if FeatureFlags.whatsappEnabled && ride.isWhatsAppSource {
                     VStack {
                         HStack {
                             Spacer()
@@ -2898,12 +2907,14 @@ struct SettingsTab: View {
                             .multilineTextAlignment(.trailing)
                     }
                     
-                    HStack {
-                        Label("WhatsApp", systemImage: "message.fill")
-                            .frame(width: 100, alignment: .leading)
-                        TextField("WhatsApp Number", text: $whatsapp)
-                            .keyboardType(.phonePad)
-                            .multilineTextAlignment(.trailing)
+                    if FeatureFlags.whatsappEnabled {
+                        HStack {
+                            Label("WhatsApp", systemImage: "message.fill")
+                                .frame(width: 100, alignment: .leading)
+                            TextField("WhatsApp Number", text: $whatsapp)
+                                .keyboardType(.phonePad)
+                                .multilineTextAlignment(.trailing)
+                        }
                     }
                 } header: {
                     Text("Personal Information")
@@ -3015,6 +3026,15 @@ struct SettingsTab: View {
                     .disabled(isSaving)
                 }
                 
+                // MARK: - About
+                Section {
+                    NavigationLink {
+                        AboutView()
+                    } label: {
+                        Label("About & Contact", systemImage: "info.circle")
+                    }
+                }
+
                 // MARK: - Sign Out
                 Section {
                     Button(role: .destructive) {

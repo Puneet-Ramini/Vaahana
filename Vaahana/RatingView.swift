@@ -143,17 +143,10 @@ struct RatingView: View {
 
         Task {
             do {
-                let batch = db.batch()
-                // Write rating document
+                        // Write rating document — aggregate update is handled server-side
+                // by the onRatingCreated Cloud Function trigger.
                 let ratingRef = db.collection("ratings").document()
-                batch.setData(ratingDoc, forDocument: ratingRef)
-                // Increment rated user's aggregate stats
-                let userRef = db.collection("users").document(targetUid)
-                batch.updateData([
-                    "ratingSum":   FieldValue.increment(Int64(stars)),
-                    "ratingCount": FieldValue.increment(Int64(1)),
-                ], forDocument: userRef)
-                try await batch.commit()
+                try await ratingRef.setData(ratingDoc)
                 await MainActor.run { dismiss() }
             } catch {
                 await MainActor.run {
